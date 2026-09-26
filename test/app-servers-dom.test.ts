@@ -97,7 +97,7 @@ interface Mounted {
   close: () => void;
 }
 
-function mount(): Mounted {
+function mount(screenshot?: () => Promise<Response>): Mounted {
   const errors: string[] = [];
   const virtualConsole = new VirtualConsole();
   virtualConsole.on("jsdomError", (e: Error) => errors.push(e.message));
@@ -133,6 +133,7 @@ function mount(): Mounted {
       window.fetch = ((input: string, init?: RequestInit) => {
         if (closed) return never;
         const u = new URL(String(input), baseUrl);
+        if (u.pathname.endsWith("/preview/screenshot") && screenshot) return screenshot();
         if (u.pathname.includes("/servers")) seen.push(u.pathname + " " + (init?.method ?? "GET"));
         return fetch(u, init).then((r) => (closed ? never : r));
       }) as typeof window.fetch;
@@ -293,4 +294,48 @@ describe("web app · dev servers in the Browser tab", () => {
     expect(text(m, "#srvloglines")).toContain("code 7");
     expect(m.errors).toEqual([]);
   }, 90_000);
+  it("delivers a screenshot through the mounted composer's attachment interface", async () => {
+    const m = mount(async () => new Response(JSON.stringify({
+      path: ".loom/attachments/preview.png", width: 768, height: 800, colorScheme: "dark",
+    }), { headers: { "content-type": "application/json" } }));
+    await openBrowserTab(m);
+    const url = $(m, "#browurl") as HTMLInputElement;
+    url.value = `http://127.0.0.1:${port}`;
+    click($(m, "#browgo"));
+    await waitUntil(() => !!$(m, "#browframe iframe"));
+    click($(m, "#browshot"));
+    await waitUntil(() => text(m, "#cchips").includes("preview.png"));
+    expect(($(m, "#box") as HTMLTextAreaElement).value).toContain("Screenshot taken at 768×800, dark mode.");
+    expect(m.errors).toEqual([]);
+  });
+
+  it("discards a screenshot when navigation has replaced its composer", async () => {
+    const other = await new DaemonClient(readDaemonConfig()!).addProject(makeProjectDir({ name: "other" }));
+    let resolveShot!: (response: Response) => void;
+    let requested = false;
+    const pending = new Promise<Response>((resolve) => { resolveShot = resolve; });
+    const m = mount(() => { requested = true; return pending; });
+    await openBrowserTab(m);
+    const url = $(m, "#browurl") as HTMLInputElement;
+    url.value = `http://127.0.0.1:${port}`;
+    click($(m, "#browgo"));
+    await waitUntil(() => !!$(m, "#browframe iframe"));
+    const oldBox = $(m, "#box");
+    const shotButton = $(m, "#browshot") as HTMLButtonElement;
+    click($(m, "#browshot"));
+    await waitUntil(() => requested);
+    await waitUntil(() => !!$(m, `.srow[data-id="${other.project.id}"]`));
+    m.window.location.hash = `p/${other.project.id}`;
+    await waitUntil(() => !!$(m, "#box") && $(m, "#box") !== oldBox);
+    resolveShot(new Response(JSON.stringify({
+      path: ".loom/attachments/stale.png", width: 768, height: 800, colorScheme: "dark",
+    }), { headers: { "content-type": "application/json" } }));
+    // Wait for the old request's continuation to run, observable on its button.
+    await waitUntil(() => !shotButton.disabled);
+    expect(text(m, "#cchips")).not.toContain("preview.png");
+    expect(($(m, "#box") as HTMLTextAreaElement).value).not.toContain("Screenshot taken");
+    expect(m.errors).toEqual([]);
+  });
+
+
 });

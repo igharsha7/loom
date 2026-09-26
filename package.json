@@ -46,14 +46,16 @@
     "./sdk": "./dist/sdk.js"
   },
   "scripts": {
-    "build": "tsc",
-    "prepare": "tsc",
+    "build": "npm run build:web && tsc",
+    "prepare": "npm run build",
     "dev": "tsx src/cli/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --exclude 'test/app-*dom.test.ts' && vitest run --no-file-parallelism test/app-dom.test.ts test/app-orchestra-dom.test.ts test/app-composer-dom.test.ts test/app-team-dom.test.ts test/app-team-phase2-dom.test.ts test/app-team-brain-dom.test.ts test/app-landing-dom.test.ts test/app-runners-dom.test.ts",
+    "test": "vitest run --exclude 'test/app-*dom.test.ts' && vitest run --no-file-parallelism test/app-*dom.test.ts",
     "test:watch": "vitest",
     "test:all-parallel": "vitest run",
-    "verify:adapters": "node scripts/verify-adapters.mjs"
+    "verify:adapters": "node scripts/verify-adapters.mjs",
+    "build:web": "node scripts/build-web.mjs",
+    "predev": "npm run build:web"
   },
   "dependencies": {
     "@noble/ciphers": "^2.4.0",
@@ -82,7 +84,8 @@
     "jsdom": "^29.1.1",
     "tsx": "^4.23.1",
     "typescript": "~5.9.0",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.10",
+    "esbuild": "0.28.1"
   },
   "optionalDependencies": {
     "node-pty": "^1.1.0"

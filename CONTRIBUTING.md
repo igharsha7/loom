@@ -28,9 +28,16 @@ Useful development commands:
 
 ```bash
 npm run dev -- status
-npm test -- test/codex.test.ts
+npx vitest run test/codex.test.ts
 npm run test:watch
 ```
+
+The browser sources live in [`src/web/`](src/web/README.md). `npm run build`
+bundles them before compiling the daemon; `npm run build:web` rebuilds only the
+browser. Build before tests that import the served page. `npm test` runs all
+browser DOM suites sequentially after the remaining suites. For daemon
+boundaries, see [HTTP routes](src/daemon/routes/README.md) and
+[runtime modules](src/daemon/runtime/README.md).
 
 `npm run verify:adapters` drives installed, authenticated agent CLIs against
 real tasks. It may spend provider credits, so run it manually after changing a

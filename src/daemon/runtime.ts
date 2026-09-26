@@ -1,57 +1,53 @@
-/**
- * ProjectRuntime — one live project inside the daemon: its event log, its
- * agents, and its baton. All mutations flow through here so the log stays
- * the single source of truth.
- */
-
 import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import type {
-  AgentConfig,
-  AgentCost,
-  AnyAgent,
-  ChatInfo,
-  CostSummary,
-  LoomEvent,
-  McpServerConfig,
-  ProjectConfig,
-  ProjectInfo,
-  ProjectStatus,
-  SendInput,
-  UnifiedMemory,
-} from "../types.js";
-import type { RouteState, RouteStepSpec, RouterKind } from "../types.js";
-import { GIT_DELIVERIES, isAdapter, MAIN_CHAT, type GitDelivery } from "../types.js";
 import { createAgent, isWithdrawnKind, knownAgentKinds, tierForKind } from "../adapters/index.js";
-import { ADES } from "../core/ades.js";
-import { BatonManager, NotHolderError } from "../core/baton.js";
-import { Brain, CONFIDENCE_FLOOR, type Memory } from "../core/brain.js";
-import { compileBrief, retrieve, type Hit, type RetrieveOpts } from "../core/brain-index.js";
-import { extractFromTurn, readExternalContent, type ExtractEngine } from "../core/brain-extract.js";
-import { claudeText } from "../core/claude-cli.js";
+import { ModelAdapter } from "../adapters/model.js";
+import { ADES, detectAdes } from "../core/ades.js";
+import { BatonManager } from "../core/baton.js";
+import { type Hit, type RetrieveOpts } from "../core/brain-index.js";
+import { Brain } from "../core/brain.js";
 import * as checkpoints from "../core/checkpoint.js";
-import { EventLog } from "../core/eventlog.js";
-import { addWorktree as gitAddWorktree, ensureBranch, push as gitPush, readOut, stageAndCommitFiles, worktreePath } from "../core/git.js";
-import { logbook } from "../core/logbook.js";
-import { compileTieredBrief, retrieveTiered, type TieredMemory } from "../core/team-memory.js";
 import { renderProjection } from "../core/distill.js";
-import {
-  buildUnifiedMemory,
-  hashContent,
-  readNativeMemory,
-  type ImportedBlock,
-} from "../core/memory.js";
+import { EventLog } from "../core/eventlog.js";
+import { ensureBranch, addWorktree as gitAddWorktree, readOut, worktreePath } from "../core/git.js";
+import { logbook } from "../core/logbook.js";
 import { probeMcpServer, probeMcpServers, writeMcpSession } from "../core/mcp.js";
-import { notify } from "../core/notify.js";
 import {
-  decisionStats,
-  extractDecisions,
-  normalizeStoredDecision,
-  type AgentDecision,
-  type DecisionStats,
-} from "../observability/decisions.js";
-import { turnTraceId } from "../observability/index.js";
+  type ImportedBlock
+} from "../core/memory.js";
+import { notify } from "../core/notify.js";
+import { OrchestraEngine, type OrchestraCoordinator } from "../core/orchestra.js";
+import { isPermissionMode, permissionFor, unsupportedReason, type PermissionMode } from "../core/permissions.js";
+import { startPreviewProxy, type PreviewProxy } from "../core/preview-proxy.js";
+import { buildBriefing, buildProjection } from "../core/projection.js";
+import {
+  PromptQueue,
+  type QueueCondition,
+  type QueueInput,
+  type QueueItem,
+  type QueueState,
+  type QueueTarget
+} from "../core/prompt-queue.js";
+import {
+  newId,
+  projectLoomDir,
+  readProjectConfig,
+  readProjectState,
+  writeMemoryFile,
+  writeProjectConfig,
+  writeProjectState,
+  type BoardTask,
+} from "../core/registry.js";
+import { RouteEngine, resolveSteps } from "../core/routes.js";
+import { SemanticIndex } from "../core/semantic.js";
+import { Servers } from "../core/servers.js";
+import {
+  SkillInstallError,
+  installSkillFromDir,
+  installSkillFromGit,
+  type SkillInstallResult,
+} from "../core/skill-install.js";
 import {
   buildSkillsBlock,
   discoverSkillRoots,
@@ -60,158 +56,50 @@ import {
   type SkillManifest,
   type SkillRoot,
 } from "../core/skills.js";
-import {
-  SkillInstallError,
-  installSkillFromDir,
-  installSkillFromGit,
-  type SkillInstallResult,
-} from "../core/skill-install.js";
-import { resolveSteps, RouteEngine } from "../core/routes.js";
-import { OrchestraEngine, type OrchestraCoordinator } from "../core/orchestra.js";
-import {
-  PromptQueue,
-  describeCondition,
-  type QueueCondition,
-  type QueueInput,
-  type QueueItem,
-  type QueueState,
-  type QueueTarget,
-} from "../core/prompt-queue.js";
-import { blockedBy } from "../core/goal-lanes.js";
-import { Servers, type LogLine, type ServerStatus } from "../core/servers.js";
-import { startPreviewProxy, type PreviewProxy } from "../core/preview-proxy.js";
-import { agentAllowed, cappedPermission, type TeamPolicy } from "../core/team-policy.js";
-import { isPermissionMode, permissionFor, unsupportedReason, type PermissionMode } from "../core/permissions.js";
-import { detectAdes } from "../core/ades.js";
-import { buildBriefing, buildProjection } from "../core/projection.js";
-import {
-  newId,
-  projectLoomDir,
-  readProjectConfig,
-  readProjectState,
-  writeProjectConfig,
-  writeProjectState,
-  writeMemoryFile,
-  type BoardTask,
-} from "../core/registry.js";
+import { type TurnFacts } from "../core/step-conditions.js";
 import { suggestHandoff } from "../core/suggestions.js";
-import {
-  diffSinceSnapshot,
-  porcelainStatus,
-  workingTree,
-  type TurnDiff,
-  type WorkingTree,
-} from "../core/worktree.js";
-import { NO_CHANGES, type TurnFacts } from "../core/step-conditions.js";
-import { SemanticIndex } from "../core/semantic.js";
-import { ModelAdapter } from "../adapters/model.js";
+import { cappedPermission, type TeamPolicy } from "../core/team-policy.js";
 import { describeMerge, mergeAgentWork, type MergeOutcome } from "../core/worktree-merge.js";
-
-/** How many models one ask may go to at once. */
-const MAX_FANOUT = 8;
-
-const PROJECTION_WINDOW = 400; // recent events distilled on handoff
-
-/**
- * How a budget pause is labelled in the shared quarantine map, so this guard
- * can tell its own pauses from the ones a firing alert put there.
- */
-const BUDGET_PAUSE_REASON = "budget ";
-
-/** Local midnight — the day a "USD/day" budget is measured against. */
-function startOfDay(now: number): number {
-  const d = new Date(now);
-  d.setHours(0, 0, 0, 0);
-  return d.getTime();
-}
-
-/**
- * A turn refused because the agent is at or over its daily spend budget.
- *
- * Typed (like NotHolderError) because the callers need to tell it apart: the
- * API answers it with a 409 and the numbers, and a route reports which step
- * couldn't start and why, rather than a generic failure.
- */
-export class BudgetExceededError extends Error {
-  constructor(
-    public readonly agentId: string,
-    public readonly budgetUsd: number,
-    public readonly spentUsd: number,
-  ) {
-    super(
-      `agent "${agentId}" has spent $${spentUsd.toFixed(4)} today, at or over its $${budgetUsd.toFixed(2)}/day budget — raise the budget or wait for the day to roll over`,
-    );
-    this.name = "BudgetExceededError";
-  }
-}
-
-/**
- * Thrown when a dispatch targets an agent a firing alert has paused.
- *
- * Separate from BudgetExceededError because the recovery is different and the
- * UI should say so: a budget pause lifts itself when the day rolls over or you
- * raise the cap, while this one lifts when the alert reports itself resolved.
- */
-export class QuarantinedError extends Error {
-  constructor(
-    public readonly agentId: string,
-    public readonly reason: string,
-    public readonly since: number,
-  ) {
-    super(
-      `agent "${agentId}" is paused by a firing alert — ${reason}. It resumes when that alert resolves, or hand the baton to another agent.`,
-    );
-    this.name = "QuarantinedError";
-  }
-}
-
-export const LOOM_ASK_TIMEOUT_MS = 15_000;
-export const LOOM_ASK_TIMEOUT_MESSAGE =
-  "The agent didn't reply within 15 seconds. Make sure its app is open and signed in, then try again.";
-
-export class LoomAskTimeoutError extends Error {
-  constructor() {
-    super(LOOM_ASK_TIMEOUT_MESSAGE);
-    this.name = "LoomAskTimeoutError";
-  }
-}
-
-export function withLoomAskTimeout<T>(reply: Promise<T>): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new LoomAskTimeoutError()), LOOM_ASK_TIMEOUT_MS);
-    reply.then(
-      (value) => {
-        clearTimeout(timeout);
-        resolve(value);
-      },
-      (err) => {
-        clearTimeout(timeout);
-        reject(err);
-      },
-    );
-  });
-}
-
-/** What briefings need from the team brain (src/daemon/team-brain.ts). */
-export interface TeamBrainHook {
-  /** The tiered pool (canon, team, own), or null when the project isn't shared. */
-  pool(own: Memory[]): TieredMemory[] | null;
-  /** Live team context near these paths (D48), or "". */
-  context(files: string[]): string;
-}
-
-/** The queue is holding because this agent asked the human something. */
-const questionHold = (agentId: string) => `${agentId} asked you something — answer it, or resume to send what's queued`;
-
-/** What the socket carries about a server: a state change, or a line of output. */
-export type ServerFrame =
-  | { kind: "state"; name: string; status: ServerStatus }
-  | { kind: "line"; name: string; line: LogLine };
-
-/** How often a time-held prompt checks the clock. */
-export const CLOCK_TICK_MS = 15_000;
+import {
+  workingTree,
+  type WorkingTree
+} from "../core/worktree.js";
+import {
+  decisionStats,
+  extractDecisions,
+  normalizeStoredDecision,
+  type AgentDecision,
+  type DecisionStats,
+} from "../observability/decisions.js";
+import { turnTraceId } from "../observability/index.js";
+import type {
+  AgentConfig,
+  AnyAgent,
+  ChatInfo,
+  CostSummary,
+  LoomEvent,
+  McpServerConfig,
+  ProjectConfig,
+  ProjectInfo,
+  ProjectStatus,
+  RouteState, RouteStepSpec, RouterKind,
+  SendInput,
+  UnifiedMemory
+} from "../types.js";
+import { GIT_DELIVERIES, MAIN_CHAT, isAdapter, type GitDelivery } from "../types.js";
+import { MAX_FANOUT, PROJECTION_WINDOW, ServerFrame, TeamBrainHook, activityLine, configMtimeOf, withLoomAskTimeout } from './runtime-support.js';
+import { RuntimeAccounting } from './runtime/accounting.js';
+import { RuntimeBriefings } from './runtime/briefings.js';
+import { RuntimeQueue } from './runtime/queue.js';
+import { RuntimeTurns } from './runtime/turns.js';
+export { BudgetExceededError, CLOCK_TICK_MS, LOOM_ASK_TIMEOUT_MESSAGE, LOOM_ASK_TIMEOUT_MS, LoomAskTimeoutError, QuarantinedError, type ServerFrame, type TeamBrainHook, activityLine, planModeBriefing, relativeToProject, withLoomAskTimeout } from './runtime-support.js';
 
 export class ProjectRuntime {
+  private readonly accounting: RuntimeAccounting;
+  private readonly briefings: RuntimeBriefings;
+  private readonly queueCoordinator: RuntimeQueue;
+  private readonly turns: RuntimeTurns;
+
   readonly info: ProjectInfo;
   readonly config: ProjectConfig;
   readonly log: EventLog;
@@ -226,12 +114,6 @@ export class ProjectRuntime {
   private agents = new Map<string, AnyAgent>();
   private startedAgents = new Set<string>();
   private configMtime = 0;
-  /**
-   * Which conversation each agent's current turn belongs to. Set when a turn
-   * starts and left in place afterwards — an agent's trailing events (a late
-   * run_complete, a diff) still belong to the chat that prompted them.
-   */
-  private turnChat = new Map<string, string>();
   /** What you've lined up, run one at a time — see core/prompt-queue.ts. */
   readonly queue: PromptQueue;
   /** This project's dev servers — see core/servers.ts. */
@@ -239,24 +121,68 @@ export class ProjectRuntime {
   /** One preview proxy per server — see core/preview-proxy.ts. */
   private proxies = new Map<string, PreviewProxy>();
   private serverListeners = new Set<(f: ServerFrame) => void>();
-  private queueListeners = new Set<(s: QueueState) => void>();
-  private draining = false;
-
-  /**
-   * The dense retrieval channel, when this project opted in (brain.semantic).
-   *
-   * Null is the normal state, and null costs nothing: no model is loaded, no
-   * vectors are written, and retrieval is the three lexical channels. Loading
-   * happens in the background — the first brief after a cold start uses
-   * whatever is ready, which is the honest thing for something that takes ten
-   * seconds to warm up.
-   */
-  private semantic: SemanticIndex | null = null;
 
   private constructor(info: ProjectInfo, config: ProjectConfig, log: EventLog) {
     this.info = info;
     this.config = config;
     this.log = log;
+    const runtime = this;
+    this.accounting = new RuntimeAccounting({
+      get log() { return runtime.log; },
+      appendIfOpen: (...args) => this.appendIfOpen(...args),
+      get info() { return runtime.info; },
+    });
+    this.briefings = new RuntimeBriefings({
+      get info() { return runtime.info; },
+      get config() { return runtime.config; },
+      get log() { return runtime.log; },
+      get teamBrain() { return runtime.teamBrain; },
+      get brain() { return runtime.brain; },
+      activeSkillsBlock: (...args) => this.activeSkillsBlock(...args),
+      get turnChat() { return runtime.turns.turnChat; },
+    });
+    this.queueCoordinator = new RuntimeQueue({
+      get queue() { return runtime.queue; },
+      get agents() { return runtime.agents; },
+      routeState: (...args) => this.routeState(...args),
+      validHolder: (...args) => this.validHolder(...args),
+      get orchestra() { return runtime.orchestra; },
+      get config() { return runtime.config; },
+      get busySince() { return runtime.turns.busySince; },
+      get closed() { return runtime.closed; },
+      appendIfOpen: (...args) => this.appendIfOpen(...args),
+      startRoute: (...args) => this.startRoute(...args),
+      handoff: (...args) => this.handoff(...args),
+      sendMessage: (...args) => this.sendMessage(...args),
+    });
+    this.turns = new RuntimeTurns({
+      staleTurnMs: ProjectRuntime.STALE_TURN_MS,
+      agentDir: (...args) => this.agentDir(...args),
+      get log() { return runtime.log; },
+      get info() { return runtime.info; },
+      extractMemory: (...args) => this.extractMemory(...args),
+      get config() { return runtime.config; },
+      chatBinding: (...args) => this.chatBinding(...args),
+      validHolder: (...args) => this.validHolder(...args),
+      defaultAdapterId: (...args) => this.defaultAdapterId(...args),
+      agent: (...args) => this.agent(...args),
+      enforceQuarantine: (...args) => this.enforceQuarantine(...args),
+      enforceBudget: (...args) => this.enforceBudget(...args),
+      get teamPolicy() { return runtime.teamPolicy; },
+      get baton() { return runtime.baton; },
+      releaseQuestionHold: (...args) => this.releaseQuestionHold(...args),
+      get queue() { return runtime.queue; },
+      get routes() { return runtime.routes; },
+      ensureStarted: (...args) => this.ensureStarted(...args),
+      consumePendingBriefing: (...args) => this.consumePendingBriefing(...args),
+      activeSkillsBlock: (...args) => this.activeSkillsBlock(...args),
+      healthyMcps: (...args) => this.healthyMcps(...args),
+      appendIfOpen: (...args) => this.appendIfOpen(...args),
+      get agents() { return runtime.agents; },
+      handoff: (...args) => this.handoff(...args),
+      get pendingBriefings() { return runtime.briefings.pendingBriefings; },
+    });
+
     this.baton = new BatonManager(info.dir, log);
     if (config.brain?.semantic) {
       const index = new SemanticIndex(path.join(info.dir, ".loom"));
@@ -264,7 +190,7 @@ export class ProjectRuntime {
         .start()
         .then(async (ok) => {
           if (!ok) return; // the runtime isn't installed; logbook said so
-          this.semantic = index;
+          this.briefings.semantic = index;
           const made = await index.sync(this.brain.all());
           if (made) logbook.info("brain", `embedded ${made} memories for semantic retrieval`, "", info.id);
         })
@@ -287,7 +213,7 @@ export class ProjectRuntime {
       handoff: (to) => this.handoff(to, { source: "route" }),
       send: (text, agentId) => this.sendMessage(text, agentId, { source: "route" }),
       interrupt: () => this.interrupt({ source: "route" }),
-      costTotal: () => this.costs.totalUsd,
+      costTotal: () => this.accounting.costs.totalUsd,
       turnFacts: (agentId) => this.turnFacts(agentId),
       isAdapterId: (id) => {
         const agent = this.agents.get(id);
@@ -335,7 +261,7 @@ export class ProjectRuntime {
     });
 
     this.queue = new PromptQueue(path.join(projectLoomDir(info.dir), "queue.json"), (q) => {
-      for (const cb of this.queueListeners) cb(q);
+      for (const cb of this.queueCoordinator.queueListeners) cb(q);
       this.watchClockConditions(q);
     });
 
@@ -380,7 +306,7 @@ export class ProjectRuntime {
     rt.startMcpHealthLoop();
     void detectAdes()
       .then((found) => (rt.installedKinds = Object.keys(found).filter((k) => found[k])))
-      .catch(() => {});
+      .catch(() => { });
     // Worktree-per-agent: prepare each adapter's checkout and respawn it there.
     // Safe pre-start — agents are constructed lazily-started, so replacing the
     // instance before its first turn loses nothing.
@@ -396,138 +322,18 @@ export class ProjectRuntime {
     }
     return rt;
   }
+  private rehydrateCosts(): void { return this.accounting.rehydrateCosts(); }
 
-  // -------------------------------------------------------------------------
-  // Cost telemetry — O(1) incremental, rehydrated from the log on open
-  // -------------------------------------------------------------------------
+  private trackCost(event: LoomEvent): void { return this.accounting.trackCost(event); }
 
-  private costs = { totalUsd: 0, turns: 0, totalMs: 0, tokensIn: 0, tokensOut: 0 };
-  private costsByAgent = new Map<
-    string,
-    { usd: number; turns: number; ms: number; tokensIn: number; tokensOut: number }
-  >();
-  // A turn's cost lands on a `turn_cost` status just before its `run_complete`
-  // (the CLI reports it mid-stream). We hold it here so the completed turn — and
-  // therefore its exported gen_ai span — carries the real cost, not just tokens.
-  private pendingCost = new Map<string, number>();
-  // Turn text accumulated per agent (from its message events) so we can extract
-  // structured decisions once the turn completes. Reset after each run_complete.
-  private turnText = new Map<string, string>();
+  costSummary(): CostSummary { return this.accounting.costSummary(); }
 
-  private rehydrateCosts(): void {
-    for (const event of this.log.list({ kinds: ["status", "run_complete"] })) {
-      this.trackCost(event);
-    }
-  }
+  budgets(): Record<string, number> { return this.accounting.budgets(); }
 
-  private trackCost(event: LoomEvent): void {
-    const agentId = event.agentId ?? "unknown";
-    const entry =
-      this.costsByAgent.get(agentId) ?? { usd: 0, turns: 0, ms: 0, tokensIn: 0, tokensOut: 0 };
-    if (event.kind === "status" && event.payload.state === "turn_cost") {
-      const usd = Number(event.payload.costUsd ?? 0);
-      if (usd > 0) {
-        this.costs.totalUsd += usd;
-        entry.usd += usd;
-        this.costsByAgent.set(agentId, entry);
-        // The moment the money crosses the cap, pause — don't wait for the next
-        // dispatch to notice. enforceBudget still guards every dispatch (that's
-        // the hard stop); this makes the pause visible when the spend happens,
-        // so a looping agent shows as paused NOW rather than at its next ask,
-        // and the burn panel's "over" and the roster's "paused" agree in time.
-        const cap = this.budgets()[agentId];
-        if (
-          Number.isFinite(cap) &&
-          cap! > 0 &&
-          this.spendTodayFor(agentId) >= cap! &&
-          !this.quarantined()[agentId]
-        ) {
-          this.quarantine(agentId, `${BUDGET_PAUSE_REASON}$${cap!.toFixed(2)}/day`, false);
-          this.appendIfOpen({
-            kind: "status",
-            agentId,
-            payload: { state: "budget_exceeded", budgetUsd: cap, spentTodayUsd: this.spendTodayFor(agentId) },
-          });
-        }
-      }
-    } else if (event.kind === "run_complete") {
-      const ms = Number(event.payload.durationMs ?? 0);
-      // Adapters that report token usage (codex, claude-code, …) carry it on
-      // run_complete; cost-only adapters leave these 0. Either way the totals
-      // stay honest — an absent number is never invented here.
-      const tin = Number(event.payload.inputTokens ?? event.payload.tokensIn ?? 0) || 0;
-      const tout = Number(event.payload.outputTokens ?? event.payload.tokensOut ?? 0) || 0;
-      this.costs.turns += 1;
-      this.costs.totalMs += ms;
-      this.costs.tokensIn += tin;
-      this.costs.tokensOut += tout;
-      entry.turns += 1;
-      entry.ms += ms;
-      entry.tokensIn += tin;
-      entry.tokensOut += tout;
-      this.costsByAgent.set(agentId, entry);
-    }
-  }
+  setBudget(agentId: string, usdPerDay: number): Record<string, number> { return this.accounting.setBudget(agentId, usdPerDay); }
 
-  costSummary(): CostSummary {
-    const byAgent: AgentCost[] = [...this.costsByAgent.entries()]
-      .map(([agentId, c]) => ({ agentId, ...c }))
-      .sort((a, b) => b.usd - a.usd || b.turns - a.turns);
-    return {
-      totalUsd: this.costs.totalUsd,
-      turns: this.costs.turns,
-      totalMs: this.costs.totalMs,
-      tokensIn: this.costs.tokensIn,
-      tokensOut: this.costs.tokensOut,
-      byAgent,
-    };
-  }
+  spendTodayFor(agentId: string, now = Date.now()): number { return this.accounting.spendTodayFor(agentId, now); }
 
-  /** Per-agent spend budgets (USD/day), set from the Observatory burn-rate panel. */
-  budgets(): Record<string, number> {
-    return readProjectState(this.info.dir).budgets ?? {};
-  }
-
-  /** Set (usd > 0) or clear (usd ≤ 0) one agent's daily budget; returns the new map. */
-  setBudget(agentId: string, usdPerDay: number): Record<string, number> {
-    const state = readProjectState(this.info.dir);
-    const budgets = { ...(state.budgets ?? {}) };
-    if (Number.isFinite(usdPerDay) && usdPerDay > 0) budgets[agentId] = usdPerDay;
-    else delete budgets[agentId];
-    writeProjectState(this.info.dir, { ...state, budgets });
-    return budgets;
-  }
-
-  /**
-   * What one agent has really spent since local midnight.
-   *
-   * Read from the log, using the same rule the running cost totals use: a
-   * turn's money arrives on a `turn_cost` status and nowhere else. (The same
-   * figure is copied onto `run_complete` for the exported span; counting both
-   * would double every turn.) Adapters that report tokens but no dollars —
-   * codex, agy — contribute 0, honestly, because they hand us no price.
-   */
-  spendTodayFor(agentId: string, now = Date.now()): number {
-    const since = startOfDay(now);
-    let usd = 0;
-    for (const e of this.log.list({ kinds: ["status"] })) {
-      if (e.agentId !== agentId || e.ts < since) continue;
-      if (e.payload.state !== "turn_cost") continue;
-      usd += Number(e.payload.costUsd ?? 0) || 0;
-    }
-    return usd;
-  }
-
-  /**
-   * The spend ledger as a daily series, per agent per day.
-   *
-   * "What did this project cost me last week" had no answer short of reading
-   * turn by turn. Same source of truth as spendTodayFor — turn_cost statuses
-   * and nowhere else — bucketed by local day. Tokens ride along from
-   * run_complete, keyed the same way, so 'which agent is eating the tokens'
-   * (#17) is the same walk as 'what did this cost' (#16). Days with no spend
-   * simply don't appear; a chart can zero-fill, the API doesn't lie.
-   */
   costSeries(days = 30, now = Date.now()): Array<{
     day: string;
     usd: number;
@@ -535,178 +341,21 @@ export class ProjectRuntime {
     tokensIn: number;
     tokensOut: number;
     byAgent: Record<string, { usd: number; turns: number; tokensIn: number; tokensOut: number }>;
-  }> {
-    const since = startOfDay(now) - (days - 1) * 24 * 60 * 60 * 1000;
-    const buckets = new Map<
-      string,
-      {
-        usd: number;
-        turns: number;
-        tokensIn: number;
-        tokensOut: number;
-        byAgent: Record<string, { usd: number; turns: number; tokensIn: number; tokensOut: number }>;
-      }
-    >();
-    const dayOf = (ts: number): string => {
-      const d = new Date(ts);
-      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-    };
-    const bucket = (ts: number) => {
-      const key = dayOf(ts);
-      let b = buckets.get(key);
-      if (!b) {
-        b = { usd: 0, turns: 0, tokensIn: 0, tokensOut: 0, byAgent: {} };
-        buckets.set(key, b);
-      }
-      return b;
-    };
-    const agentSlot = (
-      b: ReturnType<typeof bucket>,
-      agentId: string,
-    ): { usd: number; turns: number; tokensIn: number; tokensOut: number } => {
-      let s = b.byAgent[agentId];
-      if (!s) {
-        s = { usd: 0, turns: 0, tokensIn: 0, tokensOut: 0 };
-        b.byAgent[agentId] = s;
-      }
-      return s;
-    };
-    for (const e of this.log.list({ kinds: ["status", "run_complete"] })) {
-      if (e.ts < since) continue;
-      const agentId = e.agentId ?? "unknown";
-      if (e.kind === "status" && e.payload.state === "turn_cost") {
-        const usd = Number(e.payload.costUsd ?? 0) || 0;
-        if (usd <= 0) continue;
-        const b = bucket(e.ts);
-        b.usd += usd;
-        agentSlot(b, agentId).usd += usd;
-      } else if (e.kind === "run_complete") {
-        const tin = Number(e.payload.inputTokens ?? e.payload.tokensIn ?? 0) || 0;
-        const tout = Number(e.payload.outputTokens ?? e.payload.tokensOut ?? 0) || 0;
-        const b = bucket(e.ts);
-        b.turns += 1;
-        b.tokensIn += tin;
-        b.tokensOut += tout;
-        const s = agentSlot(b, agentId);
-        s.turns += 1;
-        s.tokensIn += tin;
-        s.tokensOut += tout;
-      }
-    }
-    return [...buckets.entries()]
-      .map(([day, b]) => ({ day, ...b }))
-      .sort((a, b) => a.day.localeCompare(b.day));
-  }
+  }> { return this.accounting.costSeries(days, now); }
 
-  /** Every budgeted agent: its cap, what it has spent today, and whether it's out. */
-  budgetStatus(now = Date.now()): Record<string, { budgetUsd: number; spentTodayUsd: number; over: boolean }> {
-    const out: Record<string, { budgetUsd: number; spentTodayUsd: number; over: boolean }> = {};
-    for (const [agentId, budgetUsd] of Object.entries(this.budgets())) {
-      const spentTodayUsd = this.spendTodayFor(agentId, now);
-      out[agentId] = { budgetUsd, spentTodayUsd, over: spentTodayUsd >= budgetUsd };
-    }
-    return out;
-  }
+  budgetStatus(now = Date.now()): Record<string, { budgetUsd: number; spentTodayUsd: number; over: boolean }> { return this.accounting.budgetStatus(now); }
 
-  /**
-   * Refuse to dispatch to an agent a firing alert has paused.
-   *
-   * The self-heal loop wrote quarantines into state and *nothing read them
-   * back*: the webhook paused an agent, and the very next handoff or message
-   * went straight to it. So the headline feature — the telemetry backend says
-   * an agent is unhealthy, Loom takes it out of rotation — paused nothing at
-   * all. It sat beside `enforceBudget`, which had exactly the same bug and was
-   * fixed; this is the other half.
-   *
-   * Budget pauses are skipped here because `enforceBudget` owns them and can
-   * lift them on its own (a new day, a raised cap). An alert pause only lifts
-   * when the alert says resolved, so there is nothing to re-check.
-   */
-  private enforceQuarantine(agentId: string): void {
-    const q = this.quarantined()[agentId];
-    if (!q || q.reason.startsWith(BUDGET_PAUSE_REASON)) return;
-    throw new QuarantinedError(agentId, q.reason, q.since);
-  }
+  private enforceQuarantine(agentId: string): void { return this.accounting.enforceQuarantine(agentId); }
 
-  /**
-   * Refuse a turn an agent can't afford.
-   *
-   * A budget that nothing checks is a text field, and that is all this was: the
-   * burn panel wrote USD/day into state and no code path ever read it back, so
-   * an agent with a $1 cap would happily spend $40. Now every dispatch — a
-   * message you send, a baton hop, a route step — passes through here first.
-   *
-   * At or over the cap the agent is quarantined and the turn throws, taking the
-   * same route through the UI as the self-heal alert pause (same state map,
-   * same shape) so a paused agent looks paused however it got there. The pause
-   * lifts itself: the spend is measured against the current day, so when the
-   * day rolls over — or you raise the cap — the next attempt clears it and logs
-   * the recovery. A budget of 0/unset means no budget, and nothing is enforced.
-   */
-  private enforceBudget(agentId: string, now = Date.now()): void {
-    const budgetUsd = this.budgets()[agentId];
-    if (!Number.isFinite(budgetUsd) || !budgetUsd || budgetUsd <= 0) {
-      this.liftBudgetPause(agentId, now);
-      return;
-    }
-    const spentUsd = this.spendTodayFor(agentId, now);
-    if (spentUsd < budgetUsd) {
-      this.liftBudgetPause(agentId, now);
-      return;
-    }
-    if (!this.quarantined()[agentId]) {
-      this.quarantine(agentId, `${BUDGET_PAUSE_REASON}$${budgetUsd.toFixed(2)}/day`, false, now);
-    }
-    // One event per refusal, not one per pause: the thread should show every
-    // turn that didn't happen, not just the first.
-    this.log.append({
-      kind: "status",
-      agentId,
-      payload: { state: "budget_exceeded", budgetUsd, spentTodayUsd: spentUsd },
-    });
-    throw new BudgetExceededError(agentId, budgetUsd, spentUsd);
-  }
+  private enforceBudget(agentId: string, now = Date.now()): void { return this.accounting.enforceBudget(agentId, now); }
 
-  /**
-   * Lift a pause this guard put there, and only that one — a quarantine from a
-   * firing alert is somebody else's to lift, and clearing it here would
-   * un-pause an agent that is still broken.
-   */
-  private liftBudgetPause(agentId: string, now = Date.now()): void {
-    const q = this.quarantined()[agentId];
-    if (!q?.reason.startsWith(BUDGET_PAUSE_REASON)) return;
-    this.unquarantine(agentId);
-    this.log.append({
-      kind: "status",
-      agentId,
-      payload: { state: "budget_recovered", reason: q.reason, pausedMs: Math.max(0, now - q.since) },
-    });
-  }
+  private liftBudgetPause(agentId: string, now = Date.now()): void { return this.accounting.liftBudgetPause(agentId, now); }
 
-  /** Agents currently paused by a firing alert (self-heal quarantine). */
-  quarantined(): Record<string, { reason: string; since: number; displaced: boolean }> {
-    return readProjectState(this.info.dir).quarantine ?? {};
-  }
+  quarantined(): Record<string, { reason: string; since: number; displaced: boolean }> { return this.accounting.quarantined(); }
 
-  /** Pause an agent (a firing alert). `displaced` marks that it lost the baton to a fallback. */
-  quarantine(agentId: string, reason: string, displaced: boolean, now = Date.now()): void {
-    const state = readProjectState(this.info.dir);
-    const quarantine = { ...(state.quarantine ?? {}) };
-    quarantine[agentId] = { reason, since: now, displaced };
-    writeProjectState(this.info.dir, { ...state, quarantine });
-  }
+  quarantine(agentId: string, reason: string, displaced: boolean, now = Date.now()): void { return this.accounting.quarantine(agentId, reason, displaced, now); }
 
-  /** Lift an agent's quarantine (its alert resolved); returns what it was, or null. */
-  unquarantine(agentId: string): { reason: string; since: number; displaced: boolean } | null {
-    const state = readProjectState(this.info.dir);
-    const quarantine = { ...(state.quarantine ?? {}) };
-    const prev = quarantine[agentId] ?? null;
-    if (prev) {
-      delete quarantine[agentId];
-      writeProjectState(this.info.dir, { ...state, quarantine });
-    }
-    return prev;
-  }
+  unquarantine(agentId: string): { reason: string; since: number; displaced: boolean } | null { return this.accounting.unquarantine(agentId); }
 
   /** Has .loom/config.json changed since this runtime was opened? */
   configStale(): boolean {
@@ -1005,7 +654,7 @@ export class ProjectRuntime {
     );
     this.agents.set(cfg.id, agent);
     agent.onEvent((e) => {
-      const chat = this.turnChat.get(agent.id);
+      const chat = this.turns.turnChat.get(agent.id);
       let payload = e.payload;
       // Enrich the completed turn so its gen_ai span carries system + model +
       // cost (adapters only put tokens on run_complete). The kind is known
@@ -1014,13 +663,13 @@ export class ProjectRuntime {
       const p = e.payload as Record<string, unknown>;
       if (e.kind === "status" && p.state === "turn_cost") {
         const usd = Number(p.costUsd ?? 0);
-        if (usd > 0) this.pendingCost.set(agent.id, usd);
+        if (usd > 0) this.turns.pendingCost.set(agent.id, usd);
       } else if (e.kind === "run_complete") {
         const model =
           (typeof p.model === "string" && p.model) ||
           (typeof cfg.options?.model === "string" ? cfg.options.model : undefined);
-        const cost = this.pendingCost.get(agent.id);
-        this.pendingCost.delete(agent.id);
+        const cost = this.turns.pendingCost.get(agent.id);
+        this.turns.pendingCost.delete(agent.id);
         payload = {
           ...p,
           adapter: cfg.kind,
@@ -1037,7 +686,7 @@ export class ProjectRuntime {
       // an error is over, not hung.
       const turnOver = e.kind === "run_complete" || e.kind === "error" || (e.kind === "status" && p.state === "interrupted");
       if (turnOver) {
-        this.busySince.delete(agent.id);
+        this.turns.busySince.delete(agent.id);
         // the next queued prompt may go (a Stop paused the queue first — see interrupt)
         this.kickQueue();
       }
@@ -1075,7 +724,7 @@ export class ProjectRuntime {
     this.config.agents = this.config.agents.filter((a) => a.id !== agentId);
     this.saveConfig();
     if (live) {
-      void Promise.resolve(live.stop()).catch(() => {});
+      void Promise.resolve(live.stop()).catch(() => { });
       this.agents.delete(agentId);
     }
     return { removed: agentId };
@@ -1110,7 +759,7 @@ export class ProjectRuntime {
     // Rebuild so the new model actually takes: stop the old process, spawn a
     // replacement subscribed exactly as the constructor's loop does.
     if (live) {
-      void Promise.resolve(live.stop()).catch(() => {});
+      void Promise.resolve(live.stop()).catch(() => { });
       this.agents.delete(agentId);
     }
     this.spawnAgent(cfg);
@@ -1141,7 +790,7 @@ export class ProjectRuntime {
     }
     cfg.options = { ...(cfg.options ?? {}), permissions: mode };
     if (live) {
-      void Promise.resolve(live.stop()).catch(() => {});
+      void Promise.resolve(live.stop()).catch(() => { });
       this.agents.delete(agentId);
       this.startedAgents.delete(agentId);
     }
@@ -1281,7 +930,7 @@ export class ProjectRuntime {
     if (on && !live) {
       this.spawnAgent(cfg); // bring it back to life
     } else if (!on && live) {
-      void Promise.resolve(live.stop()).catch(() => {});
+      void Promise.resolve(live.stop()).catch(() => { });
       this.agents.delete(agentId);
       this.startedAgents.delete(agentId);
     }
@@ -1392,7 +1041,7 @@ export class ProjectRuntime {
   startMcpHealthLoop(intervalMs = Number(process.env.LOOM_MCP_POLL_MS) || 60_000): void {
     if (this.mcpTimer || !(this.config.mcps ?? []).length) return;
     this.mcpTimer = setInterval(() => {
-      void this.pollMcpHealth().catch(() => {});
+      void this.pollMcpHealth().catch(() => { });
     }, intervalMs);
     this.mcpTimer.unref?.();
   }
@@ -1836,391 +1485,40 @@ export class ProjectRuntime {
     }
     return agent;
   }
+  private async checkpointBefore(agentId: string, prompt: string): Promise<void> { return this.turns.checkpointBefore(agentId, prompt); }
 
-  /** Pre-turn porcelain snapshots, for per-prompt diff attribution. */
-  private preTurnTree = new Map<string, string>();
+  checkpoints(): Promise<checkpoints.Checkpoint[]> { return this.turns.checkpoints(); }
 
-  /** The checkpoint taken before each agent's current turn (#101). */
-  private turnCheckpoint = new Map<string, string>();
+  async rewind(id: string): Promise<checkpoints.RestoreResult> { return this.turns.rewind(id); }
 
-  /**
-   * Write down what the files are, before a turn changes them (#101).
-   *
-   * Announced in the log so the thread can offer "put it back" on the turn
-   * that follows it, and so the list survives a daemon restart with the
-   * labels intact. Failing is not an error: a checkpoint is a courtesy, and
-   * a project that isn't a git repo simply doesn't get one. What it must
-   * never do is stop the turn.
-   */
-  private async checkpointBefore(agentId: string, prompt: string): Promise<void> {
-    try {
-      const label = prompt.replace(/\s+/g, " ").trim().slice(0, 120) || `a turn by ${agentId}`;
-      const cp = await checkpoints.capture(this.agentDir(agentId), label);
-      if (!cp) return;
-      // Carried onto this turn's turn_diff, so the card that shows what
-      // changed also knows the point to put it back to. Working it out in the
-      // client by "the checkpoint nearest above this card" would be right
-      // until the day two turns interleave.
-      this.turnCheckpoint.set(agentId, cp.id);
-      this.log.append({
-        kind: "checkpoint",
-        agentId,
-        payload: { id: cp.id, label: cp.label, at: cp.at, dirty: cp.dirty, branch: cp.branch, reason: "before_turn" },
-      });
-    } catch {
-      /* never the reason a turn doesn't run */
-    }
-  }
+  async turnFacts(agentId: string): Promise<TurnFacts> { return this.turns.turnFacts(agentId); }
 
-  /** Every point this project's files can be put back to, newest first. */
-  checkpoints(): Promise<checkpoints.Checkpoint[]> {
-    return checkpoints.list(this.info.dir);
-  }
+  private captureTurnDiff(agentId: string): void { return this.turns.captureTurnDiff(agentId); }
 
-  /**
-   * Put the files back, and say what moved.
-   *
-   * Refused while an agent is mid-turn: rewinding the tree under a running
-   * agent gives it a working directory that contradicts everything it has
-   * read this turn, and the damage lands in whatever it writes next.
-   */
-  async rewind(id: string): Promise<checkpoints.RestoreResult> {
-    const busy = [...this.busySince.keys()];
-    if (busy.length) {
-      throw new Error(
-        `${busy.join(", ")} ${busy.length === 1 ? "is" : "are"} mid-turn — stop the turn first, or the rewind lands underneath it`,
-      );
-    }
-    const out = await checkpoints.restore(this.info.dir, id);
-    this.log.append({
-      kind: "checkpoint",
-      payload: {
-        id: out.restored.id,
-        label: out.restored.label,
-        at: Date.now(),
-        reason: "rewound",
-        files: out.changed.length,
-        undo: out.undo.id,
-      },
-    });
-    return out;
-  }
+  private async commitTurn(agentId: string, files: string[]): Promise<void> { return this.turns.commitTurn(agentId, files); }
 
-  /**
-   * The diff of each agent's most recent turn, as a promise.
-   *
-   * A route's step conditions ("run the reviewer if more than 200 lines
-   * changed") are decided the moment the turn completes, which is before the
-   * diff has finished being computed. Keeping the promise lets the route wait
-   * for the real numbers instead of reading the previous turn's.
-   */
-  private lastTurnDiff = new Map<string, Promise<TurnDiff | null>>();
+  private extractMemory(agentId: string, files: string[]): void { return this.briefings.extractMemory(agentId, files); }
 
-  /** What an agent's last turn changed — for route step conditions. */
-  async turnFacts(agentId: string): Promise<TurnFacts> {
-    const diff = await (this.lastTurnDiff.get(agentId) ?? Promise.resolve(null));
-    if (!diff) return NO_CHANGES;
-    return { files: diff.files.map((f) => f.path), added: diff.added, removed: diff.removed };
-  }
-
-  /** After a turn: log which files that prompt changed (turn_diff), then learn. */
-  private captureTurnDiff(agentId: string): void {
-    const before = this.preTurnTree.get(agentId);
-    if (before === undefined) {
-      // No snapshot (e.g. a turn with no pre-tree) — still worth reading.
-      // The previous turn's diff goes with it: a route asking what this turn
-      // changed must not be handed the last one's numbers.
-      this.lastTurnDiff.delete(agentId);
-      this.extractMemory(agentId, []);
-      return;
-    }
-    this.preTurnTree.delete(agentId);
-    const checkpoint = this.turnCheckpoint.get(agentId);
-    this.turnCheckpoint.delete(agentId);
-    const pending = diffSinceSnapshot(this.agentDir(agentId), before).catch(() => null);
-    this.lastTurnDiff.set(agentId, pending);
-    void pending
-      .then((diff) => {
-        if (diff) {
-          this.log.append({
-            kind: "turn_diff",
-            agentId,
-            payload: {
-              files: diff.files,
-              added: diff.added,
-              removed: diff.removed,
-              patch: diff.patch,
-              truncated: diff.truncated,
-              // The point these changes can be put back to, when there is one
-              // — a project that isn't a git repo has no checkpoint to offer.
-              ...(checkpoint ? { checkpoint } : {}),
-            },
-          });
-          void this.commitTurn(agentId, diff.files.map((f) => f.path));
-        }
-        // Learn from the turn once we know which files it touched — the files
-        // sharpen candidate retrieval. Runs after the diff so recentTurnFiles
-        // isn't needed; the files are right here.
-        this.extractMemory(agentId, (diff?.files ?? []).map((f) => f.path));
-      })
-      .catch(() => this.extractMemory(agentId, []));
-  }
-
-  /**
-   * Opt-in: commit a turn's changes as they land, with the agent as co-author.
-   *
-   * git blame on a fleet's work answered "who wrote this" with whoever ran the
-   * daemon. With `git.commitPerTurn` on, each turn's changes become one commit —
-   * subject from the prompt that caused them, `Co-Authored-By: <agent> via
-   * Loom` so both git log and GitHub attribute the work.
-   *
-   * Off by default and per-project on purpose: committing is a policy, not a
-   * mechanic, and half-done turns land too. Only the files THIS turn touched
-   * are staged, so two agents finishing close together each commit their own
-   * work rather than whoever finishes second swallowing both.
-   */
-  private async commitTurn(agentId: string, files: string[]): Promise<void> {
-    const delivery = this.config.git?.delivery ?? "none";
-    if ((!this.config.git?.commitPerTurn && delivery === "none") || !files.length) return;
-    try {
-      const events = this.log.list({ limit: 60 });
-      const prompt =
-        [...events].reverse().find((e) => e.kind === "message" && !e.agentId)?.payload.text ?? "";
-      const subject = String(prompt).split("\n")[0]!.slice(0, 68) || `work by ${agentId}`;
-      const cfg = this.config.agents.find((a) => a.id === agentId);
-      const message =
-        `${subject}\n\n` +
-        `Turn by ${agentId}${cfg ? ` (${cfg.kind})` : ""} in Loom.\n` +
-        `Co-Authored-By: ${agentId} <${agentId}@loom.local>`;
-      await stageAndCommitFiles(this.agentDir(agentId), files, message);
-      this.log.append({
-        kind: "status",
-        agentId,
-        payload: { state: "turn_committed", files: files.length, subject },
-      });
-      // "push" delivers each committed turn; "pr" leaves pushing to the
-      // orchestra's branch (a PR per turn is the flood teams complain about).
-      if (delivery === "push") {
-        const pushed = await gitPush(this.agentDir(agentId));
-        this.log.append({ kind: "status", agentId, payload: { state: "turn_pushed", branch: pushed.branch } });
-      }
-    } catch (err) {
-      // A commit that can't happen (not a repo, hooks failed, nothing staged
-      // after filters) is a Console line, never a failed turn.
-      logbook.warn(
-        "git",
-        `turn commit skipped for ${agentId}`,
-        err instanceof Error ? err.message : String(err),
-        this.info.id,
-      );
-    }
-  }
-
-  /**
-   * Phase 2: read a finished turn for durable memory.
-   *
-   * Fire-and-forget on purpose. A slow or missing extractor must never delay
-   * anything — extractFromTurn already swallows engine failures, and this is
-   * void-ed so even an unexpected throw can't escape into the event pipeline.
-   * Off entirely when config says so; a no-op when Claude isn't available.
-   */
-  private extractMemory(agentId: string, files: string[]): void {
-    if (this.config.brain?.extractor === "off") return;
-    const chat = this.turnChat.get(agentId) ?? MAIN_CHAT;
-    const turn = this.gatherTurnText(chat);
-    if (turn.length < 40) return; // nothing substantial to learn from
-    const model = this.config.brain?.model ?? "haiku";
-    const engine: ExtractEngine = (p) =>
-      claudeText(`${p.system}\n\n${p.user}`, { model, timeoutMs: 60_000 });
-    const recent = this.log.list({ limit: 80 }).filter((e) => (e.chat ?? MAIN_CHAT) === chat);
-    void extractFromTurn(this.brain, turn, {
-      engine,
-      agentId,
-      chat,
-      ...(files.length ? { files } : {}),
-      eventId: this.log.lastId(),
-      ...(readExternalContent(recent) ? { untrusted: true } : {}),
-    })
-      .then((res) => {
-        const learned = res.added.length + res.updated.length + res.forgotten.length;
-        if (learned > 0) {
-          this.log.append({
-            kind: "status",
-            payload: {
-              state: "brain_extract",
-              agentId,
-              added: res.added.length,
-              updated: res.updated.length,
-              forgotten: res.forgotten.length,
-            },
-          });
-        }
-      })
-      .catch(() => {});
-  }
-
-  /**
-   * The transcript of the most recent turn in a chat: from the last human
-   * message to now — the user's ask and what the agent did in reply.
-   */
-  private gatherTurnText(chat: string): string {
-    const events = this.log.list({ chat, limit: 40 });
-    let start = 0;
-    for (let i = events.length - 1; i >= 0; i--) {
-      if (events[i]!.kind === "message" && !events[i]!.agentId) {
-        start = i;
-        break;
-      }
-    }
-    const lines: string[] = [];
-    for (const e of events.slice(start)) {
-      const p = e.payload;
-      if (e.kind === "message") {
-        lines.push(`${e.agentId ?? "user"}: ${String(p.text ?? "").slice(0, 2000)}`);
-      } else if (e.kind === "tool_call") {
-        lines.push(`[${e.agentId} used ${String(p.tool ?? "a tool")}] ${String(p.summary ?? "")}`.trim());
-      } else if (e.kind === "file_edit") {
-        lines.push(`[${e.agentId} edited ${String(p.path ?? "")}]`);
-      } else if (e.kind === "decision") {
-        lines.push(`decision: ${String(p.text ?? "")}`);
-      }
-    }
-    return lines.join("\n").trim();
-  }
+  private gatherTurnText(chat: string): string { return this.briefings.gatherTurnText(chat); }
 
   workingTree(): Promise<WorkingTree> {
     return workingTree(this.info.dir);
   }
+  private importedMemory(): ImportedBlock[] { return this.briefings.importedMemory(); }
 
-  // -------------------------------------------------------------------------
-  // Unified memory — "multiple memory in one"
-  // -------------------------------------------------------------------------
+  unifiedMemory(): UnifiedMemory { return this.briefings.unifiedMemory(); }
 
-  /** Freshly read every connected ADE's native memory from disk. */
-  private importedMemory(): ImportedBlock[] {
-    return readNativeMemory(this.info.dir, this.config);
-  }
+  private async retrieveBrief(events: LoomEvent[], agentId: string): Promise<string> { return this.briefings.retrieveBrief(events, agentId); }
 
-  /** The merged brain: decisions + imported ADE memories + shared context. */
-  unifiedMemory(): UnifiedMemory {
-    return buildUnifiedMemory(this.info.name, this.log.list(), this.importedMemory());
-  }
+  private brainBrief(opts: RetrieveOpts): string { return this.briefings.brainBrief(opts); }
 
-  /**
-   * Phase 3: the brain brief for a handoff — the memories relevant to the work
-   * in flight, compiled. Query is the recent conversation plus the files recent
-   * turns touched; scoped to the incoming agent; low-confidence memories are
-   * held back from injection (they stay visible in the Brain tab). Empty string
-   * when there's nothing relevant, so callers append it unconditionally.
-   */
-  private async retrieveBrief(events: LoomEvent[], agentId: string): Promise<string> {
-    const query = events
-      .filter((e) => e.kind === "message")
-      .slice(-8)
-      .map((e) => String(e.payload.text ?? ""))
-      .join(" ");
-    const files = [
-      ...new Set(
-        events
-          .filter((e) => e.kind === "turn_diff")
-          .flatMap((e) => {
-            // turn_diff stores ChangedFile[] ({status, path}); older events or
-            // other shapes may carry bare strings. Normalise to paths.
-            const raw = (e.payload.files as Array<string | { path?: string }> | undefined) ?? [];
-            return raw.map((f) => (typeof f === "string" ? f : (f?.path ?? ""))).filter(Boolean);
-          }),
-      ),
-    ].slice(-20);
-    if (!query.trim() && !files.length) return "";
-    const brief = await this.brainBriefFor({
-      ...(query.trim() ? { query } : {}),
-      ...(files.length ? { files } : {}),
-      agent: agentId,
-      minConfidence: CONFIDENCE_FLOOR,
-      limit: 14,
-    });
-    const team = files.length ? (this.teamBrain?.context(files) ?? "") : "";
-    return [brief, team].filter(Boolean).join("\n\n");
-  }
+  private async brainBriefFor(opts: RetrieveOpts): Promise<string> { return this.briefings.brainBriefFor(opts); }
 
-  /**
-   * The memory brief for a query. Solo: this project's brain. Shared with a
-   * team: canon, confirmed, own and teammates' proposals ranked together, each
-   * line labelled with how sure to be (Loom Teams D42).
-   */
-  private brainBrief(opts: RetrieveOpts): string {
-    const pool = this.teamBrain?.pool(this.brain.all());
-    if (!pool) return compileBrief(retrieve(this.brain, opts).map((h) => h.memory));
-    return compileTieredBrief(retrieveTiered(pool, opts));
-  }
+  async searchBrain(opts: RetrieveOpts): Promise<Hit[]> { return this.briefings.searchBrain(opts); }
 
-  /**
-   * The same brief, with the dense channel when this project has one.
-   *
-   * Embedding is real work (a millisecond, warm) and retrieval is sync, so the
-   * vectors are computed here and handed in. Everything about this is
-   * best-effort: no model, no network, a slow first load — the brief is the
-   * one the three lexical channels produce, which is the brief Loom has always
-   * produced.
-   */
-  private async brainBriefFor(opts: RetrieveOpts): Promise<string> {
-    const dense = await this.denseFor(opts.query ?? "");
-    return this.brainBrief(dense ? { ...opts, dense } : opts);
-  }
+  private async denseFor(query: string): Promise<RetrieveOpts["dense"] | null> { return this.briefings.denseFor(query); }
 
-  /**
-   * Retrieval exactly as a briefing sees it — including the dense channel.
-   *
-   * The Brain tab and `loom brain:search` use this: a search that scored
-   * differently from the briefing it's meant to explain would be worse than
-   * no search at all.
-   */
-  async searchBrain(opts: RetrieveOpts): Promise<Hit[]> {
-    const dense = await this.denseFor(opts.query ?? "");
-    return retrieve(this.brain, dense ? { ...opts, dense } : opts);
-  }
-
-  /** Vectors for one query, or null when the channel isn't available. */
-  private async denseFor(query: string): Promise<RetrieveOpts["dense"] | null> {
-    if (!this.semantic || !query.trim()) return null;
-    try {
-      const memories = this.brain.all();
-      await this.semantic.sync(memories);
-      const q = await this.semantic.query(query);
-      if (!q) return null;
-      const byId = this.semantic.byId(memories);
-      return byId.size ? { query: q, byId } : null;
-    } catch (err) {
-      logbook.warn("brain", "the dense channel didn't answer", String(err), this.info.id);
-      return null;
-    }
-  }
-
-  /**
-   * Pull each ADE's native memory into the shared log. Idempotent — a source
-   * whose content hasn't changed since its last import is skipped, so this is
-   * safe to call on connect, on demand, or on a timer.
-   */
-  importMemories(): { imported: number; sources: string[] } {
-    const seen = new Map<string, string>(); // file -> last imported hash
-    for (const e of this.log.list({ kinds: ["memory_import"] })) {
-      seen.set(String(e.payload.file), String(e.payload.hash));
-    }
-    const sources: string[] = [];
-    let imported = 0;
-    for (const block of this.importedMemory()) {
-      const hash = hashContent(block.content);
-      if (seen.get(block.file) === hash) continue;
-      this.log.append({
-        kind: "memory_import",
-        agentId: block.agentId,
-        payload: { file: block.file, kind: block.kind, chars: block.content.length, hash },
-      });
-      sources.push(block.file);
-      imported += 1;
-    }
-    return { imported, sources };
-  }
+  importMemories(): { imported: number; sources: string[] } { return this.briefings.importMemories(); }
 
   /** Fire-and-notify hooks + routing + suggested handoffs, off the log. */
   private afterAgentEvent(event: LoomEvent): void {
@@ -2230,13 +1528,13 @@ export class ProjectRuntime {
     // read the turn before this one.
     if (event.kind === "run_complete" && event.agentId) {
       this.captureTurnDiff(event.agentId);
-      void this.captureAgentDecisions(event.agentId).catch(() => {});
+      void this.captureAgentDecisions(event.agentId).catch(() => { });
     }
     this.routes.handleAgentEvent(event);
     // Accumulate the turn's prose so decisions can be mined when it completes.
     if (event.kind === "message" && event.agentId && !event.payload.reasoning) {
-      const prev = this.turnText.get(event.agentId) ?? "";
-      this.turnText.set(event.agentId, `${prev}\n${String(event.payload.text ?? "")}`.slice(-8000));
+      const prev = this.turns.turnText.get(event.agentId) ?? "";
+      this.turns.turnText.set(event.agentId, `${prev}\n${String(event.payload.text ?? "")}`.slice(-8000));
     }
     if (event.kind === "needs_input") {
       notify({
@@ -2327,8 +1625,8 @@ export class ProjectRuntime {
 
   /** Mine decisions from a completed turn, persist them, surface on the Timeline. */
   private async captureAgentDecisions(agentId: string): Promise<void> {
-    const turnText = this.turnText.get(agentId) ?? "";
-    this.turnText.delete(agentId);
+    const turnText = this.turns.turnText.get(agentId) ?? "";
+    this.turns.turnText.delete(agentId);
     if (turnText.trim().length < 100) return;
     const lastTurn = this.log.list({ kinds: ["run_complete"] }).filter((e) => e.agentId === agentId).slice(-1)[0];
     const p = (lastTurn?.payload ?? {}) as Record<string, unknown>;
@@ -2353,7 +1651,7 @@ export class ProjectRuntime {
       agentId,
       agentRole: this.agentRole(agentId),
       projectId: this.info.id,
-      chatId: this.turnChat.get(agentId) ?? MAIN_CHAT,
+      chatId: this.turns.turnChat.get(agentId) ?? MAIN_CHAT,
       turnIndex: this.turnCountFor(agentId),
       ...(traceId ? { traceId } : {}),
       ...(lastTurn ? { turnId: String(lastTurn.id) } : {}),
@@ -2442,7 +1740,7 @@ export class ProjectRuntime {
     }
 
     await this.ensureStarted(agentId);
-    this.turnChat.set(agentId, chat);
+    this.turns.turnChat.set(agentId, chat);
     this.log.append({ kind: "message", chat, agentId, payload: { text, author: "user" } });
 
     try {
@@ -2469,7 +1767,7 @@ export class ProjectRuntime {
   async previewProxy(name: string, target: string): Promise<PreviewProxy> {
     const live = this.proxies.get(name);
     if (live && live.target === target) return live;
-    if (live) await live.close().catch(() => {});
+    if (live) await live.close().catch(() => { });
     const proxy = await startPreviewProxy(target);
     this.proxies.set(name, proxy);
     return proxy;
@@ -2480,322 +1778,35 @@ export class ProjectRuntime {
     this.serverListeners.add(cb);
     return () => this.serverListeners.delete(cb);
   }
+  onQueueChange(cb: (q: QueueState) => void): () => void { return this.queueCoordinator.onQueueChange(cb); }
 
-  /** Live queue changes, for the socket. Returns unsubscribe. */
-  onQueueChange(cb: (q: QueueState) => void): () => void {
-    this.queueListeners.add(cb);
-    return () => this.queueListeners.delete(cb);
-  }
+  enqueue(input: QueueInput): QueueItem { return this.queueCoordinator.enqueue(input); }
 
-  /** Line a prompt up; it goes as soon as nothing ahead of it is in the way. */
-  enqueue(input: QueueInput): QueueItem {
-    const t = input.target ?? { kind: "auto" as const };
-    if (t.kind === "agent") this.mustTakeTurns(t.agentId);
-    const item = this.queue.add(input);
-    this.kickQueue();
-    return item;
-  }
+  editQueued(itemId: string, patch: { text?: string; target?: QueueTarget; plan?: boolean }): QueueItem { return this.queueCoordinator.editQueued(itemId, patch); }
 
-  /** Change a waiting prompt. A target this project can't run is refused now,
-   * not when the queue reaches it and has to stop. */
-  editQueued(itemId: string, patch: { text?: string; target?: QueueTarget; plan?: boolean }): QueueItem {
-    if (patch.target?.kind === "agent") this.mustTakeTurns(patch.target.agentId);
-    const item = this.queue.edit(itemId, patch);
-    this.kickQueue();
-    return item;
-  }
+  private mustTakeTurns(agentId: string): void { return this.queueCoordinator.mustTakeTurns(agentId); }
 
-  /** An agent in this project that can hold the baton, or the reason it can't. */
-  private mustTakeTurns(agentId: string): void {
-    const agent = this.agents.get(agentId);
-    if (!agent) throw new Error(`no agent "${agentId}" in this project`);
-    if (!isAdapter(agent)) throw new Error(`agent "${agentId}" is a bridge (read-only) — it cannot take turns`);
-  }
+  queueBlocker(item: QueueItem): string | null { return this.queueCoordinator.queueBlocker(item); }
 
-  /** Why the head can't go yet, or null when it can. */
-  queueBlocker(item: QueueItem): string | null {
-    // A condition comes first: a prompt held for 3am isn't waiting on an agent.
-    const held = item.when ? this.conditionUnmet(item.when) : null;
-    if (held) return held;
-    const route = this.routeState();
-    const routing = route && (route.status === "running" || route.status === "waiting_human");
-    const holder = this.validHolder();
-    if (item.target.kind === "orchestra") {
-      const running = this.orchestra.runningScopes();
-      if (!running.length) return null;
-      const allowed = Math.max(1, this.config.maxConcurrentGoals ?? 1);
-      // With lanes on, a queued goal that can't collide with what's running
-      // starts beside it; the rest wait, with the overlap named.
-      return blockedBy({ runId: "queued", goal: item.text, paths: [] }, running, allowed)
-        ?? null;
-    }
-    if (routing) return "waiting for the running route";
-    if (item.target.kind === "agent" && this.busySince.has(item.target.agentId)) return `waiting for ${item.target.agentId} to finish its turn`;
-    if (holder && this.busySince.has(holder)) return `waiting for ${holder} to finish its turn`;
-    return null;
-  }
+  private conditionUnmet(when: QueueCondition): string | null { return this.queueCoordinator.conditionUnmet(when); }
 
-  /**
-   * Is a queued prompt's condition still unmet? The reason, or null to go.
-   *
-   * Every branch reads a fact the daemon already has — the clock, a goal's
-   * landing state, its checks — so nothing here can be wrong in an interesting
-   * way. A condition about a goal that no longer exists releases the prompt
-   * rather than holding it for ever.
-   */
-  private conditionUnmet(when: QueueCondition): string | null {
-    if (when.kind === "at") {
-      return Date.now() >= when.at ? null : describeCondition(when);
-    }
-    if (when.kind === "quiet") {
-      const busy = this.busySince.size > 0 || Boolean(this.orchestra.active());
-      if (busy) {
-        this.quietSince = 0;
-        return describeCondition(when);
-      }
-      if (!this.quietSince) this.quietSince = Date.now();
-      return Date.now() - this.quietSince >= when.ms ? null : describeCondition(when);
-    }
-    const run = this.orchestra.get(when.runId);
-    if (!run) return null; // the goal is gone: holding for it for ever helps nobody
-    if (when.kind === "landed") {
-      return run.landing?.state === "merged" ? null : describeCondition(when);
-    }
-    const checks = run.landing?.checks;
-    const green = Boolean(checks && !checks.failing.length && !checks.pending.length && checks.passing > 0);
-    return green ? null : describeCondition(when);
-  }
+  private watchClockConditions(q: QueueState): void { return this.queueCoordinator.watchClockConditions(q); }
 
-  /** When the project last went quiet, for a "after N quiet minutes" condition. */
-  private quietSince = 0;
-  private clockTimer: ReturnType<typeof setInterval> | null = null;
+  private holdQueueFor(agentId: string): void { return this.queueCoordinator.holdQueueFor(agentId); }
 
-  /**
-   * A prompt held for an hour needs something to notice the hour arriving.
-   *
-   * Only ticks while such a prompt exists — the queue's other conditions are
-   * woken by the events they wait on (a goal landing, checks going green), and
-   * a timer that runs when nothing needs it is a battery someone else pays for.
-   */
-  private watchClockConditions(q: QueueState): void {
-    const needsClock = q.items.some((i) => i.when && (i.when.kind === "at" || i.when.kind === "quiet"));
-    if (needsClock && !this.clockTimer) {
-      this.clockTimer = setInterval(() => this.kickQueue(), CLOCK_TICK_MS);
-      this.clockTimer.unref?.();
-    } else if (!needsClock && this.clockTimer) {
-      clearInterval(this.clockTimer);
-      this.clockTimer = null;
-    }
-  }
+  private releaseQuestionHold(agentId: string): void { return this.queueCoordinator.releaseQuestionHold(agentId); }
 
-  /**
-   * Hold the queue because `agentId` asked the human something — but only when
-   * the queue is actually pointed at that agent. An orchestra worker's question
-   * is the orchestrator's to answer (see core/orchestra.ts) and shouldn't
-   * freeze a queue lined up for someone else.
-   */
-  private holdQueueFor(agentId: string): void {
-    const head = this.queue.peek();
-    if (!head || this.queue.paused) return;
-    const mine = head.target.kind === "agent" ? head.target.agentId === agentId : head.target.kind === "auto";
-    if (!mine) return;
-    this.queue.setPaused(true, questionHold(agentId));
-  }
+  private kickQueue(): void { return this.queueCoordinator.kickQueue(); }
 
-  /**
-   * You answered, so the hold is over.
-   *
-   * Only a hold this agent's own question put there: a queue you paused
-   * yourself stays paused, and so does one stopped mid-turn. Without this, the
-   * next thing you typed while the agent worked would queue behind the held
-   * prompt and sit there, in a queue nothing was going to resume.
-   */
-  private releaseQuestionHold(agentId: string): void {
-    if (!this.queue.paused || this.queue.snapshot().reason !== questionHold(agentId)) return;
-    this.queue.setPaused(false);
-  }
+  async drainPromptQueue(): Promise<void> { return this.queueCoordinator.drainPromptQueue(); }
 
-  private kickQueue(): void {
-    if (this.closed || this.draining || this.queue.paused || !this.queue.length) return;
-    queueMicrotask(() => void this.drainPromptQueue());
-  }
-
-  /** Send the head of the queue if it may go; then look again. */
-  async drainPromptQueue(): Promise<void> {
-    if (this.closed || this.draining || this.queue.paused) return;
-    const head = this.queue.peek();
-    if (!head || this.queueBlocker(head)) return;
-    this.draining = true;
-    // Out of the queue, then sent: what you can still see is what hasn't gone.
-    // (Leaving it in place until the send returns would survive a crash
-    // mid-dispatch, at the price of a prompt you can edit or remove after it
-    // has already reached the agent — a worse thing to be wrong about.)
-    const item = this.queue.shift()!;
-    try {
-      await this.dispatchQueued(item);
-    } catch (err) {
-      // refused (budget, quarantine, policy, a missing agent): keep it where it
-      // was and stop, so you can edit it or send it elsewhere — never drop it
-      const message = err instanceof Error ? err.message : String(err);
-      if (!this.closed) {
-        this.queue.unshift(item);
-        this.queue.setPaused(true, `the next prompt wasn't sent: ${message}`);
-        this.appendIfOpen({ kind: "error", chat: item.chat, payload: { message: `queued prompt not sent: ${message}` } });
-      }
-    } finally {
-      this.draining = false;
-    }
-    this.kickQueue();
-  }
-
-  private async dispatchQueued(item: QueueItem): Promise<void> {
-    const t = item.target;
-    if (t.kind === "orchestra") {
-      await this.orchestra.start({
-        goal: item.text,
-        // A queued goal remembers the thread it was typed in. sendMessage
-        // below always honoured that; this branch dropped it (#100).
-        ...(item.chat ? { chat: item.chat } : {}),
-        ...(t.orchestrator ? { orchestrator: t.orchestrator } : {}),
-        ...(t.workers?.length ? { workers: t.workers } : {}),
-        ...(t.maxParallel ? { maxParallel: t.maxParallel } : {}),
-        ...(t.maxUsd ? { maxUsd: t.maxUsd } : {}),
-        ...(item.plan ? { plan: true } : {}),
-      });
-      return;
-    }
-    if (t.kind === "auto" && !item.plan) {
-      await this.startRoute({ task: item.text, spec: "auto" });
-      return;
-    }
-    // one agent: the baton moves to it first, as when you pick it and send
-    const to = t.kind === "agent" ? t.agentId : undefined;
-    const holder = this.validHolder();
-    if (to && holder && holder !== to) await this.handoff(to, { source: item.source });
-    await this.sendMessage(item.text, to, { source: item.source, chat: item.chat, fromQueue: true, ...(item.plan ? { plan: true } : {}) });
-  }
+  private async dispatchQueued(item: QueueItem): Promise<void> { return this.queueCoordinator.dispatchQueued(item); }
 
   async sendMessage(
     text: string,
     agentId?: string,
     opts: { source?: "user" | "route"; chat?: string; plan?: boolean; fromQueue?: boolean } = {},
-  ): Promise<{ agentId: string; queued?: number; queueId?: string }> {
-    const source = opts.source ?? "user";
-    const chat = opts.chat ?? MAIN_CHAT;
-    // A thread that named an agent answers with that agent, whoever holds the
-    // baton — which is what lets two threads talk to two agents at once. An
-    // explicit target still wins: you asked for that one.
-    const bound = this.chatBinding(chat);
-    let target = agentId ?? bound.agentId ?? this.validHolder() ?? this.defaultAdapterId();
-    const agent = this.agent(target);
-    if (!isAdapter(agent)) {
-      throw new Error(`agent "${target}" is a bridge (read-only) — it cannot take turns`);
-    }
-    // Before anything is committed — the baton, the message in the thread, the
-    // process — check the agent can afford the turn. Refusing after the message
-    // is logged would leave a prompt in the conversation that nothing answers.
-    this.enforceQuarantine(target);
-    this.enforceBudget(target);
-    const kind = this.config.agents.find((a) => a.id === target)?.kind ?? "";
-    if (this.teamPolicy && !agentAllowed(this.teamPolicy, kind)) {
-      throw new Error(`team policy doesn't allow ${kind} on this repo (loom.team.json)`);
-    }
-
-    // The baton is the write lock for work that touches the repository. A
-    // thread pinned to an agent doesn't need it to answer a question, and
-    // taking it would stop the agent that IS working — so a pinned thread
-    // leaves it alone, and the thread that isn't pinned behaves as it always
-    // has.
-    const pinned = !agentId && bound.agentId === target;
-    if (!pinned) {
-      const holder = this.validHolder();
-      if (holder === null) {
-        this.baton.acquire(target);
-      } else if (holder !== target) {
-        throw new NotHolderError(target, holder);
-      }
-    }
-
-    // The agent is mid-turn: queue the prompt, in order, and run it when the
-    // turn ends. It used to go straight to the adapter, which threw "busy" into
-    // an error event — the prompt was lost while the send had said 200.
-    // Answering while the agent is still busy is still answering.
-    if (source === "user") this.releaseQuestionHold(target);
-    // It shows in the queue, editable, and enters the thread when it's sent.
-    if (!opts.fromQueue && this.busySince.has(target)) {
-      const item = this.queue.add({ text, target: { kind: "agent", agentId: target }, chat, source, ...(opts.plan ? { plan: true } : {}) });
-      return { agentId: target, queued: this.queue.length, queueId: item.id };
-    }
-
-    // A user reply to a paused route's question resumes the route — and to an
-    // agent's own question, the queue it was holding.
-    if (source === "user") {
-      this.routes.onUserMessage(target);
-      this.releaseQuestionHold(target);
-    }
-
-    // everything this turn produces belongs to the chat you sent from
-    this.turnChat.set(target, chat);
-    this.busySince.set(target, Date.now()); // the stale-session clock starts
-    this.log.append({
-      kind: "message",
-      chat,
-      payload: { text, author: source === "route" ? "loom" : "user", ...(opts.fromQueue ? { fromQueue: true } : {}) },
-    });
-    await this.ensureStarted(target);
-
-    const pendingBriefing = this.consumePendingBriefing(target);
-    // Prepend the enabled skills so every turn carries them, alongside any
-    // one-shot handoff briefing. Empty when no skills are on.
-    const briefing =
-      [this.activeSkillsBlock(), pendingBriefing, opts.plan ? planModeBriefing(text) : ""]
-        .filter(Boolean)
-        .join("\n")
-        .trim() || undefined;
-    // The project's configured MCP servers, rendered to a temp config file the
-    // adapter hands to its CLI. Null when nothing is configured — or when this
-    // adapter's CLI has no flag for it, because an "MCP attached" note on a
-    // turn that dropped the config would be the same lie in a new place.
-    const mcp = agent.capabilities.mcp ? writeMcpSession(this.healthyMcps()) : null;
-    // The thread's model, only ever to an adapter that can act on it — see
-    // bindable(), which is where a model that couldn't be honoured is refused.
-    const perTurnModel = bound.agentId === target ? bound.model : undefined;
-    const input: SendInput = {
-      text,
-      ...(briefing ? { briefing } : {}),
-      ...(perTurnModel ? { model: perTurnModel } : {}),
-      ...(mcp ? { mcp: { configPath: mcp.configPath, servers: mcp.servers } } : {}),
-    };
-    if (mcp) {
-      this.log.append({
-        kind: "status",
-        agentId: target,
-        payload: { state: "mcp_attached", servers: mcp.servers.map((s) => s.name) },
-      });
-    }
-    // Snapshot the tree so this prompt's changes can be attributed to it.
-    this.preTurnTree.set(target, await porcelainStatus(this.agentDir(target)));
-    // …and a checkpoint you can actually go back to. The porcelain snapshot
-    // above only says *which* paths changed; this holds their content, so
-    // "undo what that turn did" is a click rather than a re-typing (#101).
-    await this.checkpointBefore(target, text);
-    // Fire-and-notify: the turn runs in the background; progress streams
-    // into the log and completion lands as run_complete.
-    void agent
-      .send(input)
-      .catch((err) => {
-        this.appendIfOpen({
-          kind: "error",
-          agentId: target,
-          payload: { message: String(err instanceof Error ? err.message : err) },
-        });
-      })
-      // The config file exists for exactly this turn. Cleaned up whether the
-      // turn succeeded, failed or was interrupted — a temp file per turn that
-      // nothing removes is a slow leak of the project's server URLs.
-      .finally(() => mcp?.cleanup());
-    return { agentId: target };
-  }
+  ): Promise<{ agentId: string; queued?: number; queueId?: string }> { return this.turns.sendMessage(text, agentId, opts); }
 
   // -------------------------------------------------------------------------
   // Named routes
@@ -2894,7 +1905,7 @@ export class ProjectRuntime {
     const wanted = new Map(this.config.agents.map((a) => [a.id, a]));
     for (const [id, live] of [...this.agents]) {
       if (!wanted.has(id)) {
-        void Promise.resolve(live.stop()).catch(() => {});
+        void Promise.resolve(live.stop()).catch(() => { });
         this.agents.delete(id);
         this.startedAgents.delete(id);
       }
@@ -2909,32 +1920,9 @@ export class ProjectRuntime {
     return { brain, tasks: snap.tasks.length };
   }
 
-  // -------------------------------------------------------------------------
-  // Stale sessions
-  // -------------------------------------------------------------------------
-  /**
-   * When each adapter's current turn started. Set at dispatch, cleared when its
-   * run_complete / error / interrupted lands. An entry much older than any
-   * plausible turn is a hung session: the process is alive enough to hold
-   * `busy` and dead enough to never finish, which blocks every dispatch with
-   * "is busy" until someone notices.
-   */
-  private busySince = new Map<string, number>();
-
   /** Turns older than this are presumed hung. Generous: real turns run long. */
   static readonly STALE_TURN_MS = 10 * 60 * 1000;
-
-  /** Adapters that look hung: busy far longer than any plausible turn. */
-  staleSessions(now = Date.now()): Array<{ agentId: string; busyMs: number }> {
-    const out: Array<{ agentId: string; busyMs: number }> = [];
-    for (const [agentId, since] of this.busySince) {
-      const live = this.agents.get(agentId);
-      if (!live || !isAdapter(live) || !live.busy()) continue;
-      const busyMs = now - since;
-      if (busyMs >= ProjectRuntime.STALE_TURN_MS) out.push({ agentId, busyMs });
-    }
-    return out;
-  }
+  staleSessions(now = Date.now()): Array<{ agentId: string; busyMs: number }> { return this.turns.staleSessions(now); }
 
   /**
    * Put a hung session out of its misery and bring up a fresh one.
@@ -2949,12 +1937,12 @@ export class ProjectRuntime {
     if (!cfg) throw new Error(`unknown agent "${agentId}" in project "${this.info.name}"`);
     const live = this.agents.get(agentId);
     if (live && isAdapter(live)) {
-      await live.interrupt().catch(() => {});
-      await live.stop().catch(() => {});
+      await live.interrupt().catch(() => { });
+      await live.stop().catch(() => { });
     }
     this.agents.delete(agentId);
     this.startedAgents.delete(agentId);
-    this.busySince.delete(agentId);
+    this.turns.busySince.delete(agentId);
     if (this.validHolder() === agentId) this.baton.release(agentId);
     this.spawnAgent(cfg);
     this.log.append({
@@ -3098,31 +2086,7 @@ export class ProjectRuntime {
 
     return { id, agentId: opts.agentId };
   }
-
-  /**
-   * The narrow briefing a child gets.
-   *
-   * Deliberately not the parent's thread. A child exists to answer one question
-   * and hand back an answer; giving it the whole conversation costs tokens for
-   * context it was not asked to reason about, and invites it to wander into the
-   * parent's job. It gets what it is for, who asked, the rules of the project,
-   * and the memories that match its own task — not the parent's.
-   */
-  private subtaskBriefing(parent: string, childId: string, task: string): string {
-    const parts = [
-      `[Loom subtask] You are "${childId}", running one scoped subtask for "${parent}" ` +
-        `in project "${this.info.name}".`,
-      `The subtask: ${task}`,
-      "Do this one thing and report the result. Do not take over the wider task — " +
-        `"${parent}" still owns the conversation and holds the baton.`,
-    ];
-    const skills = this.activeSkillsBlock();
-    if (skills) parts.push(skills);
-    // Retrieval scoped to the child's own task rather than the parent's thread.
-    const brief = this.brainBrief({ query: task, agent: childId, limit: 6 });
-    if (brief) parts.push(brief);
-    return parts.filter(Boolean).join("\n\n");
-  }
+  private subtaskBriefing(parent: string, childId: string, task: string): string { return this.briefings.subtaskBriefing(parent, childId, task); }
 
   private defaultAdapterId(): string {
     const cfg =
@@ -3132,76 +2096,9 @@ export class ProjectRuntime {
     if (!cfg) throw new Error(`project "${this.info.name}" has no full-duplex adapters`);
     return cfg.id;
   }
+  private consumePendingBriefing(agentId: string): string | undefined { return this.briefings.consumePendingBriefing(agentId); }
 
-  // -------------------------------------------------------------------------
-  // Handoff
-  // -------------------------------------------------------------------------
-
-  /** Briefings are injected with the first turn after a handoff. */
-  private pendingBriefings = new Map<string, string>();
-
-  private consumePendingBriefing(agentId: string): string | undefined {
-    const briefing = this.pendingBriefings.get(agentId);
-    this.pendingBriefings.delete(agentId);
-    return briefing;
-  }
-
-  /**
-   * Explicit baton pass: interrupt the current holder if mid-turn, project
-   * the log into the target's namespaced memory, arm the one-shot briefing.
-   * A *manual* handoff cancels any active route — the human outranks it.
-   */
-  /**
-   * Re-run a failed turn on a different agent.
-   *
-   * When a turn failed, the only recovery was retyping the prompt at someone
-   * else — and the someone else started cold, not knowing an attempt had been
-   * made. This finds the failed turn's prompt, hands the baton to the chosen
-   * agent, and re-sends the same text with the failure attached as context, so
-   * the second agent knows what was tried and what it died of.
-   *
-   * The failure context rides the one-shot handoff briefing rather than the
-   * message text, so the thread shows the same clean prompt twice rather than
-   * a prompt wearing a stack trace.
-   */
-  async retryTurn(toAgentId: string): Promise<{ agentId: string; retried: string }> {
-    const events = this.log.list({ limit: 200 });
-    // The last error, and the last user message before it: that pairing is the
-    // failed turn. Route-authored messages count too — a route step that died
-    // is exactly what you retry somewhere else.
-    let errorAt = -1;
-    for (let i = events.length - 1; i >= 0; i--) {
-      if (events[i]!.kind === "error") { errorAt = i; break; }
-    }
-    if (errorAt === -1) throw new Error("no failed turn to retry");
-    const err = events[errorAt]!;
-    let prompt: string | undefined;
-    for (let i = errorAt - 1; i >= 0; i--) {
-      const e = events[i]!;
-      if (e.kind === "message" && !e.agentId) {
-        prompt = String(e.payload.text ?? "");
-        break;
-      }
-    }
-    if (!prompt?.trim()) throw new Error("could not find the prompt that failed");
-
-    await this.handoff(toAgentId, { source: "user" });
-    const failedAgent = err.agentId ?? "the previous agent";
-    const failure = String(err.payload.message ?? "unknown error").slice(0, 500);
-    const prior = this.pendingBriefings.get(toAgentId);
-    this.pendingBriefings.set(
-      toAgentId,
-      [
-        prior,
-        `[Loom retry] "${failedAgent}" attempted this and failed with: ${failure}`,
-        "Do not repeat the failing approach without addressing the failure.",
-      ]
-        .filter(Boolean)
-        .join("\n"),
-    );
-    await this.sendMessage(prompt, toAgentId, { chat: err.chat ?? MAIN_CHAT });
-    return { agentId: toAgentId, retried: prompt };
-  }
+  async retryTurn(toAgentId: string): Promise<{ agentId: string; retried: string }> { return this.turns.retryTurn(toAgentId); }
 
   /**
    * Carry the outgoing agent's branch into the incoming agent's worktree.
@@ -3302,7 +2199,7 @@ export class ProjectRuntime {
     // The merge goes at the TOP of the briefing when it conflicted: an agent
     // that starts editing a tree full of conflict markers makes it worse.
     const mergeNote = merge ? describeMerge(merge, holder ?? "the previous agent", to) : "";
-    this.pendingBriefings.set(
+    this.briefings.pendingBriefings.set(
       to,
       [mergeNote, buildBriefing(input), brainBrief].filter(Boolean).join("\n\n"),
     );
@@ -3326,33 +2223,16 @@ export class ProjectRuntime {
       const bridgeView = bridgeBrief
         ? `${buildProjection({ ...input, targetAgentId: cfg.id })}\n\n---\n${bridgeBrief}`
         : buildProjection({ ...input, targetAgentId: cfg.id });
-      await bystander.injectMemory(bridgeView).catch(() => {});
+      await bystander.injectMemory(bridgeView).catch(() => { });
     }
 
     const { from } = this.baton.handoff(to, handoffMeta);
     await this.ensureStarted(to);
     return { from, ...(merge ? { merge } : {}) };
   }
-
   async interrupt(
     opts: { source?: "user" | "route" } = {},
-  ): Promise<{ interrupted: string | null }> {
-    if ((opts.source ?? "user") === "user") this.routes.onManualInterrupt();
-    const holder = this.validHolder();
-    if (!holder) return { interrupted: null };
-    const agent = this.agent(holder);
-    // Stop means stop: what's queued doesn't start after it — it waits,
-    // paused, for you to resume, edit or clear it.
-    if ((opts.source ?? "user") === "user" && this.queue.length && !this.queue.paused) {
-      this.queue.setPaused(true, "you pressed Stop — resume to run what's queued");
-      this.log.append({ kind: "status", agentId: holder, payload: { state: "queue_paused", waiting: this.queue.length } });
-    }
-    if (isAdapter(agent) && agent.busy()) {
-      await agent.interrupt();
-      return { interrupted: holder };
-    }
-    return { interrupted: null };
-  }
+  ): Promise<{ interrupted: string | null }> { return this.turns.interrupt(opts); }
 
   // -------------------------------------------------------------------------
   // Routing
@@ -3520,7 +2400,7 @@ export class ProjectRuntime {
       chats: this.chats(),
       route: this.routes.state(),
       routeNames: ["auto", ...Object.keys(this.config.routes ?? {})],
-      costUsd: this.costs.totalUsd,
+      costUsd: this.accounting.costs.totalUsd,
       // Paused agents belong in the status payload, not only in state on disk.
       // Without this the UI cannot show that an alert has taken an agent out of
       // rotation — the pause was real and completely invisible, which reads as
@@ -3552,14 +2432,14 @@ export class ProjectRuntime {
     };
     const agents = this.config.agents.map((cfg) => {
       const live = this.agents.get(cfg.id);
-      const chat = this.turnChat.get(cfg.id);
+      const chat = this.turns.turnChat.get(cfg.id);
       const last = lastOf(cfg.id, chat);
       return {
         id: cfg.id,
         kind: cfg.kind,
         role: cfg.role,
         busy: Boolean(live && isAdapter(live) && live.busy()),
-        since: this.busySince.get(cfg.id) ?? null,
+        since: this.turns.busySince.get(cfg.id) ?? null,
         permissions: permissionFor(cfg.kind, cfg.options),
         holdsBaton: this.validHolder() === cfg.id,
         chat: chat ?? last?.chat ?? null,
@@ -3570,22 +2450,22 @@ export class ProjectRuntime {
     const run = this.orchestra.active() ?? this.orchestra.list()[0];
     const orchestra = run
       ? {
-          id: run.id,
-          goal: run.goal,
-          status: run.status,
-          chat: run.chat,
-          orchestrator: run.orchestrator.agent,
-          tasks: run.tasks.map((t) => ({
-            id: t.id,
-            title: t.title,
-            agent: t.agent,
-            status: t.status,
-            chat: t.chat,
-            attempts: t.attempts,
-            files: t.files?.length ?? 0,
-            last: lastOf(t.agent, t.chat),
-          })),
-        }
+        id: run.id,
+        goal: run.goal,
+        status: run.status,
+        chat: run.chat,
+        orchestrator: run.orchestrator.agent,
+        tasks: run.tasks.map((t) => ({
+          id: t.id,
+          title: t.title,
+          agent: t.agent,
+          status: t.status,
+          chat: t.chat,
+          attempts: t.attempts,
+          files: t.files?.length ?? 0,
+          last: lastOf(t.agent, t.chat),
+        })),
+      }
       : null;
     return {
       project: { id: this.info.id, name: this.info.name },
@@ -3669,8 +2549,8 @@ export class ProjectRuntime {
     } finally {
       if (timer) clearTimeout(timer);
       off();
-      if (agent.busy()) await agent.interrupt().catch(() => {});
-      await agent.stop().catch(() => {});
+      if (agent.busy()) await agent.interrupt().catch(() => { });
+      await agent.stop().catch(() => { });
     }
   }
 
@@ -3679,11 +2559,7 @@ export class ProjectRuntime {
     this.config.team = share ? { teamId: share.teamId, repo: share.repo } : { optOut: true };
     this.saveConfig();
   }
-
-  /** The chat an agent's current (or last) turn belongs to, if any. */
-  chatOf(agentId: string): string | undefined {
-    return this.turnChat.get(agentId);
-  }
+  chatOf(agentId: string): string | undefined { return this.turns.chatOf(agentId); }
 
   /** The live (or latest) orchestra run, compact — for status payloads. */
   orchestraSummary(): Record<string, unknown> | null {
@@ -3722,18 +2598,18 @@ export class ProjectRuntime {
   }
 
   async close(): Promise<void> {
-    await this.orchestra.shutdown().catch(() => {});
+    await this.orchestra.shutdown().catch(() => { });
     this.closed = true;
     if (this.mcpTimer) { clearInterval(this.mcpTimer); this.mcpTimer = null; }
     for (const id of this.startedAgents) {
-      await this.agent(id).stop().catch(() => {});
+      await this.agent(id).stop().catch(() => { });
     }
     this.startedAgents.clear();
     // A dev server outlives the daemon that started it unless we say otherwise,
     // and an orphan holding port 3000 is a bad thing to leave behind.
-    if (this.clockTimer) { clearInterval(this.clockTimer); this.clockTimer = null; }
-    await this.servers.closeAll().catch(() => {});
-    for (const proxy of this.proxies.values()) await proxy.close().catch(() => {});
+    if (this.queueCoordinator.clockTimer) { clearInterval(this.queueCoordinator.clockTimer); this.queueCoordinator.clockTimer = null; }
+    await this.servers.closeAll().catch(() => { });
+    for (const proxy of this.proxies.values()) await proxy.close().catch(() => { });
     this.proxies.clear();
     this.brain.close(); // unsubscribes before the log drops its listeners
     this.log.close();
@@ -3753,63 +2629,5 @@ export class ProjectRuntime {
   private appendIfOpen(event: Parameters<EventLog["append"]>[0]): void {
     if (this.closed) return;
     this.log.append(event);
-  }
-}
-
-/** One event, as one line of "what is it doing". */
-export function activityLine(e: LoomEvent): string {
-  const p = e.payload as Record<string, unknown>;
-  const cut = (v: unknown, n = 120) => String(v ?? "").replace(/\s+/g, " ").trim().slice(0, n);
-  switch (e.kind) {
-    case "tool_call":
-      return `${cut(p.tool ?? p.name, 40)} ${cut(p.command ?? p.input ?? p.summary ?? "", 90)}`.trim();
-    case "file_edit":
-      return `edited ${cut(p.path, 100)}`;
-    case "message":
-      return cut(p.text);
-    case "needs_input":
-      return `asks: ${cut(p.question)}`;
-    case "approval":
-      return p.phase === "requested" ? `wants approval for ${cut(p.tool, 60)}` : `approval ${cut(p.behavior, 10)}`;
-    case "run_complete":
-      return "finished its turn";
-    case "error":
-      return `error: ${cut(p.message)}`;
-    default:
-      return e.kind.replace(/_/g, " ");
-  }
-}
-
-/**
- * Plan mode for an ordinary turn: think, don't touch — and leave the plan as a
- * markdown spec any agent can execute later (or an orchestra can run).
- */
-export function planModeBriefing(prompt: string): string {
-  const slug =
-    prompt
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-|-$/g, "")
-      .slice(0, 40) || "plan";
-  const day = new Date().toISOString().slice(0, 10);
-  return [
-    "[Loom · Plan mode] Do NOT change any code in this turn. Investigate the repository, then write a",
-    `complete implementation plan to plans/${day}-${slug}.md (create the plans/ folder if needed). Structure:`,
-    "front matter (title, status: proposed), then ## Goal, ## Context (relevant files by path and what they do),",
-    "## Approach, ## Tasks — each task self-contained with its files, steps and acceptance criteria, written so",
-    "a different coding agent could execute it with no other context — ## Risks, ## Verification (exact commands).",
-    "Then reply with a short summary and the file's path.",
-  ].join("\n");
-}
-
-export function relativeToProject(projectDir: string, p: string): string {
-  return path.isAbsolute(p) ? path.relative(projectDir, p) : p;
-}
-
-function configMtimeOf(projectDir: string): number {
-  try {
-    return fs.statSync(path.join(projectDir, ".loom", "config.json")).mtimeMs;
-  } catch {
-    return 0;
   }
 }

@@ -87,7 +87,7 @@ export function localBuildRev(distRoot = DIST_ROOT) {
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
         const full = path.join(dir, entry.name);
         if (entry.isDirectory()) walk(full);
-        else if (entry.name.endsWith(".js")) rels.push(path.relative(distRoot, full));
+        else if (/\.(?:js|css|html)$/.test(entry.name)) rels.push(path.relative(distRoot, full));
       }
     };
     walk(distRoot);
