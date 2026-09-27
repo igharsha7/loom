@@ -31,7 +31,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import type { SendInput } from "../types.js";
-import { readProjectState, writeProjectState } from "../core/registry.js";
 import { AdapterBase, agentEnv, cliAvailable } from "./base.js";
 import { permissionFor } from "../core/permissions.js";
 
@@ -97,14 +96,11 @@ export class GrokAdapter extends AdapterBase {
   }
 
   private get sessionId(): string | undefined {
-    const state = readProjectState(this.projectDir);
-    return state.agents[this.id]?.sessionId as string | undefined;
+    return this.nativeState.read().sessionId as string | undefined;
   }
 
   private set sessionId(value: string | undefined) {
-    const state = readProjectState(this.projectDir);
-    state.agents[this.id] = { ...state.agents[this.id], sessionId: value };
-    writeProjectState(this.projectDir, state);
+    this.nativeState.patch({ sessionId: value });
   }
 
   async available(): Promise<boolean> {

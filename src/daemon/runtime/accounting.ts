@@ -1,4 +1,4 @@
-import { EventLog } from "../../core/eventlog.js";
+import type { EventJournal } from "../../core/eventlog.js";
 import {
   readProjectState,
   writeProjectState
@@ -13,8 +13,8 @@ import { BUDGET_PAUSE_REASON, BudgetExceededError, QuarantinedError, startOfDay 
 
 /** Dependencies owned by the project coordinator, read live for each operation. */
 export interface RuntimeAccountingHost {
-  log: EventLog;
-  appendIfOpen: (event: Parameters<EventLog["append"]>[0]) => void;
+  log: EventJournal;
+  appendIfOpen: (event: Parameters<EventJournal["append"]>[0]) => void;
   info: ProjectInfo;
 }
 

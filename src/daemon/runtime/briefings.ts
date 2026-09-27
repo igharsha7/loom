@@ -1,8 +1,9 @@
 import { extractFromTurn, readExternalContent, type ExtractEngine } from "../../core/brain-extract.js";
 import { compileBrief, retrieve, type Hit, type RetrieveOpts } from "../../core/brain-index.js";
 import { Brain, CONFIDENCE_FLOOR } from "../../core/brain.js";
-import { claudeText } from "../../core/claude-cli.js";
-import { EventLog } from "../../core/eventlog.js";
+import type { RenderedProjection } from "../../core/distill.js";
+import { buildBriefing, buildProjection, type ProjectionInput } from "../../core/projection.js";
+import type { EventJournal } from "../../core/eventlog.js";
 import { logbook } from "../../core/logbook.js";
 import {
   buildUnifiedMemory,
@@ -10,7 +11,7 @@ import {
   readNativeMemory,
   type ImportedBlock,
 } from "../../core/memory.js";
-import { SemanticIndex } from "../../core/semantic.js";
+import type { SemanticIndex } from "../../core/semantic.js";
 import { compileTieredBrief, retrieveTiered } from "../../core/team-memory.js";
 import type {
   LoomEvent,
@@ -19,17 +20,20 @@ import type {
   UnifiedMemory
 } from "../../types.js";
 import { MAIN_CHAT } from "../../types.js";
-import { TeamBrainHook } from '../runtime-support.js';
+import { PROJECTION_WINDOW, type TeamBrainHook } from '../runtime-support.js';
 
 /** Dependencies owned by the project coordinator, read live for each operation. */
 export interface RuntimeBriefingsHost {
   info: ProjectInfo;
   config: ProjectConfig;
-  log: EventLog;
+  log: EventJournal;
   teamBrain: TeamBrainHook | null;
   brain: Brain;
   activeSkillsBlock: () => string;
-  turnChat: Map<string, string>;
+  turnChat: ReadonlyMap<string, string>;
+  extractionEngine: (model: string) => ExtractEngine;
+  renderProjection: (input: ProjectionInput) => Promise<RenderedProjection>;
+  createSemanticIndex: () => Pick<SemanticIndex, "start" | "sync" | "query" | "byId">;
 }
 
 /** Owns briefings state for exactly one open project. */
@@ -45,7 +49,66 @@ export class RuntimeBriefings {
    * whatever is ready, which is the honest thing for something that takes ten
    * seconds to warm up.
    */
-  semantic: SemanticIndex | null = null;
+  private semantic: Pick<SemanticIndex, "start" | "sync" | "query" | "byId"> | null = null;
+  private readonly lifetime = new AbortController();
+  private semanticGeneration = 0;
+
+  close(): void {
+    this.lifetime.abort();
+    this.semanticGeneration++;
+    this.semantic = null;
+    this.pendingBriefings.clear();
+  }
+
+  /** Optional loading never delays opening a project; late results are discarded. */
+  async configureSemantic(enabled: boolean): Promise<void> {
+    const generation = ++this.semanticGeneration;
+    this.semantic = null;
+    if (!enabled || this.lifetime.signal.aborted) return;
+    try {
+      const index = this.host.createSemanticIndex();
+      if (!await index.start() || this.lifetime.signal.aborted || generation !== this.semanticGeneration) return;
+      this.semantic = index;
+      await index.sync(this.host.brain.all());
+    } catch (error) {
+      if (!this.lifetime.signal.aborted) {
+        logbook.warn("brain", "semantic retrieval didn't start", String(error), this.host.info.id);
+      }
+    }
+  }
+
+  /** Prepare context without starting agents, taking the baton or touching UI.
+   * This retains the legacy selection policy until Brain continuity is built.
+   */
+  async prepareHandoff(to: string, from: string | null, mergeNote: string, bridgeIds: string[]): Promise<{
+    memory: string;
+    briefing: string;
+    mode: "template" | "llm";
+    elapsedMs: number;
+    bridges: Array<{ agentId: string; memory: string }>;
+  }> {
+    if (this.lifetime.signal.aborted) throw new Error("context runtime is closed");
+    this.importMemories();
+    const events = this.host.log.list({ limit: PROJECTION_WINDOW });
+    const input = { projectName: this.host.info.name, config: this.host.config, events,
+      targetAgentId: to, fromAgentId: from };
+    const start = Date.now();
+    const rendered = await this.host.renderProjection(input);
+    const brief = await this.retrieveBrief(events, to);
+    const unified = this.unifiedMemory();
+    const memory = [rendered.content, brief, ...(unified.sources.length ? [unified.document] : [])]
+      .filter(Boolean).join("\n\n---\n");
+    const elapsedMs = Date.now() - start;
+    const bridges: Array<{ agentId: string; memory: string }> = [];
+    for (const agentId of bridgeIds) {
+      const bridgeBrief = await this.retrieveBrief(events, agentId);
+      bridges.push({ agentId, memory: [buildProjection({ ...input, targetAgentId: agentId }), bridgeBrief]
+        .filter(Boolean).join("\n\n---\n") });
+    }
+    if (this.lifetime.signal.aborted) throw new Error("context runtime is closed");
+    return { memory, briefing: [mergeNote, buildBriefing(input), brief].filter(Boolean).join("\n\n"),
+      mode: rendered.mode, elapsedMs, bridges };
+  }
 
   // -------------------------------------------------------------------------
   // Unified memory — "multiple memory in one"
@@ -137,13 +200,14 @@ export class RuntimeBriefings {
 
   /** Vectors for one query, or null when the channel isn't available. */
   async denseFor(query: string): Promise<RetrieveOpts["dense"] | null> {
-    if (!this.semantic || !query.trim()) return null;
+    const index = this.semantic;
+    if (this.lifetime.signal.aborted || !index || !query.trim()) return null;
     try {
       const memories = this.host.brain.all();
-      await this.semantic.sync(memories);
-      const q = await this.semantic.query(query);
-      if (!q) return null;
-      const byId = this.semantic.byId(memories);
+      await index.sync(memories);
+      const q = await index.query(query);
+      if (!q || this.lifetime.signal.aborted || index !== this.semantic) return null;
+      const byId = index.byId(memories);
       return byId.size ? { query: q, byId } : null;
     } catch (err) {
       logbook.warn("brain", "the dense channel didn't answer", String(err), this.host.info.id);
@@ -224,16 +288,16 @@ export class RuntimeBriefings {
    * Off entirely when config says so; a no-op when Claude isn't available.
    */
   extractMemory(agentId: string, files: string[]): void {
-    if (this.host.config.brain?.extractor === "off") return;
+    if (this.lifetime.signal.aborted || this.host.config.brain?.extractor === "off") return;
     const chat = this.host.turnChat.get(agentId) ?? MAIN_CHAT;
     const turn = this.gatherTurnText(chat);
     if (turn.length < 40) return; // nothing substantial to learn from
     const model = this.host.config.brain?.model ?? "haiku";
-    const engine: ExtractEngine = (p) =>
-      claudeText(`${p.system}\n\n${p.user}`, { model, timeoutMs: 60_000 });
+    const engine = this.host.extractionEngine(model);
     const recent = this.host.log.list({ limit: 80 }).filter((e) => (e.chat ?? MAIN_CHAT) === chat);
     void extractFromTurn(this.host.brain, turn, {
       engine,
+      signal: this.lifetime.signal,
       agentId,
       chat,
       ...(files.length ? { files } : {}),
@@ -242,7 +306,7 @@ export class RuntimeBriefings {
     })
       .then((res) => {
         const learned = res.added.length + res.updated.length + res.forgotten.length;
-        if (learned > 0) {
+        if (!this.lifetime.signal.aborted && learned > 0) {
           this.host.log.append({
             kind: "status",
             payload: {
@@ -266,7 +330,7 @@ export class RuntimeBriefings {
     const events = this.host.log.list({ chat, limit: 40 });
     let start = 0;
     for (let i = events.length - 1; i >= 0; i--) {
-      if (events[i]!.kind === "message" && !events[i]!.agentId) {
+      if (events[i]!.kind === "message" && (!events[i]!.agentId || events[i]!.payload.author === "user")) {
         start = i;
         break;
       }

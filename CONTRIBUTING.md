@@ -39,6 +39,11 @@ browser DOM suites sequentially after the remaining suites. For daemon
 boundaries, see [HTTP routes](src/daemon/routes/README.md) and
 [runtime modules](src/daemon/runtime/README.md).
 
+Before changing conversation, adapter or Brain ownership, read the
+[boundary notes](docs/refactoring/BOUNDARIES.md). Add lifecycle regressions to
+`test/boundaries.test.ts`; event-store changes must pass the SQLite and JSONL
+cases in `test/eventlog.test.ts`. Keep UI delivery downstream of persistence.
+
 `npm run verify:adapters` drives installed, authenticated agent CLIs against
 real tasks. It may spend provider credits, so run it manually after changing a
 real adapter rather than treating it as a normal test-suite step.

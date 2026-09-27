@@ -14,18 +14,22 @@ import type {
 } from "../types.js";
 import { writeMemoryFile } from "../core/registry.js";
 
+import { AgentStateStore } from "../core/agent-state.js";
+
 type EventCb = (e: AdapterEvent) => void;
 
 export abstract class AgentBase {
   readonly id: string;
   readonly kind: string;
   protected projectDir: string;
+  protected readonly nativeState: AgentStateStore;
   private listeners = new Set<EventCb>();
 
   constructor(id: string, kind: string, projectDir: string) {
     this.id = id;
     this.kind = kind;
     this.projectDir = projectDir;
+    this.nativeState = new AgentStateStore(projectDir, id);
   }
 
   onEvent(cb: EventCb): () => void {

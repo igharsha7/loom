@@ -36,3 +36,7 @@ client, HTTP routes, and project runtime. Framework selection is deferred.
 
 Completed: all three requested extractions. Framework selection remains deferred.
 See NOTES.md for verification results and deliberately retained boundaries.
+
+The next authorized phase is tracked in [BOUNDARIES.md](BOUNDARIES.md): separating
+storage, native adapters, Brain preparation and client delivery before building
+Brain continuity. The completed checklist above describes the earlier extraction.

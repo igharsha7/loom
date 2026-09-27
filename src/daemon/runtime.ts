@@ -7,20 +7,18 @@ import { ADES, detectAdes } from "../core/ades.js";
 import { BatonManager } from "../core/baton.js";
 import { type Hit, type RetrieveOpts } from "../core/brain-index.js";
 import { Brain } from "../core/brain.js";
+import { claudeText } from "../core/claude-cli.js";
+import { ConversationStore } from "../core/conversations.js";
 import * as checkpoints from "../core/checkpoint.js";
 import { renderProjection } from "../core/distill.js";
 import { EventLog } from "../core/eventlog.js";
 import { ensureBranch, addWorktree as gitAddWorktree, readOut, worktreePath } from "../core/git.js";
 import { logbook } from "../core/logbook.js";
 import { probeMcpServer, probeMcpServers, writeMcpSession } from "../core/mcp.js";
-import {
-  type ImportedBlock
-} from "../core/memory.js";
 import { notify } from "../core/notify.js";
 import { OrchestraEngine, type OrchestraCoordinator } from "../core/orchestra.js";
 import { isPermissionMode, permissionFor, unsupportedReason, type PermissionMode } from "../core/permissions.js";
 import { startPreviewProxy, type PreviewProxy } from "../core/preview-proxy.js";
-import { buildBriefing, buildProjection } from "../core/projection.js";
 import {
   PromptQueue,
   type QueueCondition,
@@ -87,8 +85,9 @@ import type {
   UnifiedMemory
 } from "../types.js";
 import { GIT_DELIVERIES, MAIN_CHAT, isAdapter, type GitDelivery } from "../types.js";
-import { MAX_FANOUT, PROJECTION_WINDOW, ServerFrame, TeamBrainHook, activityLine, configMtimeOf, withLoomAskTimeout } from './runtime-support.js';
+import { MAX_FANOUT, ServerFrame, TeamBrainHook, activityLine, configMtimeOf, withLoomAskTimeout } from './runtime-support.js';
 import { RuntimeAccounting } from './runtime/accounting.js';
+import { RuntimeAgents } from './runtime/agents.js';
 import { RuntimeBriefings } from './runtime/briefings.js';
 import { RuntimeQueue } from './runtime/queue.js';
 import { RuntimeTurns } from './runtime/turns.js';
@@ -103,6 +102,7 @@ export class ProjectRuntime {
   readonly info: ProjectInfo;
   readonly config: ProjectConfig;
   readonly log: EventLog;
+  private readonly conversations: ConversationStore;
   readonly baton: BatonManager;
   readonly routes: RouteEngine;
   /** One orchestrator, many parallel workers — see core/orchestra.ts. */
@@ -111,8 +111,8 @@ export class ProjectRuntime {
   private installedKinds: string[] = [];
   /** Memory as units — see core/brain.ts. Reads and writes through `log`. */
   readonly brain: Brain;
-  private agents = new Map<string, AnyAgent>();
-  private startedAgents = new Set<string>();
+  private readonly agentLifecycle = new RuntimeAgents();
+  private get agents(): ReadonlyMap<string, AnyAgent> { return this.agentLifecycle.agents; }
   private configMtime = 0;
   /** What you've lined up, run one at a time — see core/prompt-queue.ts. */
   readonly queue: PromptQueue;
@@ -126,6 +126,7 @@ export class ProjectRuntime {
     this.info = info;
     this.config = config;
     this.log = log;
+    this.conversations = new ConversationStore(info.dir);
     const runtime = this;
     this.accounting = new RuntimeAccounting({
       get log() { return runtime.log; },
@@ -140,6 +141,9 @@ export class ProjectRuntime {
       get brain() { return runtime.brain; },
       activeSkillsBlock: (...args) => this.activeSkillsBlock(...args),
       get turnChat() { return runtime.turns.turnChat; },
+      extractionEngine: (model) => (prompt) => claudeText(`${prompt.system}\n\n${prompt.user}`, { model, timeoutMs: 60_000 }),
+      renderProjection: (input) => renderProjection(input, this.config.projection),
+      createSemanticIndex: () => new SemanticIndex(path.join(this.info.dir, ".loom")),
     });
     this.queueCoordinator = new RuntimeQueue({
       get queue() { return runtime.queue; },
@@ -157,6 +161,7 @@ export class ProjectRuntime {
     });
     this.turns = new RuntimeTurns({
       staleTurnMs: ProjectRuntime.STALE_TURN_MS,
+      get closed() { return runtime.closed; },
       agentDir: (...args) => this.agentDir(...args),
       get log() { return runtime.log; },
       get info() { return runtime.info; },
@@ -174,6 +179,15 @@ export class ProjectRuntime {
       get queue() { return runtime.queue; },
       get routes() { return runtime.routes; },
       ensureStarted: (...args) => this.ensureStarted(...args),
+      isCurrentAgent: (agent) => !this.closed && this.agents.get(agent.id) === agent,
+      dispatchFailed: (agent, chat, error) => {
+        if (this.closed || this.agents.get(agent.id) !== agent) return;
+        this.turns.busySince.delete(agent.id);
+        const event = this.log.append({ kind: "error", agentId: agent.id, chat,
+          payload: { message: error instanceof Error ? error.message : String(error) } });
+        this.afterAgentEvent(event);
+        this.kickQueue();
+      },
       consumePendingBriefing: (...args) => this.consumePendingBriefing(...args),
       activeSkillsBlock: (...args) => this.activeSkillsBlock(...args),
       healthyMcps: (...args) => this.healthyMcps(...args),
@@ -184,19 +198,8 @@ export class ProjectRuntime {
     });
 
     this.baton = new BatonManager(info.dir, log);
-    if (config.brain?.semantic) {
-      const index = new SemanticIndex(path.join(info.dir, ".loom"));
-      void index
-        .start()
-        .then(async (ok) => {
-          if (!ok) return; // the runtime isn't installed; logbook said so
-          this.briefings.semantic = index;
-          const made = await index.sync(this.brain.all());
-          if (made) logbook.info("brain", `embedded ${made} memories for semantic retrieval`, "", info.id);
-        })
-        .catch((err) => logbook.warn("brain", "semantic retrieval didn't start", String(err), info.id));
-    }
     this.brain = new Brain(log);
+    void this.briefings.configureSemantic(config.brain?.semantic === true);
 
     // Same path as addAgent: an agent added at runtime must behave exactly like
     // one that was here at open, and two copies of this loop would drift.
@@ -316,7 +319,7 @@ export class ProjectRuntime {
         const live = rt.agents.get(cfg.id);
         if (!live || live.capabilities.tier !== "adapter") continue;
         await rt.ensureAgentWorktree(cfg.id);
-        rt.agents.delete(cfg.id);
+        await rt.agentLifecycle.retire(cfg.id);
         rt.spawnAgent(cfg);
       }
     }
@@ -414,6 +417,7 @@ export class ProjectRuntime {
       }
       if (typeof patch.brain.model === "string") b.model = patch.brain.model.trim() || undefined;
       this.config.brain = b;
+      if (typeof patch.brain.semantic === "boolean") void this.briefings.configureSemantic(patch.brain.semantic);
     }
     if (patch.projection) {
       const pr = { ...(this.config.projection ?? {}) };
@@ -652,8 +656,7 @@ export class ProjectRuntime {
       { ...cfg, options: { ...this.policyOptions(cfg), loomProject: this.info.id } },
       this.agentDir(cfg.id),
     );
-    this.agents.set(cfg.id, agent);
-    agent.onEvent((e) => {
+    this.agentLifecycle.install(agent, (e) => {
       const chat = this.turns.turnChat.get(agent.id);
       let payload = e.payload;
       // Enrich the completed turn so its gen_ai span carries system + model +
@@ -716,7 +719,7 @@ export class ProjectRuntime {
       throw new Error(`"${agentId}" holds the baton — hand it to someone else first`);
     }
     const live = this.agents.get(agentId);
-    if (live && isAdapter(live) && live.busy()) {
+    if (live && isAdapter(live) && (live.busy() || this.turns.busySince.has(agentId))) {
       throw new Error(`"${agentId}" is mid-turn — interrupt it first`);
     }
     // Its events stay in the log: the history happened, and a roster change
@@ -724,8 +727,7 @@ export class ProjectRuntime {
     this.config.agents = this.config.agents.filter((a) => a.id !== agentId);
     this.saveConfig();
     if (live) {
-      void Promise.resolve(live.stop()).catch(() => { });
-      this.agents.delete(agentId);
+      void this.agentLifecycle.retire(agentId);
     }
     return { removed: agentId };
   }
@@ -734,11 +736,10 @@ export class ProjectRuntime {
    * Point an agent at a different model.
    *
    * The model is read once, when the adapter is constructed (createAgent hands
-   * it cfg.options), so changing it means building a fresh agent — which drops
-   * the CLI session the old one was resuming. That's the right behaviour for a
-   * model switch: continuing one model's conversation on another model is not a
-   * thing the underlying CLIs support anyway. Refused mid-turn, because swapping
-   * the process out from under a running turn would strand it.
+   * it cfg.options), so changing it means building a fresh adapter instance.
+   * Native resume data stays persisted; each adapter decides whether its harness
+   * can reuse it. Refused while a turn is preparing or running, because swapping
+   * the process out from under that turn would strand it.
    *
    * An empty model clears the override, so the CLI falls back to its own default
    * — the honest "Default" the picker offers.
@@ -747,7 +748,7 @@ export class ProjectRuntime {
     const cfg = this.config.agents.find((a) => a.id === agentId);
     if (!cfg) throw new Error(`unknown agent "${agentId}"`);
     const live = this.agents.get(agentId);
-    if (live && isAdapter(live) && live.busy()) {
+    if (live && isAdapter(live) && (live.busy() || this.turns.busySince.has(agentId))) {
       throw new Error(`"${agentId}" is mid-turn — wait for it to finish, then switch models`);
     }
     const next = model.trim().slice(0, 80);
@@ -759,8 +760,7 @@ export class ProjectRuntime {
     // Rebuild so the new model actually takes: stop the old process, spawn a
     // replacement subscribed exactly as the constructor's loop does.
     if (live) {
-      void Promise.resolve(live.stop()).catch(() => { });
-      this.agents.delete(agentId);
+      void this.agentLifecycle.retire(agentId);
     }
     this.spawnAgent(cfg);
     this.saveConfig();
@@ -785,14 +785,12 @@ export class ProjectRuntime {
       throw new Error(`team policy caps permissions at "${this.teamPolicy.permissions.ceiling}" on this repo (loom.team.json)`);
     }
     const live = this.agents.get(agentId);
-    if (live && isAdapter(live) && live.busy()) {
+    if (live && isAdapter(live) && (live.busy() || this.turns.busySince.has(agentId))) {
       throw new Error(`"${agentId}" is mid-turn — wait for it to finish, then change its permissions`);
     }
     cfg.options = { ...(cfg.options ?? {}), permissions: mode };
     if (live) {
-      void Promise.resolve(live.stop()).catch(() => { });
-      this.agents.delete(agentId);
-      this.startedAgents.delete(agentId);
+      void this.agentLifecycle.retire(agentId);
     }
     if (cfg.enabled !== false) this.spawnAgent(cfg);
     this.saveConfig();
@@ -920,7 +918,7 @@ export class ProjectRuntime {
         throw new Error(`"${agentId}" holds the baton — hand it off before switching it off`);
       }
       const live = this.agents.get(agentId);
-      if (live && isAdapter(live) && live.busy()) {
+      if (live && isAdapter(live) && (live.busy() || this.turns.busySince.has(agentId))) {
         throw new Error(`"${agentId}" is mid-turn — interrupt it first`);
       }
     }
@@ -930,9 +928,7 @@ export class ProjectRuntime {
     if (on && !live) {
       this.spawnAgent(cfg); // bring it back to life
     } else if (!on && live) {
-      void Promise.resolve(live.stop()).catch(() => { });
-      this.agents.delete(agentId);
-      this.startedAgents.delete(agentId);
+      void this.agentLifecycle.retire(agentId);
     }
     this.log.append({ kind: on ? "agent_join" : "agent_leave", agentId, payload: { enabled: on } });
     return { id: agentId, enabled: on };
@@ -1099,29 +1095,11 @@ export class ProjectRuntime {
    * is never stored. The rest live in state.json — a chat you created and
    * haven't spoken in yet has no events to derive it from.
    */
-  chats(): ChatInfo[] {
-    const stored = readProjectState(this.info.dir).chats ?? [];
-    return [
-      { id: MAIN_CHAT, title: "Main", createdAt: 0 },
-      ...stored.filter((c) => c.id !== MAIN_CHAT),
-    ];
-  }
+  chats(): ChatInfo[] { return this.conversations.chats(); }
 
   createChat(title: string, opts: { agentId?: string; model?: string } = {}): ChatInfo {
-    const bound = opts.agentId ? this.bindable(opts.agentId, opts.model) : null;
-    const state = readProjectState(this.info.dir);
-    const chat: ChatInfo = {
-      id: newId(4),
-      // numbered, not "New chat" — the button already says New chat, and a
-      // sidebar of identical rows tells you nothing
-      title: title.trim().slice(0, 60) || `Chat ${(state.chats ?? []).length + 2}`,
-      createdAt: Date.now(),
-      ...(bound ? { agentId: bound.agentId } : {}),
-      ...(bound?.model ? { model: bound.model } : {}),
-    };
-    state.chats = [...(state.chats ?? []), chat];
-    writeProjectState(this.info.dir, state);
-    return chat;
+    const bound = opts.agentId ? this.bindable(opts.agentId, opts.model) : {};
+    return this.conversations.createChat(title, bound);
   }
 
   /**
@@ -1150,24 +1128,9 @@ export class ProjectRuntime {
 
   /** Bind (or unbind) who answers in a thread. */
   setChatAgent(id: string, agentId: string | null, model?: string): ChatInfo | null {
-    if (id === MAIN_CHAT) {
-      // Main is where the baton answers; that's what makes it Main.
-      throw new Error("the main thread follows the baton — make a new thread to pin an agent");
-    }
-    const bound = agentId ? this.bindable(agentId, model) : null;
-    const state = readProjectState(this.info.dir);
-    const chat = (state.chats ?? []).find((c) => c.id === id);
-    if (!chat) return null;
-    if (bound) {
-      chat.agentId = bound.agentId;
-      if (bound.model) chat.model = bound.model;
-      else delete chat.model;
-    } else {
-      delete chat.agentId;
-      delete chat.model;
-    }
-    writeProjectState(this.info.dir, state);
-    return chat;
+    // Preserve Main's error before validating an optional target.
+    if (id !== MAIN_CHAT && agentId) this.bindable(agentId, model);
+    return this.conversations.setChatAgent(id, agentId, model);
   }
 
   /**
@@ -1245,31 +1208,9 @@ export class ProjectRuntime {
     return { agentId: found.agentId, ...(found.model ? { model: found.model } : {}) };
   }
 
-  renameChat(id: string, title: string): ChatInfo | null {
-    if (id === MAIN_CHAT) return null; // main's name is not yours to change
-    const state = readProjectState(this.info.dir);
-    const chat = (state.chats ?? []).find((c) => c.id === id);
-    if (!chat) return null;
-    chat.title = title.trim().slice(0, 60) || chat.title;
-    writeProjectState(this.info.dir, state);
-    return chat;
-  }
+  renameChat(id: string, title: string): ChatInfo | null { return this.conversations.renameChat(id, title); }
 
-  /**
-   * Forget a conversation. Its events stay in the log — it's append-only, and
-   * the brain is built from all of them; deleting the thread you had with an
-   * agent shouldn't quietly rewrite what the project decided. The chat just
-   * stops being listed.
-   */
-  deleteChat(id: string): boolean {
-    if (id === MAIN_CHAT) return false; // there is always a main chat
-    const state = readProjectState(this.info.dir);
-    const before = (state.chats ?? []).length;
-    state.chats = (state.chats ?? []).filter((c) => c.id !== id);
-    if (state.chats.length === before) return false;
-    writeProjectState(this.info.dir, state);
-    return true;
-  }
+  deleteChat(id: string): boolean { return this.conversations.deleteChat(id); }
 
   // -------------------------------------------------------------------------
   // Board tasks — the cards you write yourself
@@ -1467,7 +1408,7 @@ export class ProjectRuntime {
   anyBusy(): boolean {
     // A live orchestra run counts: reloading the project would close it, and
     // closing aborts the run — a config edit must not kill a fleet mid-flight.
-    if (this.orchestra.active()) return true;
+    if (this.orchestra.active() || this.turns.busySince.size > 0) return true;
     return [...this.agents.values()].some((a) => isAdapter(a) && a.busy());
   }
 
@@ -1478,12 +1419,8 @@ export class ProjectRuntime {
   }
 
   private async ensureStarted(agentId: string): Promise<AnyAgent> {
-    const agent = this.agent(agentId);
-    if (!this.startedAgents.has(agentId)) {
-      await agent.start();
-      this.startedAgents.add(agentId);
-    }
-    return agent;
+    this.agent(agentId); // preserve the public unknown-agent error
+    return this.agentLifecycle.start(agentId);
   }
   private async checkpointBefore(agentId: string, prompt: string): Promise<void> { return this.turns.checkpointBefore(agentId, prompt); }
 
@@ -1499,24 +1436,17 @@ export class ProjectRuntime {
 
   private extractMemory(agentId: string, files: string[]): void { return this.briefings.extractMemory(agentId, files); }
 
-  private gatherTurnText(chat: string): string { return this.briefings.gatherTurnText(chat); }
-
   workingTree(): Promise<WorkingTree> {
     return workingTree(this.info.dir);
   }
-  private importedMemory(): ImportedBlock[] { return this.briefings.importedMemory(); }
 
   unifiedMemory(): UnifiedMemory { return this.briefings.unifiedMemory(); }
-
-  private async retrieveBrief(events: LoomEvent[], agentId: string): Promise<string> { return this.briefings.retrieveBrief(events, agentId); }
 
   private brainBrief(opts: RetrieveOpts): string { return this.briefings.brainBrief(opts); }
 
   private async brainBriefFor(opts: RetrieveOpts): Promise<string> { return this.briefings.brainBriefFor(opts); }
 
   async searchBrain(opts: RetrieveOpts): Promise<Hit[]> { return this.briefings.searchBrain(opts); }
-
-  private async denseFor(query: string): Promise<RetrieveOpts["dense"] | null> { return this.briefings.denseFor(query); }
 
   importMemories(): { imported: number; sources: string[] } { return this.briefings.importMemories(); }
 
@@ -1664,7 +1594,7 @@ export class ProjectRuntime {
       anthropicApiKey: process.env.ANTHROPIC_API_KEY,
       filesChanged,
     });
-    if (!decisions.length) return;
+    if (this.closed || !decisions.length) return;
     this.storeDecisions(decisions);
     // Surface each on the Timeline / snapshots via a status event (no new EventKind,
     // and no collision with the brain's memory `decision` events). `source` rides
@@ -1905,9 +1835,7 @@ export class ProjectRuntime {
     const wanted = new Map(this.config.agents.map((a) => [a.id, a]));
     for (const [id, live] of [...this.agents]) {
       if (!wanted.has(id)) {
-        void Promise.resolve(live.stop()).catch(() => { });
-        this.agents.delete(id);
-        this.startedAgents.delete(id);
+        void this.agentLifecycle.retire(id);
       }
     }
     for (const cfg of this.config.agents) {
@@ -1938,10 +1866,8 @@ export class ProjectRuntime {
     const live = this.agents.get(agentId);
     if (live && isAdapter(live)) {
       await live.interrupt().catch(() => { });
-      await live.stop().catch(() => { });
     }
-    this.agents.delete(agentId);
-    this.startedAgents.delete(agentId);
+    await this.agentLifecycle.retire(agentId);
     this.turns.busySince.delete(agentId);
     if (this.validHolder() === agentId) this.baton.release(agentId);
     this.spawnAgent(cfg);
@@ -2161,70 +2087,24 @@ export class ProjectRuntime {
       if (merge) handoffMeta = { ...handoffMeta, merge };
     }
 
-    // Refresh the shared brain from every ADE's native memory before handing
-    // off, so the incoming agent inherits what the others knew.
-    this.importMemories();
-    const events = this.log.list({ limit: PROJECTION_WINDOW });
-    const input = {
-      projectName: this.info.name,
-      config: this.config,
-      events,
-      targetAgentId: to,
-      fromAgentId: holder,
-    };
-    // Template by default; LLM-distilled when the project opts in — always
-    // falling back to the template so a broken Claude never blocks a handoff.
-    const distillStart = Date.now();
-    const rendered = await renderProjection(input, this.config.projection);
-    // Phase 3: the memories relevant to the work in flight, retrieved and
-    // compiled — this is the part the recency-window projection can't do. Query
-    // is the recent conversation plus the files recent turns touched; scoped to
-    // this chat and to the incoming agent; low-confidence memories are held back
-    // from injection (they're still visible in the Brain tab).
-    const brainBrief = await this.retrieveBrief(events, to);
-    // Append the unified cross-ADE memory so the incoming agent sees the
-    // whole brain, not just this project's log.
-    const unified = this.unifiedMemory();
-    const parts = [rendered.content];
-    if (brainBrief) parts.push(brainBrief);
-    if (unified.sources.length > 0) parts.push(unified.document);
-    const enriched = parts.join("\n\n---\n");
-    await target.injectMemory(enriched);
-    writeMemoryFile(this.info.dir, to, enriched); // idempotent with default impl
-    // The memory file above is only read by CLIs that look for it; most don't
-    // (codex, opencode, grok and agy never did), so the one briefing every
-    // adapter actually receives — prepended to its next turn — carries the
-    // retrieved brain brief too. Without it, a handoff to codex arrived with
-    // the conversation but none of what the project (or team) had learned.
-    // The merge goes at the TOP of the briefing when it conflicted: an agent
-    // that starts editing a tree full of conflict markers makes it worse.
+    const bridgeIds = this.config.agents.map((cfg) => cfg.id).filter((id) => {
+      const agent = this.agents.get(id);
+      return agent && !isAdapter(agent) && id !== to;
+    });
     const mergeNote = merge ? describeMerge(merge, holder ?? "the previous agent", to) : "";
-    this.briefings.pendingBriefings.set(
-      to,
-      [mergeNote, buildBriefing(input), brainBrief].filter(Boolean).join("\n\n"),
-    );
-    if (rendered.mode === "llm") {
-      this.log.append({
-        kind: "status",
-        payload: { state: "projection", mode: "llm", ms: Date.now() - distillStart },
-      });
+    const prepared = await this.briefings.prepareHandoff(to, holder, mergeNote, bridgeIds);
+    if (this.closed || this.agents.get(to) !== target) throw new Error("handoff target is no longer active");
+    await target.injectMemory(prepared.memory);
+    if (this.closed || this.agents.get(to) !== target) throw new Error("handoff target is no longer active");
+    writeMemoryFile(this.info.dir, to, prepared.memory);
+    this.briefings.pendingBriefings.set(to, prepared.briefing);
+    if (prepared.mode === "llm") {
+      this.log.append({ kind: "status", payload: { state: "projection", mode: "llm", ms: prepared.elapsedMs } });
     }
-
-    // Bridges (GUI agents) are passive observers — keep their shared-context
-    // files fresh on every hop so e.g. Antigravity always sees the weave.
-    // (Always template views: N bridges × LLM calls per hop would be waste.)
-    for (const cfg of this.config.agents) {
-      const bystander = this.agents.get(cfg.id);
-      if (!bystander || isAdapter(bystander) || cfg.id === to) continue;
-      // Bridges get the retrieved brain brief too — they can't take a system
-      // prompt, but their shared-context file is the only memory they have, so
-      // it shouldn't be the one view without the learned memories in it.
-      const bridgeBrief = await this.retrieveBrief(events, cfg.id);
-      const bridgeView = bridgeBrief
-        ? `${buildProjection({ ...input, targetAgentId: cfg.id })}\n\n---\n${bridgeBrief}`
-        : buildProjection({ ...input, targetAgentId: cfg.id });
-      await bystander.injectMemory(bridgeView).catch(() => { });
+    for (const bridge of prepared.bridges) {
+      await this.agents.get(bridge.agentId)?.injectMemory(bridge.memory).catch(() => {});
     }
+    if (this.closed || this.agents.get(to) !== target) throw new Error("handoff target is no longer active");
 
     const { from } = this.baton.handoff(to, handoffMeta);
     await this.ensureStarted(to);
@@ -2438,7 +2318,7 @@ export class ProjectRuntime {
         id: cfg.id,
         kind: cfg.kind,
         role: cfg.role,
-        busy: Boolean(live && isAdapter(live) && live.busy()),
+        busy: Boolean(live && isAdapter(live) && (live.busy() || this.turns.busySince.has(cfg.id))),
         since: this.turns.busySince.get(cfg.id) ?? null,
         permissions: permissionFor(cfg.kind, cfg.options),
         holdsBaton: this.validHolder() === cfg.id,
@@ -2600,11 +2480,9 @@ export class ProjectRuntime {
   async close(): Promise<void> {
     await this.orchestra.shutdown().catch(() => { });
     this.closed = true;
+    this.briefings.close();
     if (this.mcpTimer) { clearInterval(this.mcpTimer); this.mcpTimer = null; }
-    for (const id of this.startedAgents) {
-      await this.agent(id).stop().catch(() => { });
-    }
-    this.startedAgents.clear();
+    await this.agentLifecycle.close();
     // A dev server outlives the daemon that started it unless we say otherwise,
     // and an orphan holding port 3000 is a bad thing to leave behind.
     if (this.queueCoordinator.clockTimer) { clearInterval(this.queueCoordinator.clockTimer); this.queueCoordinator.clockTimer = null; }

@@ -34,7 +34,6 @@ import fs from "node:fs";
 import readline from "node:readline";
 import type { AgentCapabilities, SendInput } from "../types.js";
 import { codexMcpArgs } from "../core/mcp.js";
-import { readProjectState, writeProjectState } from "../core/registry.js";
 import { AdapterBase, ADAPTER_CAPABILITIES, agentEnv, cliAvailable, frameBriefing } from "./base.js";
 import { permissionFor } from "../core/permissions.js";
 
@@ -94,14 +93,11 @@ export class CodexAdapter extends AdapterBase {
 
   /** Codex calls it a thread; loom stores it in the same slot as any session. */
   private get threadId(): string | undefined {
-    const state = readProjectState(this.projectDir);
-    return state.agents[this.id]?.sessionId as string | undefined;
+    return this.nativeState.read().sessionId as string | undefined;
   }
 
   private set threadId(value: string | undefined) {
-    const state = readProjectState(this.projectDir);
-    state.agents[this.id] = { ...state.agents[this.id], sessionId: value };
-    writeProjectState(this.projectDir, state);
+    this.nativeState.patch({ sessionId: value });
   }
 
   async available(): Promise<boolean> {

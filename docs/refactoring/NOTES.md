@@ -113,3 +113,11 @@ Local test logs (temporary, not committed): `/tmp/loom-final-tests.log`,
 Branch is `dev/Harsha`, based on main at `838f994`. Publication target is
 `igharsha7/loom` (`origin`); the original repository is retained as `upstream`.
 TODO.md has no remaining work within the requested three steps.
+
+## Brain prerequisite follow-up
+
+The next phase separates event storage, conversation metadata, native adapter
+state/lifecycle, Brain preparation and client delivery. See
+[BOUNDARIES.md](BOUNDARIES.md) for ownership, fixes and remaining Brain work.
+Verification: build/typecheck passed; full test suite passed 1,482 tests with
+17 skipped, including all 125 browser DOM tests. This phase is uncommitted.

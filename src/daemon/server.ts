@@ -1,3 +1,4 @@
+import { ClientDelivery } from "./delivery.js";
 import express, { type NextFunction, type Request, type Response } from "express";
 import crypto from "node:crypto";
 import http, { type Server } from "node:http";
@@ -116,6 +117,7 @@ export class LoomDaemon {
   private auth: AuthManager;
   private runtimes = new Map<string, ProjectRuntime>();
   private sockets = new Map<WebSocket, { project?: string; scope?: string[] }>();
+  private readonly delivery = new ClientDelivery(this.sockets, (socket) => socket.terminate());
   /** In-flight self-heal recheck timers, cleared on close. */
   private healTimers = new Set<ReturnType<typeof setTimeout>>();
   /** Terminal shells — a real pty when node-pty loaded, else plain pipes. */
@@ -236,11 +238,7 @@ export class LoomDaemon {
     this.team = new TeamLink({
       runtimes: () => [...this.runtimes.values()],
       broadcast: (frame) => {
-        const payload = JSON.stringify(frame);
-        // Team frames are daemon-level: unscoped (admin / full) clients only.
-        for (const [ws, sub] of this.sockets) {
-          if (ws.readyState === WebSocket.OPEN && !sub.scope) ws.send(payload);
-        }
+        this.delivery.publish(frame, { kind: "admin" });
       },
       ...(opts.hubFactory ? { hubFactory: opts.hubFactory } : {}),
       ...(opts.runnerExec ? { runnerExec: opts.runnerExec } : {}),
@@ -467,13 +465,7 @@ export class LoomDaemon {
 
   /** One frame to everyone watching this project (or everyone, with no project). */
   private broadcastFrame(payload: Record<string, unknown>, projectId?: string): void {
-    const frame = JSON.stringify(payload);
-    for (const [ws, sub] of this.sockets) {
-      if (ws.readyState !== WebSocket.OPEN) continue;
-      if (projectId && sub.project && sub.project !== projectId) continue;
-      if (projectId && sub.scope && !sub.scope.includes(projectId)) continue;
-      ws.send(frame);
-    }
+    this.delivery.publish(payload, { kind: "project", projectId });
   }
 
   private broadcast(projectId: string, event: LoomEvent): void {
@@ -502,27 +494,13 @@ export class LoomDaemon {
    */
   private streamLogs(): () => void {
     return logbook.subscribe((record) => {
-      const frame = JSON.stringify({ type: "log", record });
-      for (const [ws, sub] of this.sockets) {
-        if (ws.readyState !== WebSocket.OPEN) continue;
-        // A scoped socket gets its own projects' records only. Daemon-level
-        // records (no project) stay admin/unscoped — a phone paired for one
-        // project has no business watching the whole machine fail.
-        if (sub.scope && (!record.project || !sub.scope.includes(record.project))) continue;
-        ws.send(frame);
-      }
+      this.delivery.publish({ type: "log", record }, { kind: "log", projectId: record.project });
     });
   }
 
   /** Fan a terminal frame out to every socket watching this project. */
   private broadcastTerm(projectId: string, frame: Record<string, unknown>): void {
-    const payload = JSON.stringify(frame);
-    for (const [ws, sub] of this.sockets) {
-      if (ws.readyState !== WebSocket.OPEN) continue;
-      if (sub.project && sub.project !== projectId) continue;
-      if (sub.scope && !sub.scope.includes(projectId)) continue;
-      ws.send(payload);
-    }
+    this.delivery.publish(frame, { kind: "project", projectId });
   }
 
   private pushTokens(): string[] {

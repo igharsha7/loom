@@ -1,4 +1,4 @@
-import { EventLog } from "../../core/eventlog.js";
+import type { EventJournal } from "../../core/eventlog.js";
 import { blockedBy } from "../../core/goal-lanes.js";
 import { OrchestraEngine } from "../../core/orchestra.js";
 import {
@@ -22,14 +22,14 @@ import { CLOCK_TICK_MS, questionHold } from '../runtime-support.js';
 /** Dependencies owned by the project coordinator, read live for each operation. */
 export interface RuntimeQueueHost {
   queue: PromptQueue;
-  agents: Map<string, AnyAgent>;
+  agents: ReadonlyMap<string, AnyAgent>;
   routeState: () => RouteState | null;
   validHolder: () => string | null;
   orchestra: OrchestraEngine;
   config: ProjectConfig;
   busySince: Map<string, number>;
   closed: boolean;
-  appendIfOpen: (event: Parameters<EventLog["append"]>[0]) => void;
+  appendIfOpen: (event: Parameters<EventJournal["append"]>[0]) => void;
   startRoute: (opts: { task: string; spec?: string | RouteStepSpec[]; router?: RouterKind; maxHops?: number; }) => Promise<RouteState>;
   handoff: (to: string, opts?: { source?: "user" | "route"; }) => Promise<{ from: string | null; merge?: MergeOutcome; }>;
   sendMessage: (text: string, agentId?: string, opts?: { source?: "user" | "route"; chat?: string; plan?: boolean; fromQueue?: boolean; }) => Promise<{ agentId: string; queued?: number; queueId?: string; }>;

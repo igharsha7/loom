@@ -179,5 +179,17 @@ community integration). The factory receives the full `AgentConfig`, so pass
 settings. Persist resumable provider session IDs with the project-state helpers
 in `src/core/registry.ts`, not in global process state.
 
+Built-in adapters access their existing project-state slot through the protected
+`nativeState` store on `AgentBase`: `nativeState.read()` and
+`nativeState.patch({ sessionId })`. A patch re-reads the project state immediately
+before writing, preserves unrelated fields, and removes keys set to `undefined`.
+Keep native resume IDs opaque; this store does not map them to Loom chat IDs or
+assert compatibility between providers. Do not retain a project-wide state
+snapshot across an `await` and later write it back.
+
+The runtime owns adapter subscriptions and instance retirement. A replacement
+must start after its predecessor stops; events from a retired instance are
+ignored. This does not change an adapter's obligation to stop its own processes.
+
 See the existing adapters for provider-specific process handling and event
 translation: `claude-code.ts`, `codex.ts`, `opencode.ts`, and `grok.ts`.

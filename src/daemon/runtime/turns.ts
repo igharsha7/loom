@@ -1,6 +1,6 @@
 import { BatonManager, NotHolderError } from "../../core/baton.js";
 import * as checkpoints from "../../core/checkpoint.js";
-import { EventLog } from "../../core/eventlog.js";
+import type { EventJournal } from "../../core/eventlog.js";
 import { push as gitPush, stageAndCommitFiles } from "../../core/git.js";
 import { logbook } from "../../core/logbook.js";
 import { writeMcpSession } from "../../core/mcp.js";
@@ -29,7 +29,7 @@ import { planModeBriefing } from '../runtime-support.js';
 /** Dependencies owned by the project coordinator, read live for each operation. */
 export interface RuntimeTurnsHost {
   agentDir: (agentId: string) => string;
-  log: EventLog;
+  log: EventJournal;
   info: ProjectInfo;
   extractMemory: (agentId: string, files: string[]) => void;
   config: ProjectConfig;
@@ -41,16 +41,19 @@ export interface RuntimeTurnsHost {
   enforceBudget: (agentId: string, now?: number) => void;
   teamPolicy: TeamPolicy | null;
   staleTurnMs: number;
+  closed: boolean;
   baton: BatonManager;
   releaseQuestionHold: (agentId: string) => void;
   queue: PromptQueue;
   routes: RouteEngine;
   ensureStarted: (agentId: string) => Promise<AnyAgent>;
+  isCurrentAgent: (agent: AnyAgent) => boolean;
+  dispatchFailed: (agent: AnyAgent, chat: string, error: unknown) => void;
   consumePendingBriefing: (agentId: string) => string | undefined;
   activeSkillsBlock: () => string;
   healthyMcps: () => McpServerConfig[];
-  appendIfOpen: (event: Parameters<EventLog["append"]>[0]) => void;
-  agents: Map<string, AnyAgent>;
+  appendIfOpen: (event: Parameters<EventJournal["append"]>[0]) => void;
+  agents: ReadonlyMap<string, AnyAgent>;
   handoff: (to: string, opts?: { source?: "user" | "route"; }) => Promise<{ from: string | null; merge?: MergeOutcome; }>;
   pendingBriefings: Map<string, string>;
 }
@@ -116,7 +119,7 @@ export class RuntimeTurns {
     try {
       const label = prompt.replace(/\s+/g, " ").trim().slice(0, 120) || `a turn by ${agentId}`;
       const cp = await checkpoints.capture(this.host.agentDir(agentId), label);
-      if (!cp) return;
+      if (!cp || this.host.closed) return;
       // Carried onto this turn's turn_diff, so the card that shows what
       // changed also knows the point to put it back to. Working it out in the
       // client by "the checkpoint nearest above this card" would be right
@@ -191,6 +194,7 @@ export class RuntimeTurns {
     this.lastTurnDiff.set(agentId, pending);
     void pending
       .then((diff) => {
+        if (this.host.closed) return;
         if (diff) {
           this.host.log.append({
             kind: "turn_diff",
@@ -333,59 +337,65 @@ export class RuntimeTurns {
       chat,
       payload: { text, author: source === "route" ? "loom" : "user", ...(opts.fromQueue ? { fromQueue: true } : {}) },
     });
-    await this.host.ensureStarted(target);
+    let mcp: ReturnType<typeof writeMcpSession> = null;
+    try {
+      await this.host.ensureStarted(target);
+      if (!this.host.isCurrentAgent(agent)) throw new Error(`agent "${target}" is no longer active`);
 
-    const pendingBriefing = this.host.consumePendingBriefing(target);
-    // Prepend the enabled skills so every turn carries them, alongside any
-    // one-shot handoff briefing. Empty when no skills are on.
-    const briefing =
-      [this.host.activeSkillsBlock(), pendingBriefing, opts.plan ? planModeBriefing(text) : ""]
-        .filter(Boolean)
-        .join("\n")
-        .trim() || undefined;
-    // The project's configured MCP servers, rendered to a temp config file the
-    // adapter hands to its CLI. Null when nothing is configured — or when this
-    // adapter's CLI has no flag for it, because an "MCP attached" note on a
-    // turn that dropped the config would be the same lie in a new place.
-    const mcp = agent.capabilities.mcp ? writeMcpSession(this.host.healthyMcps()) : null;
-    // The thread's model, only ever to an adapter that can act on it — see
-    // bindable(), which is where a model that couldn't be honoured is refused.
-    const perTurnModel = bound.agentId === target ? bound.model : undefined;
-    const input: SendInput = {
-      text,
-      ...(briefing ? { briefing } : {}),
-      ...(perTurnModel ? { model: perTurnModel } : {}),
-      ...(mcp ? { mcp: { configPath: mcp.configPath, servers: mcp.servers } } : {}),
-    };
-    if (mcp) {
-      this.host.log.append({
-        kind: "status",
-        agentId: target,
-        payload: { state: "mcp_attached", servers: mcp.servers.map((s) => s.name) },
-      });
-    }
-    // Snapshot the tree so this prompt's changes can be attributed to it.
-    this.preTurnTree.set(target, await porcelainStatus(this.host.agentDir(target)));
-    // …and a checkpoint you can actually go back to. The porcelain snapshot
-    // above only says *which* paths changed; this holds their content, so
-    // "undo what that turn did" is a click rather than a re-typing (#101).
-    await this.checkpointBefore(target, text);
-    // Fire-and-notify: the turn runs in the background; progress streams
-    // into the log and completion lands as run_complete.
-    void agent
-      .send(input)
-      .catch((err) => {
-        this.host.appendIfOpen({
-          kind: "error",
+      const pendingBriefing = this.host.consumePendingBriefing(target);
+      // Prepend the enabled skills so every turn carries them, alongside any
+      // one-shot handoff briefing. Empty when no skills are on.
+      const briefing =
+        [this.host.activeSkillsBlock(), pendingBriefing, opts.plan ? planModeBriefing(text) : ""]
+          .filter(Boolean)
+          .join("\n")
+          .trim() || undefined;
+      // The project's configured MCP servers, rendered to a temp config file the
+      // adapter hands to its CLI. Null when nothing is configured — or when this
+      // adapter's CLI has no flag for it, because an "MCP attached" note on a
+      // turn that dropped the config would be the same lie in a new place.
+      mcp = agent.capabilities.mcp ? writeMcpSession(this.host.healthyMcps()) : null;
+      // The thread's model, only ever to an adapter that can act on it — see
+      // bindable(), which is where a model that couldn't be honoured is refused.
+      const perTurnModel = bound.agentId === target ? bound.model : undefined;
+      const input: SendInput = {
+        text,
+        ...(briefing ? { briefing } : {}),
+        ...(perTurnModel ? { model: perTurnModel } : {}),
+        ...(mcp ? { mcp: { configPath: mcp.configPath, servers: mcp.servers } } : {}),
+      };
+      if (mcp) {
+        this.host.log.append({
+          kind: "status",
           agentId: target,
-          payload: { message: String(err instanceof Error ? err.message : err) },
+          payload: { state: "mcp_attached", servers: mcp.servers.map((s) => s.name) },
         });
-      })
-      // The config file exists for exactly this turn. Cleaned up whether the
-      // turn succeeded, failed or was interrupted — a temp file per turn that
-      // nothing removes is a slow leak of the project's server URLs.
-      .finally(() => mcp?.cleanup());
-    return { agentId: target };
+      }
+      // Snapshot the tree so this prompt's changes can be attributed to it.
+      this.preTurnTree.set(target, await porcelainStatus(this.host.agentDir(target)));
+      // …and a checkpoint you can actually go back to. The porcelain snapshot
+      // above only says *which* paths changed; this holds their content, so
+      // "undo what that turn did" is a click rather than a re-typing (#101).
+      await this.checkpointBefore(target, text);
+      // Fire-and-notify: the turn runs in the background; progress streams
+      // into the log and completion lands as run_complete.
+      if (!this.host.isCurrentAgent(agent)) throw new Error(`agent "${target}" is no longer active`);
+      void Promise.resolve()
+        .then(() => {
+          if (!this.host.isCurrentAgent(agent)) throw new Error(`agent "${target}" is no longer active`);
+          return agent.send(input);
+        })
+        .catch((error) => this.host.dispatchFailed(agent, chat, error))
+        // The config file exists for exactly this turn. Cleaned up whether the
+        // turn succeeded, failed or was interrupted — a temp file per turn that
+        // nothing removes is a slow leak of the project's server URLs.
+        .finally(() => mcp?.cleanup());
+      return { agentId: target };
+    } catch (error) {
+      mcp?.cleanup();
+      this.host.dispatchFailed(agent, chat, error);
+      throw error;
+    }
   }
 
   /** Adapters that look hung: busy far longer than any plausible turn. */
