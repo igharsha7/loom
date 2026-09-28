@@ -115,6 +115,9 @@ import { ICONS } from './icons.js';
   // Zero is "$0", not "$0.0000" — four decimals of nothing reads as fake
   // precision (and free-model turns genuinely cost nothing). Sub-cent but real
   // costs still show four places; anything that would round to $0.0000 is $0.
+  /** A token count at a glance: 950, 12.3k, 1.2M. */
+  function tokens(n){ n = Number(n) || 0; if (n < 1000) return String(Math.round(n));
+    if (n < 1e6) return (n < 1e4 ? (n / 1e3).toFixed(1) : String(Math.round(n / 1e3))) + "k"; return (n / 1e6).toFixed(1) + "M"; }
   function money(n){ n = Number(n) || 0; if (n < 0.00005) return "$0"; return "$" + (n >= 0.01 ? n.toFixed(2) : n.toFixed(4)); }
 
   /** Compact "3m ago" / "2h ago" / "5d ago" from an epoch-ms timestamp. */
@@ -125,4 +128,4 @@ import { ICONS } from './icons.js';
     if (s < 86400) return Math.round(s / 3600) + "h ago";
     return Math.round(s / 86400) + "d ago";
   }
-export { esc,highlight,hue,mdInline,mdToHtml,money,pageGone,rel };
+export { esc,highlight,hue,mdInline,mdToHtml,money,pageGone,rel,tokens };

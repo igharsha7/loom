@@ -66,12 +66,12 @@ The original research matrix remains authoritative; this table reports implement
 | E05 | Partial | Conflicting original statements remain; conflict classification/clarification is not automated. |
 | E06 | Partial | Topic/deferred/rejected statuses retained; no native comprehension evaluation. |
 | E07 | Gated | Message deletion/revision dependencies absent; native queue action edits explicitly rejected. |
-| E08 | Covered | New user-source frontier invalidates unsent packets; bounded pre-intent reassembly. |
+| E08 | Covered | New governing user evidence invalidates unsent packets; queued/unsent requests are neither history nor invalidation (validation follow-up fix). |
 | E09 | Covered | Same instance, distinct chat bindings; explicit native IDs. |
 | E10 | Covered | Provider-specific bindings; Claude → Codex → Claude fixture. |
 | E11 | Partial | Model/options/protocol/workspace fingerprint; external auth/entitlement discovery unverified. |
 | E12 | Partial | Missing native acknowledgement stays unknown; manual reconciliation resets epoch. No automatic expiry recovery. |
-| E13 | Gated | Native compaction signals and retention reconstruction triggers pending. |
+| E13 | Covered | Both harnesses report compaction (Claude `compact_boundary`, Codex app-server `contextCompaction`); the binding is marked compacted and the next packet rebuilds state into the resumed session. |
 | E14 | Partial | Retention unknown; protected user evidence repeated. Native reconstruction triggers pending. |
 | E15 | Partial | Ordinary turn-input fixture avoids append-system prompt; live continuation quality unverified. |
 | E16 | Partial | Canonical checkout, HEAD/dirty content and instruction fingerprints; non-Git file applicability and moved-store migration pending. |
@@ -81,7 +81,7 @@ The original research matrix remains authoritative; this table reports implement
 | E20 | Partial | Inherited tool group and output-pipe fixture; escaped/detached descendants and Windows containment remain gates. |
 | E21 | Partial | Failed lifecycle stop blocks successors; uncertain termination retains lease. Real approval dialogs unverified. |
 | E22 | Partial | Run/binding/epoch correlation and original chat lookup; broader reordered/late-provider fixtures pending. |
-| E23 | Covered | Request idempotency and one foreground writer across pinned chats/queue. |
+| E23 | Covered | Request idempotency, one foreground writer across pinned chats/queue; unsent retries re-run instead of silently no-oping. |
 | E24 | Partial | Orchestra/subagents/bridges/routes gated before mutation; full worktree/team parity pending. |
 | E25 | Covered | Immutable prepared packet/receipt; revalidation before any native call. |
 | E26 | Covered | Restart submitting intent becomes unknown with lease retained. |
@@ -100,7 +100,7 @@ The original research matrix remains authoritative; this table reports implement
 | E39 | Gated | Current snapshot checked; per-verification historical workspace applicability not implemented. |
 | E40 | Covered | Immutable packet/receipt links, source/outcome/coverage checks, epoch/state/workspace revalidation. |
 | E41 | Covered | Current request included in heuristic budget; durable overflow/reassembly and explicit resume. Native capacity unknown. |
-| E42 | Partial | Prior omitted/referenced optional sources reconsidered under bounds; no exact-retention/full-coverage assertion. |
+| E42 | Covered | Deltas cover every observation since the basis packet plus prior omissions; user sources a session lacks are resent exact or referenced. |
 | E43 | Partial | FTS backfill/update/delete/rebuild and lexical fallback; actual index/DB corruption fault matrix pending. |
 | E44 | Partial | Escaped bounded FTS, scoped reads; aliases/entity expansion and broad paginated search pending. |
 | E45 | Covered | Mandatory text inline, verified local artifact reference, attachments/capabilities fail explicitly. |
@@ -148,3 +148,29 @@ Standards: eight initial/follow-up correctness findings addressed; the original
 worst issue was Stop racing with launch. Spec: ten initial/follow-up findings
 addressed in the supported path; full descendant/platform containment remains
 partial. Neither verdict is release certification for every matrix row.
+
+## Validation follow-up — 2026-09-28
+
+A later review reproduced four defects (delta coverage window, unsent requests
+rendered as history, capture before harness preflight with a silent retry no-op,
+and superseded checkpoints hiding originals). All are fixed with regressions; see
+[BRAIN-TODO](BRAIN-TODO.md#validation-follow-up--2026-09-28). The version allow-list was
+replaced by a 20 s reachability monitor, and assembly now sends a resumed native
+session only what it lacks. Full suite after the fixes: 1,419 non-DOM and 125
+browser tests passed; 17 existing skips.
+
+## Transport change (app-server / Agent SDK)
+
+Codex moved from `codex exec --json` to `codex app-server` JSON-RPC and Claude Code
+from `claude -p` to the Claude Agent SDK, following t3code. Brain-relevant effects:
+
+- Acceptance evidence is explicit on both: Codex's `turn/start` response or
+  `turn/started`; Claude's `requesting` status or first output.
+- A lost native session is reported before any turn starts (`NativeSessionMissing`);
+  `settled()` fails the receipt and moves the binding to a new epoch, so the next
+  packet reconstructs instead of sending a delta to an empty session.
+- Prompts travel on stdin, which removes the Linux argv limit.
+- A stream failure (an oversized record) now stops RPC parsing before anything else
+  is imported, and the failure's own message is kept.
+- Codex `run_complete` no longer adds cached input to input (cached is a subset).
+

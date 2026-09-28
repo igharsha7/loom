@@ -3,27 +3,73 @@
 These are not guesses: each surface below was verified against the locally installed
 tool before the adapter was written. Re-verify when versions move.
 
-## Claude Code (verified: v2.1.83)
+## Claude Code (verified: v2.1.278, Agent SDK 0.3.283)
 
-Headless invocation per turn:
+Loom drives the user's installed `claude` through the Claude Agent SDK
+(`@anthropic-ai/claude-agent-sdk`), one `query()` per turn, the way t3code does.
+The SDK speaks the CLI's stream-json control protocol over stdio:
 
 ```
-claude -p "<prompt>" \
-  --output-format stream-json --verbose \
-  [--resume <session-id>] \
-  [--append-system-prompt "<loom briefing>"] \
-  --permission-mode acceptEdits
+claude --output-format stream-json --verbose --input-format stream-json \
+  --permission-prompt-tool stdio --setting-sources=user,project,local \
+  --permission-mode <mode> [--resume=<session-id>] [--model <m>] [--mcp-config <json>]
+stdin:  control_request {subtype: "initialize", appendSystemPrompt?}  → control_response
+        {type: "user", message: {content: [{type: "text", text}]}}
+stdout: system/init (session_id) · system/status (requesting | compacting) ·
+        system/compact_boundary {pre_tokens, post_tokens} · assistant (content, usage) ·
+        rate_limit_event {utilization 0–1, rateLimitType, resetsAt s} ·
+        result (usage, total_cost_usd, modelUsage[*].contextWindow)
 ```
 
-- `--output-format stream-json` — newline-delimited JSON events on stdout:
-  - `{"type":"system","subtype":"init","session_id":...}` → capture session id
-  - `{"type":"assistant","message":{"content":[{"type":"text"|"tool_use",...}]}}`
-  - `{"type":"result","subtype":"success","total_cost_usd":...}` → run complete
-- `--resume <session-id>` — continue the same conversation across turns.
-- `--append-system-prompt` — **this is how Loom injects the handoff briefing** without
-  touching user files.
-- `--permission-mode` — `acceptEdits` default for baton holders (configurable).
-- Interrupt = SIGINT to the child process (escalate SIGKILL).
+- `pathToClaudeCodeExecutable` points the SDK at the user's `claude`, so the
+  signed-in version runs. `spawnClaudeCodeProcess` lets Loom spawn it in its own
+  process group (quiescence for Brain), and capture stderr.
+- `systemPrompt: {type: "preset", preset: "claude_code", append}` and
+  `settingSources: ["user", "project", "local"]` reproduce an interactive
+  `claude`; the SDK loads neither by default. The handoff briefing is `append`.
+- Permissions: "ask" is `permissionMode: default` with `canUseTool` answered
+  in-process by Loom's approval broker (no MCP shim); "auto" is `acceptEdits`;
+  "bypass" is `bypassPermissions` with `allowDangerouslySkipPermissions`.
+- Interrupt is the `interrupt` control request; the CLI answers with an
+  `error_during_execution` result and exits. Loom reports `interrupted`, not an error.
+- A resumed session that no longer exists: the CLI prints `No conversation found`
+  and exits before reading the prompt. Loom starts a new session, or with Brain
+  continuity reports `NativeSessionMissing` so Brain rebuilds into a new epoch.
+- Context in use is the main thread's last response usage (input + cache read +
+  cache creation + output); the window comes from the result's `modelUsage`.
+- The SDK package pulls a platform binary as an optional dependency (~228 MB);
+  Loom never runs it because `pathToClaudeCodeExecutable` is always set.
+
+## Codex (verified: codex-cli 0.153.4)
+
+Loom drives `codex app-server`, one process per turn: newline-delimited JSON-RPC
+(`{id, method, params}`, no `jsonrpc` field), the protocol t3code uses.
+
+```
+initialize {clientInfo, capabilities: {experimentalApi: true}} → initialized
+thread/start {cwd, sandbox, approvalPolicy, model?, config?}
+  | thread/resume {threadId, excludeTurns: true, …same}
+turn/start {threadId, input: [{type: "text", text, text_elements: []}], clientUserMessageId?}
+… item/started · item/completed (agentMessage, reasoning, commandExecution, fileChange,
+  mcpToolCall, webSearch, contextCompaction) · thread/tokenUsage/updated
+  {total, last, modelContextWindow} · account/rateLimits/updated · error {willRetry}
+turn/completed {turn: {id, status: completed | interrupted | failed, error}}
+turn/interrupt {threadId, turnId}
+```
+
+- Sandbox and approvals per Loom mode: bypass → `danger-full-access` + `never`;
+  auto → `workspace-write` + `never`; ask → `read-only` + `untrusted`, and each
+  `item/commandExecution/requestApproval` / `item/fileChange/requestApproval` is
+  answered by Loom's approval broker. Requests Loom can't put to a person
+  (elicitations, extra permissions) are declined rather than left waiting.
+- Project MCP servers go in `thread/start` config as `mcp_servers.<key>`.
+- Context in use is `last.totalTokens`; `inputTokens` already includes cached
+  tokens and `outputTokens` includes reasoning, so neither is added twice.
+- A missing thread on resume is an error response; Loom starts a new thread, or
+  with Brain continuity reports `NativeSessionMissing`.
+- The account's own default model comes from `~/.codex/config.toml`. A model the
+  account can't use fails the turn with Codex's 400; `model/list` says which
+  models the account offers.
 
 ## OpenCode (verified: v1.17.20)
 

@@ -15,6 +15,7 @@ import { EventLog } from "../core/eventlog.js";
 import { ensureBranch, addWorktree as gitAddWorktree, readOut, worktreePath } from "../core/git.js";
 import { logbook } from "../core/logbook.js";
 import { probeMcpServer, probeMcpServers, writeMcpSession } from "../core/mcp.js";
+import { NativeUsage } from "./runtime/native-usage.js";
 import { notify } from "../core/notify.js";
 import { OrchestraEngine, type OrchestraCoordinator } from "../core/orchestra.js";
 import { isPermissionMode, permissionFor, unsupportedReason, type PermissionMode } from "../core/permissions.js";
@@ -93,6 +94,7 @@ import { RuntimeQueue } from './runtime/queue.js';
 import { RuntimeTurns, type TurnOptions, type TurnResult } from './runtime/turns.js';
 import { ContinuityEngine } from "../core/continuity/engine.js";
 import { ContinuityError } from "../core/continuity/contracts.js";
+import { HarnessMonitor, isNativeKind } from "../core/continuity/capabilities.js";
 export { BudgetExceededError, CLOCK_TICK_MS, LOOM_ASK_TIMEOUT_MESSAGE, LOOM_ASK_TIMEOUT_MS, LoomAskTimeoutError, QuarantinedError, type ServerFrame, type TeamBrainHook, activityLine, planModeBriefing, relativeToProject, withLoomAskTimeout } from './runtime-support.js';
 
 export class ProjectRuntime {
@@ -114,6 +116,10 @@ export class ProjectRuntime {
   /** Memory as units — see core/brain.ts. Reads and writes through `log`. */
   readonly brain: Brain;
   continuity: ContinuityEngine | null = null;
+  /** Native harness reachability, polled while native continuity is on. */
+  readonly harnesses: HarnessMonitor;
+  /** Latest context and usage-limit readings from native harnesses. */
+  readonly nativeUsage = new NativeUsage();
   private readonly agentLifecycle = new RuntimeAgents();
   private get agents(): ReadonlyMap<string, AnyAgent> { return this.agentLifecycle.agents; }
   private configMtime = 0;
@@ -131,6 +137,16 @@ export class ProjectRuntime {
     this.config = config;
     this.log = log;
     if (config.brain?.continuity === true) this.continuity = new ContinuityEngine(log, info.id);
+    this.harnesses = new HarnessMonitor(
+      () => this.config.agents.filter(a => a.enabled !== false && isNativeKind(a.kind)).map(a => ({ id: a.id, kind: a.kind, options: this.policyOptions(a) })),
+      (id, next, previous) => {
+        if (!next.available) logbook.warn("harness", `${id} CLI is not reachable — native turns are refused until it answers`, next.error, info.id);
+        else if (previous && !previous.available) logbook.info("harness", `${id} CLI is reachable again (${next.version ?? "unknown version"})`, undefined, info.id);
+      },
+    );
+    if (this.continuity) this.harnesses.start();
+    // The last readings survive a restart: replay the recent reports.
+    for (const e of log.list({ kinds: ["status", "run_complete", "error"], limit: 500 })) this.nativeUsage.observe(e);
     this.conversations = new ConversationStore(info.dir);
     const runtime = this;
     this.accounting = new RuntimeAccounting({
@@ -166,6 +182,7 @@ export class ProjectRuntime {
     });
     this.turns = new RuntimeTurns({
       get continuity() { return runtime.continuity; },
+      harness: (id) => this.harnesses.ensure(id),
       kickQueue: () => this.kickQueue(),
       nativeOptions: (id) => this.policyOptions(this.config.agents.find(a => a.id === id)!),
       chatExists: (chat) => this.chats().some(c => c.id === chat),
@@ -433,8 +450,8 @@ export class ProjectRuntime {
         if (changingContinuity) {
           if (this.anyBusy() || this.continuity?.store.activeReceipts().length || this.queue.length)
             throw new ContinuityError("conflict", "finish or reconcile native turns before changing continuity mode; also clear queued prompts");
-          if (patch.brain.continuity) this.continuity = new ContinuityEngine(this.log, this.info.id);
-          else { this.continuity?.store.releaseOwner(); this.continuity = null; }
+          if (patch.brain.continuity) { this.continuity = new ContinuityEngine(this.log, this.info.id); this.harnesses.start(); }
+          else { this.continuity?.store.releaseOwner(); this.continuity = null; this.harnesses.stop(); }
 
         }
         const b = { ...(this.config.brain ?? {}) };
@@ -493,6 +510,7 @@ export class ProjectRuntime {
         this.continuity?.store.releaseOwner();
         this.continuity = previousContinuity;
         previousContinuity?.store.claimOwner();
+        if (previousContinuity) this.harnesses.start(); else this.harnesses.stop();
       }
       for (const key of Object.keys(this.config)) delete (this.config as unknown as Record<string, unknown>)[key];
       Object.assign(this.config, previousConfig);
@@ -743,6 +761,7 @@ export class ProjectRuntime {
         payload,
       });
       this.continuity?.ingest(event);
+      this.nativeUsage.observe(event);
       if (liveRun) this.afterAgentEvent(event);
       if (turnOver && !this.continuity) this.kickQueue();
       } catch {
@@ -2335,12 +2354,16 @@ export class ProjectRuntime {
           kind: cfg.kind,
           role: cfg.role,
           tier: live.capabilities.tier,
-          available: await live.available().catch(() => false),
+          available: this.continuity && isNativeKind(cfg.kind)
+            ? (await this.harnesses.ensure(cfg.id)).available
+            : await live.available().catch(() => false),
+          ...(this.continuity && isNativeKind(cfg.kind) ? { cliVersion: this.harnesses.get(cfg.id)?.version ?? null } : {}),
           busy: isAdapter(live) ? live.busy() || Boolean(this.continuity && this.turns.busySince.has(cfg.id)) : false,
           holdsBaton: holder === cfg.id,
           model,
           permissions: permissionFor(cfg.kind, cfg.options),
           enabled: true,
+          ...(isNativeKind(cfg.kind) ? { context: this.nativeUsage.context(cfg.id), limits: this.nativeUsage.limitsFor(cfg.kind) } : {}),
         };
       }),
     );
@@ -2568,6 +2591,7 @@ export class ProjectRuntime {
   async close(): Promise<void> {
     await this.orchestra.shutdown().catch(() => { });
     this.closed = true;
+    this.harnesses.stop();
     this.briefings.close();
     if (this.mcpTimer) { clearInterval(this.mcpTimer); this.mcpTimer = null; }
     await this.agentLifecycle.close();

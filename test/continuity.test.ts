@@ -4,14 +4,17 @@ import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EventLog } from "../src/core/eventlog.js";
 import { ContinuityEngine, renderPacket, estimateTokens } from "../src/core/continuity/engine.js";
-import { ContextPacketV1, digest, parseBounded, RequestV1, NativeDispatchRejected, NativeQuiescenceUnknown, type ContextItem } from "../src/core/continuity/contracts.js";
+import { ContextPacketV1, digest, parseBounded, RequestV1, NativeDispatchRejected, NativeQuiescenceUnknown, NativeSessionMissing, type ContextItem } from "../src/core/continuity/contracts.js";
 import { ClaudeCodeAdapter } from "../src/adapters/claude-code.js";
 import { CodexAdapter } from "../src/adapters/codex.js";
 import { ProjectRuntime } from "../src/daemon/runtime.js";
 import { RuntimeAgents } from "../src/daemon/runtime/agents.js";
 import { AdapterBase } from "../src/adapters/base.js";
+import { ContextArtifacts } from "../src/core/continuity/artifacts.js";
+import { HarnessMonitor } from "../src/core/continuity/capabilities.js";
 import { makeProjectDir, tmpDir, waitUntil } from "./helpers.js";
 import type { SendInput } from "../src/types.js";
+import { CLAUDE_OK, CODEX_OK, callsOf, claudeInit, claudeInitOf, claudePromptOf, claudeResult, claudeText, fakeClaude, fakeCodex, rpcOf } from "./native-fakes.js";
 
 const open: Array<{ close: () => void | Promise<void> }> = [];
 afterEach(async () => { for (const item of open.splice(0).reverse()) await item.close(); });
@@ -21,28 +24,21 @@ async function setup() {
 }
 const request = (brain: ContinuityEngine, text = "continue", id = crypto.randomUUID(), chat = "main", agent = "claude") => brain.capture({
   id, conversationId: chat, agentInstanceId: agent, text, source: "user", model: null, plan: false, targetAddedTokens: 6000 }).request;
-function fakeCli(kind: "codex" | "claude", delay = 0): string {
-  const dir = tmpDir("continuity-cli"), bin = path.join(dir, kind);
-  fs.writeFileSync(bin, `#!/usr/bin/env node
-const fs = require('node:fs');
-const args = process.argv.slice(2);
-fs.appendFileSync(${JSON.stringify(path.join(dir, "calls.jsonl"))}, JSON.stringify(args)+'\\n');
-if(args.includes('--version')) { console.log(${JSON.stringify(kind === "claude" ? "2.1.83" : "codex-cli 0.142.4")}); process.exit(0); }
-const resume = ${kind === "claude" ? "args[args.indexOf('--resume')+1]" : "args[2]"};
-const id = args.includes(${JSON.stringify(kind === "claude" ? "--resume" : "resume")}) ? resume : 'native-'+Date.now()+'-'+process.pid;
-const events = ${kind === "claude" ? `[{type:'system',subtype:'init',session_id:id},{type:'assistant',message:{content:[{type:'text',text:'Did the work.'}]}},{type:'result',is_error:false,usage:{input_tokens:32,output_tokens:8}}]` : `[{type:'thread.started',thread_id:id},{type:'turn.started'},{type:'item.completed',item:{type:'agent_message',text:'Did the work.'}},{type:'turn.completed',usage:{input_tokens:32,output_tokens:8}}]`};
-setTimeout(()=>{ for(const event of events) console.log(JSON.stringify(event)); }, ${delay});
-`, { mode: 0o755 });
-  return bin;
-}
-const calls = (bin: string): string[][] => fs.readFileSync(path.join(path.dirname(bin), "calls.jsonl"), "utf8")
-  .trim().split("\n").map(s => JSON.parse(s)).filter(a => !a.includes("--version"));
+/** A user message already in the conversation (sent earlier, or before native mode). */
+const say = (log: EventLog, text: string, chat?: string) => log.append({ kind: "message", ...(chat ? { chat } : {}), payload: { text, author: "user" } });
+/** A native harness fake that completes one ordinary turn, optionally after a delay. */
+const fakeCli = (kind: "codex" | "claude", delay = 0): string => kind === "claude"
+  ? fakeClaude({ script: delay ? [{ sleep: delay }, ...CLAUDE_OK] : CLAUDE_OK })
+  : fakeCodex({ script: delay ? [{ sleep: delay }, ...CODEX_OK] : CODEX_OK });
+const calls = callsOf;
 async function runNative(brain: ContinuityEngine, log: EventLog, dir: string, req: ReturnType<typeof request>, kind: "claude-code" | "codex", bin: string) {
   const prepared = await brain.prepare(req, kind, dir, { bin });
   const continuity = await brain.submit(prepared);
   const adapter = kind === "codex" ? new CodexAdapter(req.agentInstanceId, dir, { bin }) : new ClaudeCodeAdapter(req.agentInstanceId, dir, { bin });
   adapter.onEvent(e => brain.ingest(log.append({ ...e, agentId: req.agentInstanceId, chat: req.conversationId })));
-  await adapter.send({ text: req.text, continuity }); brain.settled(continuity.runId);
+  try { await adapter.send({ text: req.text, continuity }); }
+  catch (error) { brain.settled(continuity.runId, error); throw error; }
+  brain.settled(continuity.runId);
   return prepared;
 }
 
@@ -78,7 +74,7 @@ describe("Brain continuity contracts and evidence", () => {
   });
   it("keeps buried small decisions and tentative discussion regardless of retrieval rank", async () => {
     const { log, brain, dir } = await setup();
-    request(brain, "Maybe SQLite? Not accepted yet. Also retain keyboard focus.");
+    say(log, "Maybe SQLite? Not accepted yet. Also retain keyboard focus.");
     for (let i = 0; i < 400; i++) log.append({ kind: "message", agentId: "codex", payload: { text: `output ${i}` } });
     request(brain, "Private conversation content", "private", "private");
     const prepared = await brain.prepare(request(brain), "claude-code", dir, {});
@@ -137,10 +133,9 @@ describe("Brain cleanup regressions", () => {
     await expect(brain.submit(prepared)).rejects.toMatchObject({ code: "overflow" });
   });
   it("reactivates evidence removed from a checkpoint revision", async () => {
-    const { brain, dir } = await setup();
-    request(brain, "Keep the original tiny preference", "first"); request(brain, "second discussion", "second");
-    const first = brain.store.source(brain.store.requestEvent("first")!, "project");
-    const second = brain.store.source(brain.store.requestEvent("second")!, "project");
+    const { brain, dir, log } = await setup();
+    const first = brain.store.source(say(log, "Keep the original tiny preference"), "project");
+    const second = brain.store.source(say(log, "second discussion"), "project");
     const item: ContextItem = { id: "review", revision: 1, conversationId: "main", kind: "topic", text: "Original preference", origin: "user", status: "tentative", sources: [first], supersedes: null };
     brain.putItem(item); brain.store.dispose(first.eventId, "main", item.id);
     brain.putItem({ ...item, revision: 2, text: "second discussion", sources: [second] });
@@ -157,8 +152,8 @@ describe("Brain cleanup regressions", () => {
     expect(brain.store.items("main")[0]?.status).toBe("accepted");
   });
   it("invalidates unsent packets on new user evidence and rejects mixed receipts", async () => {
-    const { brain, dir } = await setup(), first = await brain.prepare(request(brain, "first"), "codex", dir, {});
-    request(brain, "Correction: preserve keyboard focus");
+    const { brain, dir, log } = await setup(), first = await brain.prepare(request(brain, "first"), "codex", dir, {});
+    log.append({ kind: "decision", payload: { text: "Correction: preserve keyboard focus" } });
     await expect(brain.submit(first)).rejects.toMatchObject({ code: "stale" });
     const second = await brain.prepare(request(brain, "continue"), "codex", dir, {});
     expect(second.rendered.text).toContain("preserve keyboard focus");
@@ -187,7 +182,9 @@ describe("Brain cleanup regressions", () => {
     vi.spyOn(brain, "submit").mockImplementation(async (prepared, signal) => {
       if (!injected) {
         injected = true;
-        brain.capture({ id: "new-governing", conversationId: "main", agentInstanceId: "codex", text: "Preserve this constraint. ".repeat(1200), source: "user", model: null, plan: false, targetAddedTokens: 6000 });
+        // A large reviewed item changes protected state after preparation.
+        brain.putItem({ id: "new-governing", revision: 1, conversationId: "main", kind: "instruction", text: "Preserve this constraint. ".repeat(1200),
+          origin: "user", status: "accepted", sources: [brain.store.source(brain.store.requestEvent("reassemble")!, "project")], supersedes: null });
       }
       return original(prepared, signal);
     });
@@ -221,15 +218,9 @@ describe("Brain cleanup regressions", () => {
     brain.settled(continuity.runId, new NativeDispatchRejected("no launch"));
   });
   it.skipIf(process.platform === "win32")("terminates inherited tool children before reporting completion", async () => {
-    const { brain, log, dir } = await setup(), bin = path.join(tmpDir("native-descendant"), "codex"), marker = path.join(dir, "child-writes");
+    const { brain, log, dir } = await setup(), marker = path.join(dir, "child-writes");
     const childScript = `const fs=require('node:fs'); setInterval(()=>fs.appendFileSync(${JSON.stringify(marker)},'x'),20);`;
-    fs.writeFileSync(bin, `#!/usr/bin/env node
-const {spawn}=require('node:child_process');
-const child=spawn(process.execPath,['-e',${JSON.stringify(childScript)}],{stdio:['ignore','inherit','inherit']}); child.unref();
-console.log(JSON.stringify({type:'thread.started',thread_id:'native'}));
-console.log(JSON.stringify({type:'turn.started'}));
-setTimeout(()=>console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,output_tokens:1}})),200);
-`, { mode: 0o755 });
+    const bin = fakeCodex({ script: [{ spawn: childScript }, { sleep: 200 }, ...CODEX_OK] });
     await runNative(brain, log, dir, request(brain), "codex", bin);
     const after = fs.readFileSync(marker, "utf8");
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -246,7 +237,8 @@ setTimeout(()=>console.log(JSON.stringify({type:'turn.completed',usage:{input_to
     expect(runtime.routes.read()).toBeUndefined();
   });
   it("waits for app-owned turn commits before dispatching the next native writer", async () => {
-    const bin = fakeCli("codex"), dir = makeProjectDir({ brain: { continuity: true }, git: { commitPerTurn: true }, agents: [{ id: "codex", kind: "codex", options: { bin } }] });
+    const bin = fakeCodex({ script: [{ spawn: "" }, { sleep: 400 }, ...CODEX_OK] });
+    const dir = makeProjectDir({ brain: { continuity: true }, git: { commitPerTurn: true }, agents: [{ id: "codex", kind: "codex", options: { bin } }] });
     const configFile = path.join(dir, ".loom", "config.json");
     fs.writeFileSync(configFile, JSON.stringify({ ...JSON.parse(fs.readFileSync(configFile, "utf8")), git: { commitPerTurn: true } }));
     execFileSync("git", ["init", "-q"], { cwd: dir });
@@ -256,8 +248,9 @@ setTimeout(()=>console.log(JSON.stringify({type:'turn.completed',usage:{input_to
     execFileSync("git", ["add", "."], { cwd: dir }); execFileSync("git", ["commit", "-qm", "base"], { cwd: dir });
     const marker = path.join(dir, ".git", "hook-running"), release = path.join(dir, ".git", "hook-release");
     fs.writeFileSync(path.join(dir, ".git", "hooks", "pre-commit"), `#!/bin/sh\ntouch '${marker}'\nwhile [ ! -f '${release}' ]; do sleep 0.05; done\n`, { mode: 0o755 });
-    const originalCli = fs.readFileSync(bin, "utf8");
-    fs.writeFileSync(bin, originalCli.replace("const resume =", `fs.writeFileSync(${JSON.stringify(path.join(dir, "file"))},'change-'+Date.now());\nconst resume =`));
+    // Each turn edits the tracked file, so each turn has something to commit.
+    fs.writeFileSync(bin, fs.readFileSync(bin, "utf8").replace('{"spawn":""}',
+      JSON.stringify({ spawn: `require('node:fs').writeFileSync(${JSON.stringify(path.join(dir, "file"))},'change-'+Date.now())` })));
     const runtime = await ProjectRuntime.open({ id: "project", name: "test", dir }); open.push(runtime);
     try {
       await runtime.sendMessage("change first", "codex", { requestId: "commit-first" });
@@ -270,12 +263,9 @@ setTimeout(()=>console.log(JSON.stringify({type:'turn.completed',usage:{input_to
     expect(execFileSync("git", ["log", "--oneline"], { cwd: dir, encoding: "utf8" }).trim().split("\n")).toHaveLength(3);
   }, 10_000);
   it("bounds native output records before importing oversized partial responses", async () => {
-    const { brain, log, dir } = await setup(), bin = path.join(tmpDir("native-oversize"), "codex");
-    fs.writeFileSync(bin, `#!/usr/bin/env node
-console.log(JSON.stringify({type:'thread.started',thread_id:'native'}));
-console.log(JSON.stringify({type:'turn.started'}));
-console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'x'.repeat(32_000_001)}}));
-`, { mode: 0o755 });
+    const { brain, log, dir } = await setup();
+    const oversized = `process.stdout.write('{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"' + 'x'.repeat(32_000_001) + '"}}}\\n')`;
+    const bin = fakeCodex({ script: [CODEX_OK[0]!, { spawn: oversized }, { sleep: 5000 }, ...CODEX_OK.slice(1)] });
     const prepared = await brain.prepare(request(brain), "codex", dir, {}), continuity = await brain.submit(prepared);
     const adapter = new CodexAdapter("claude", dir, { bin });
     adapter.onEvent(e => brain.ingest(log.append({ ...e, agentId: "claude" })));
@@ -364,10 +354,9 @@ describe("native continuity lifecycle", () => {
     const third = await runNative(resumed, again, dir, request(resumed, "Continue the same work"), "claude-code", claude);
     expect(third.packet.mode).toBe("delta"); expect(third.packet.target.nativeSessionId).toBe(native);
     expect(third.rendered.text).toContain("SQLite is accepted");
-    const args = calls(claude).at(-1)!;
-    expect(args[args.indexOf("--resume") + 1]).toBe(native);
-    expect(args).not.toContain("--append-system-prompt");
-    expect(args[args.indexOf("-p") + 1]).toContain("SQLite is accepted");
+    expect(calls(claude).at(-1)).toContain(`--resume=${native}`);
+    expect(claudeInitOf(claude).appendSystemPrompt).toBeUndefined();
+    expect(claudePromptOf(claude)).toContain("SQLite is accepted");
     expect(resumed.store.receipts().every(r => r.status === "accepted" && r.execution === "complete")).toBe(true);
     expect(fs.existsSync(path.join(dir, ".loom", "state.json"))).toBe(false);
   });
@@ -376,10 +365,12 @@ describe("native continuity lifecycle", () => {
     const main = await runNative(brain, log, dir, request(brain, "main-only", undefined, "main", "codex"), "codex", bin);
     const privateChat = await runNative(brain, log, dir, request(brain, "private-only", undefined, "private", "codex"), "codex", bin);
     expect(privateChat.packet.target.id).not.toBe(main.packet.target.id);
-    expect(calls(bin).at(-1)).not.toContain("resume"); expect(privateChat.rendered.text).not.toContain("main-only");
+    expect(rpcOf(bin, "thread/resume")).toHaveLength(0); expect(privateChat.rendered.text).not.toContain("main-only");
   });
   it("persists overflow without submitting and lets a later budget produce a new attempt", async () => {
-    const { brain, dir } = await setup(); request(brain, "tiny decision ".repeat(3000));
+    const { brain, dir, log } = await setup(), said = say(log, "tiny decision ".repeat(3000));
+    brain.putItem({ id: "large-review", revision: 1, conversationId: "main", kind: "decision", text: "tiny decision ".repeat(3000),
+      origin: "user", status: "accepted", sources: [brain.store.source(said, "project")], supersedes: null });
     const req = request(brain), prepared = await brain.prepare(req, "codex", dir, {});
     expect(prepared.packet.budget.overflow).toBe("mandatory");
     await expect(brain.submit(prepared)).rejects.toMatchObject({ code: "overflow" });
@@ -452,7 +443,167 @@ describe("native continuity lifecycle", () => {
     expect(two.queued).toBe(1);
     runtime.setChatAgent(chat, "claude");
     await waitUntil(() => runtime.continuity!.store.receipts("two").at(-1)?.execution === "complete");
-    expect(calls(codex)[0]).toContain("cheap-captured"); expect(calls(codex)[0]!.at(-1)).toContain("Use SQLite");
+    expect(rpcOf(codex, "thread/start")[0]).toMatchObject({ model: "cheap-captured" });
+    expect(JSON.stringify(rpcOf(codex, "turn/start")[0]!.input)).toContain("Use SQLite");
     expect(calls(claude)).toHaveLength(1);
+  });
+});
+
+describe("usage-aware switching and validation fixes", () => {
+  const accept = (brain: ContinuityEngine, log: EventLog, turn: { runId: string; bindingId: string; sessionEpoch: number }, agent: string, session: string) => {
+    const tags = { loomRunId: turn.runId, loomBindingId: turn.bindingId, loomSessionEpoch: turn.sessionEpoch };
+    brain.ingest(log.append({ kind: "status", agentId: agent, payload: { ...tags, state: "turn_started", session } }));
+    brain.ingest(log.append({ kind: "run_complete", agentId: agent, payload: tags }));
+  };
+  it("a return delta covers every observation since its basis, not a recent window", async () => {
+    const { brain, log, dir } = await setup();
+    accept(brain, log, await brain.submit(await brain.prepare(request(brain, "start"), "claude-code", dir, {})), "claude", "s1");
+    const work = Array.from({ length: 120 }, (_, i) => log.append({ kind: "message", agentId: "codex", payload: { text: `codex step ${i}` } }));
+    const back = await brain.prepare(request(brain, "zzz"), "claude-code", dir, {});
+    expect(back.packet.mode).toBe("delta");
+    const covered = new Set(back.packet.coverage.map(c => c.source.eventId));
+    expect(work.filter(e => !covered.has(e.id))).toHaveLength(0);
+    expect(back.packet.evidence).toHaveLength(120);
+  });
+  it("a queued request is neither history for the running turn nor a reason to reassemble it", async () => {
+    const { brain, dir } = await setup();
+    const a = request(brain, "A: refactor the parser");
+    request(brain, "B: delete the old parser tests");
+    const prepared = await brain.prepare(a, "claude-code", dir, {});
+    expect(prepared.rendered.text).not.toContain("old parser tests");
+    request(brain, "C: queued while A prepares");
+    await expect(brain.submit(prepared)).resolves.toHaveProperty("runId");
+  });
+  it("does not resend what a resumed session already holds; sends what another agent was told", async () => {
+    const { brain, log, dir } = await setup(), claude = fakeCli("claude"), codex = fakeCli("codex");
+    await runNative(brain, log, dir, request(brain, "Claude-only instruction: keep tabs"), "claude-code", claude);
+    await runNative(brain, log, dir, request(brain, "Codex-only instruction: add an index", undefined, "main", "codex"), "codex", codex);
+    const back = await runNative(brain, log, dir, request(brain, "continue"), "claude-code", claude);
+    expect(back.packet.mode).toBe("delta");
+    expect(back.rendered.text).not.toContain("keep tabs");
+    expect(back.rendered.text).toContain("add an index");
+    const again = await brain.prepare(request(brain, "and again"), "claude-code", dir, { bin: claude });
+    expect(again.rendered.text).not.toContain("add an index");
+    expect(again.packet.items).toHaveLength(0);
+  });
+  it("a new session gets a bounded packet: recent exact, older headlines, full text on file", async () => {
+    const { brain, log, dir } = await setup();
+    const said = Array.from({ length: 300 }, (_, i) => say(log, `Message ${i}: ${"keep the layout stable and tests green. ".repeat(4)}`));
+    const prepared = await brain.prepare(request(brain, "switch to a fresh agent"), "claude-code", dir, {});
+    expect(prepared.packet.mode).toBe("reconstruction");
+    expect(prepared.packet.budget.overflow).toBe("none");
+    expect(prepared.packet.budget.estimatedAddedTokens).toBeLessThanOrEqual(6000);
+    expect(prepared.packet.messages.map(m => m.source.eventId)).toContain(said.at(-1)!.id);
+    const covered = new Map(prepared.packet.coverage.map(c => [c.source.eventId, c.disposition]));
+    for (const e of said) expect(["exact", "referenced"]).toContain(covered.get(e.id));
+    expect(covered.get(said[0]!.id)).toBe("referenced");
+    const archive = JSON.parse(new ContextArtifacts(dir).read(prepared.packet.retrieval!.hash));
+    expect(archive.sources.map((s: { source: { eventId: number } }) => s.source.eventId)).toContain(said[0]!.id);
+    expect(prepared.rendered.text).toContain("full text in the evidence file");
+  });
+  it("superseding a checkpoint restores the originals it replaced", async () => {
+    const { brain, log, dir } = await setup();
+    const original = say(log, "Use two-space indentation in YAML only"), source = brain.store.source(original, "project");
+    brain.putItem({ id: "cp", revision: 1, conversationId: "main", kind: "instruction", text: "Use two-space indentation", origin: "user", status: "accepted", sources: [source], supersedes: null });
+    brain.store.dispose(original.id, "main", "cp");
+    expect((await brain.prepare(request(brain), "codex", dir, {})).packet.messages).toHaveLength(0);
+    const fix = say(log, "That summary was wrong: YAML only");
+    brain.putItem({ id: "fix", revision: 1, conversationId: "main", kind: "correction", text: "Two spaces in YAML files only", origin: "user", status: "accepted",
+      sources: [brain.store.source(fix, "project")], supersedes: { id: "cp", revision: 1 } });
+    const after = await brain.prepare(request(brain), "codex", dir, {});
+    expect(after.packet.messages.some(m => m.source.eventId === original.id)).toBe(true);
+    expect(after.packet.items.map(i => i.id)).toEqual(["fix"]);
+  });
+  it("switching model within a harness keeps its native session", async () => {
+    const { brain, log, dir } = await setup();
+    const first = await brain.prepare(request(brain, "one"), "claude-code", dir, { model: "sonnet" });
+    accept(brain, log, await brain.submit(first), "claude", "native-1");
+    const second = await brain.prepare({ ...request(brain, "two"), model: "opus" }, "claude-code", dir, { model: "opus" });
+    expect(second.packet.target.id).toBe(first.packet.target.id);
+    expect(second.packet.mode).toBe("delta"); expect(second.packet.target.nativeSessionId).toBe("native-1");
+  });
+  it("native compaction rebuilds state into the same session, then returns to deltas", async () => {
+    const { brain, log, dir } = await setup();
+    const bin = fakeClaude({ script: [claudeInit,
+      { out: { type: "system", subtype: "compact_boundary", compact_metadata: { trigger: "auto", pre_tokens: 190000 }, session_id: "$SESSION" } },
+      claudeText("ok"), claudeResult()] });
+    const first = await runNative(brain, log, dir, request(brain, "Keep the tiny preference: tabs"), "claude-code", bin);
+    const native = brain.store.bindingById(first.packet.target.id)!;
+    expect(native.retention).toBe("compacted");
+    const rebuilt = await brain.prepare(request(brain, "continue"), "claude-code", dir, { bin });
+    expect(rebuilt.packet.mode).toBe("reconstruction");
+    expect(rebuilt.packet.target.nativeSessionId).toBe(native.nativeSessionId);
+    expect(rebuilt.rendered.text).toContain("tabs");
+    accept(brain, log, await brain.submit(rebuilt), "claude", native.nativeSessionId!);
+    expect(brain.store.bindingById(first.packet.target.id)?.retention).toBe("unknown");
+    expect((await brain.prepare(request(brain, "next"), "claude-code", dir, { bin })).packet.mode).toBe("delta");
+  });
+  it("a lost native session moves the binding to a new epoch and reconstructs", async () => {
+    for (const kind of ["claude-code", "codex"] as const) {
+      const { brain, log, dir } = await setup();
+      const bin = kind === "codex" ? fakeCli("codex") : fakeCli("claude");
+      const first = await runNative(brain, log, dir, request(brain, "Remember: tabs, not spaces", undefined, "main", kind), kind, bin);
+      const bound = brain.store.bindingById(first.packet.target.id)!;
+      const again = await brain.prepare(request(brain, "continue", undefined, "main", kind), kind, dir, { bin });
+      expect(again.packet.mode).toBe("delta");
+      const turn = await brain.submit(again);
+      brain.settled(turn.runId, new NativeSessionMissing("gone"));
+      expect(brain.store.receipts().at(-1)).toMatchObject({ status: "failed", execution: "failed" });
+      expect(brain.store.bindingById(bound.id)).toMatchObject({ nativeSessionId: null, sessionEpoch: bound.sessionEpoch + 1, retention: "unknown" });
+      const rebuilt = await brain.prepare(request(brain, "continue once more", undefined, "main", kind), kind, dir, { bin });
+      expect(rebuilt.packet.mode).toBe("reconstruction");
+      expect(rebuilt.rendered.text).toContain("tabs, not spaces");
+    }
+  });
+  it("adapters report a lost session as NativeSessionMissing through a real turn", async () => {
+    for (const kind of ["claude-code", "codex"] as const) {
+      const { brain, log, dir } = await setup();
+      const bin = kind === "codex" ? fakeCli("codex") : fakeCli("claude");
+      await runNative(brain, log, dir, request(brain, "first", undefined, "main", kind), kind, bin);
+      const gone = kind === "codex" ? fakeCodex({ missingThread: true }) : fakeClaude({ missingSession: true });
+      // Point the same binding at a harness that lost the session: same path, new behaviour.
+      fs.copyFileSync(gone, bin);
+      await expect(runNative(brain, log, dir, request(brain, "second", undefined, "main", kind), kind, bin)).rejects.toBeInstanceOf(NativeSessionMissing);
+      expect(brain.store.receipts().at(-1)).toMatchObject({ status: "failed" });
+      expect(brain.store.activeReceipts()).toHaveLength(0);
+    }
+  });
+  it("HarnessMonitor reports reachability transitions and serves cached results", async () => {
+    const bin = path.join(tmpDir("monitor"), "codex");
+    fs.writeFileSync(bin, "#!/usr/bin/env node\nconsole.log('codex-cli 9.9.9')\n", { mode: 0o755 });
+    const changes: boolean[] = [];
+    const monitor = new HarnessMonitor(() => [{ id: "codex", kind: "codex", options: { bin } }], (_id, next) => changes.push(next.available), 60_000);
+    const up = await monitor.ensure("codex");
+    expect(up).toMatchObject({ available: true, version: "9.9.9", tested: false });
+    fs.writeFileSync(bin, "#!/bin/sh\nexit 3\n");
+    expect((await monitor.ensure("codex")).available).toBe(true); // cached within the interval
+    await monitor.pollAll();
+    expect(monitor.get("codex")?.available).toBe(false);
+    expect(changes).toEqual([true, false]);
+  });
+  it("refuses an unreachable harness before capture; a retry runs any reachable version", async () => {
+    const bin = path.join(tmpDir("cli"), "claude"), good = fakeCli("claude");
+    fs.writeFileSync(bin, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    const dir = makeProjectDir({ brain: { continuity: true, extractor: "off" }, agents: [{ id: "claude", kind: "claude-code", options: { bin } }] });
+    const runtime = await ProjectRuntime.open({ id: "project", name: "test", dir }); open.push(runtime);
+    const chat = runtime.createChat("c").id;
+    await expect(runtime.sendMessage("Do the thing", "claude", { requestId: "r", chat })).rejects.toMatchObject({ code: "unsupported" });
+    expect(runtime.log.list({ chat }).some(e => e.kind === "message" && !e.agentId)).toBe(false);
+    fs.writeFileSync(bin, fs.readFileSync(good, "utf8").replace("2.1.283", "2.9.999"), { mode: 0o755 });
+    await runtime.harnesses.pollAll();
+    const retry = await runtime.sendMessage("Do the thing", "claude", { requestId: "r", chat });
+    expect(retry.continuityStatus).toBe("submitting");
+    await waitUntil(() => runtime.continuity!.store.receipts("r").at(-1)?.execution === "complete");
+  });
+  it("re-runs an unsent request when its ID is retried after a pre-launch failure", async () => {
+    const bin = fakeCli("codex"), dir = makeProjectDir({ brain: { continuity: true, extractor: "off" }, agents: [{ id: "codex", kind: "codex", options: { bin } }] });
+    const runtime = await ProjectRuntime.open({ id: "project", name: "test", dir }); open.push(runtime);
+    const brain = runtime.continuity!, original = brain.prepare.bind(brain);
+    const failing = vi.spyOn(brain, "prepare").mockRejectedValueOnce(new Error("transient observation failure"));
+    await expect(runtime.sendMessage("work", "codex", { requestId: "again" })).rejects.toThrow(/transient/);
+    failing.mockImplementation(original);
+    expect((await runtime.sendMessage("work", "codex", { requestId: "again" })).continuityStatus).toBe("submitting");
+    await waitUntil(() => brain.store.receipts("again").at(-1)?.execution === "complete");
+    expect(calls(bin)).toHaveLength(1);
   });
 });

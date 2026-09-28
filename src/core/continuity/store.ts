@@ -14,6 +14,15 @@ const decode = <T>(row: Row | undefined): T | undefined => row ? JSON.parse(Stri
 export const eventText = (e: LoomEvent): string => typeof e.payload.text === "string" ? e.payload.text : JSON.stringify(e.payload);
 export const isUser = (e: LoomEvent): boolean => !e.agentId &&
   ((e.kind === "message" && e.payload.author !== "loom") || (e.kind === "decision" && e.payload.auto !== true && (e.payload.author === undefined || e.payload.author === "user")));
+const USER_SOURCE = `agent_id IS NULL AND ((kind='decision' AND coalesce(json_extract(payload,'$.auto'),0)!=1
+  AND coalesce(json_extract(payload,'$.author'),'user')='user') OR (kind='message' AND coalesce(json_extract(payload,'$.author'),'user')!='loom'))`;
+// A captured request is conversation history only once it may have reached a
+// harness. Queued, overflowed or pre-launch-failed requests are not yet said.
+const UNSENT_REQUESTS = `SELECT r.event_id FROM continuity_requests r WHERE r.chat=? AND NOT EXISTS
+  (SELECT 1 FROM continuity_receipts c WHERE c.request_id=r.id AND json_extract(c.data,'$.status') IN ('submitting','accepted','outcome_unknown'))`;
+// Only a current checkpoint replaces its originals; superseding it restores them.
+const CHECKPOINTED = `SELECT d.event_id FROM continuity_dispositions d JOIN continuity_items i ON i.id=d.item_id
+  WHERE d.chat=? AND json_extract(i.data,'$.status')!='superseded'`;
 
 /** Uses the event journal's existing connection. There is no second writer,
  * memory-only acknowledgement, or nested connection transaction here. */
@@ -179,16 +188,30 @@ export class ContinuityStore {
     return rows.map(r => this.event(Number(r.id))!);
   }
   protectedEvents(chat: string, through: number): LoomEvent[] {
-    const rows = this.db.prepare(`SELECT id FROM events WHERE coalesce(chat,'${MAIN_CHAT}')=? AND id<=? AND agent_id IS NULL
-      AND (kind='message' OR kind='decision')
-      AND ((kind='decision' AND coalesce(json_extract(payload,'$.auto'),0)!=1 AND coalesce(json_extract(payload,'$.author'),'user')='user') OR (kind='message' AND coalesce(json_extract(payload,'$.author'),'user')!='loom'))
-      AND id NOT IN (SELECT event_id FROM continuity_dispositions WHERE chat=?) ORDER BY id LIMIT 10001`)
-      .all(chat, through, chat) as Row[];
+    const rows = this.db.prepare(`SELECT id FROM events WHERE coalesce(chat,'${MAIN_CHAT}')=? AND id<=?
+      AND (kind='message' OR kind='decision') AND ${USER_SOURCE}
+      AND id NOT IN (${CHECKPOINTED}) AND id NOT IN (${UNSENT_REQUESTS}) ORDER BY id LIMIT 10001`)
+      .all(chat, through, chat, chat) as Row[];
     return rows.map(r => this.event(Number(r.id))!);
   }
+  /** Governing user evidence after a snapshot. A newly queued request is not
+   * governing: it runs as its own turn after the current one. */
   hasNewUserSources(chat: string, through: number): boolean {
     return Boolean(this.db.prepare(`SELECT id FROM events WHERE coalesce(chat,'${MAIN_CHAT}')=? AND id>?
-      AND agent_id IS NULL AND ((kind='decision' AND coalesce(json_extract(payload,'$.auto'),0)!=1 AND coalesce(json_extract(payload,'$.author'),'user')='user') OR (kind='message' AND coalesce(json_extract(payload,'$.author'),'user')!='loom')) LIMIT 1`).get(chat, through));
+      AND ${USER_SOURCE} AND id NOT IN (${UNSENT_REQUESTS}) LIMIT 1`).get(chat, through, chat));
+  }
+  /** Sources already placed in one native session by accepted packets. */
+  delivered(bindingId: string, epoch: number): { messages: Set<number>; evidence: Set<number> } {
+    const scope = `FROM continuity_receipts r JOIN continuity_packets p ON p.id=r.packet_id
+      WHERE r.binding_id=? AND json_extract(r.data,'$.status')='accepted' AND json_extract(p.data,'$.target.sessionEpoch')=?`;
+    const each = (path: string) => `SELECT json_extract(x.value,'$.source.eventId') AS id
+      ${scope.replace("WHERE", `, json_each(p.data,'${path}') x WHERE`)}`;
+    const ids = (parts: string[]) => new Set((this.db.prepare(parts.join(" UNION "))
+      .all(...parts.flatMap(() => [bindingId, epoch])) as Row[]).filter(r => r.id !== null).map(r => Number(r.id)));
+    return {
+      messages: ids([`SELECT json_extract(p.data,'$.currentRequest.eventId') AS id ${scope}`, each("$.messages"), each("$.references")]),
+      evidence: ids([each("$.evidence")]),
+    };
   }
   binding(slot: string, create: () => Binding): Binding {
     this.assertOwner();
@@ -255,9 +278,24 @@ export class ContinuityStore {
       this.setMeta(`revision:${chat}`, String(this.revision(chat) + 1));
     });
   }
-  dispositions(chat: string): Map<number, string> {
-    return new Map((this.db.prepare("SELECT event_id,item_id FROM continuity_dispositions WHERE chat=?").all(chat) as Row[])
-      .map(r => [Number(r.event_id), String(r.item_id)]));
+  /** Checkpointed sources. `active` omits those whose item was superseded. */
+  dispositions(chat: string, active = false): Map<number, string> {
+    const sql = active
+      ? `SELECT d.event_id,d.item_id FROM continuity_dispositions d WHERE d.event_id IN (${CHECKPOINTED})`
+      : "SELECT event_id,item_id FROM continuity_dispositions WHERE chat=?";
+    return new Map((this.db.prepare(sql).all(chat) as Row[]).map(r => [Number(r.event_id), String(r.item_id)]));
+  }
+  /** Observation candidates (agent/tool output), newest first. */
+  observations(chat: string, since: number, through: number, limit: number): LoomEvent[] {
+    const rows = this.db.prepare(`SELECT id FROM events WHERE coalesce(chat,'${MAIN_CHAT}')=? AND id>? AND id<=?
+      AND kind IN ('message','tool_call','file_edit','turn_diff','run_complete','error') AND NOT (${USER_SOURCE})
+      ORDER BY id DESC LIMIT ?`).all(chat, since, through, limit) as Row[];
+    return rows.map(r => this.event(Number(r.id))!);
+  }
+  countObservations(chat: string, since: number, through: number): number {
+    return Number((this.db.prepare(`SELECT count(*) AS n FROM events WHERE coalesce(chat,'${MAIN_CHAT}')=? AND id>? AND id<=?
+      AND kind IN ('message','tool_call','file_edit','turn_diff','run_complete','error') AND NOT (${USER_SOURCE})`)
+      .get(chat, since, through) as Row).n);
   }
   savePacket(packet: ContextPacket, rendered: RenderedBriefing, receipt: Receipt): void {
     this.assertOwner(); parseBounded(ContextPacketV1, packet); parseBounded(RenderedBriefingV1, rendered); DeliveryReceiptV1.parse(receipt);
@@ -293,8 +331,10 @@ export class ContinuityStore {
     return (this.db.prepare("SELECT data FROM continuity_receipts WHERE active=1").all() as Row[])
       .map(r => DeliveryReceiptV1.parse(JSON.parse(String(r.data))));
   }
-  lastAccepted(bindingId: string): Receipt | undefined {
-    return decode(this.db.prepare("SELECT data FROM continuity_receipts WHERE binding_id=? AND json_extract(data,'$.status')='accepted' ORDER BY rowid DESC LIMIT 1").get(bindingId) as Row | undefined);
+  lastAccepted(bindingId: string, epoch: number): Receipt | undefined {
+    return decode(this.db.prepare(`SELECT r.data AS data FROM continuity_receipts r JOIN continuity_packets p ON p.id=r.packet_id
+      WHERE r.binding_id=? AND json_extract(r.data,'$.status')='accepted' AND json_extract(p.data,'$.target.sessionEpoch')=?
+      ORDER BY r.rowid DESC LIMIT 1`).get(bindingId, epoch) as Row | undefined);
   }
   receiptForRun(id: string): Receipt | undefined {
     return decode(this.db.prepare("SELECT data FROM continuity_receipts WHERE json_extract(data,'$.runId')=?").get(id) as Row | undefined);

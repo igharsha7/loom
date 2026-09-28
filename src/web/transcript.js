@@ -1,7 +1,7 @@
 /** Browser transcript module. See README.md for ownership and startup. */
 import { agentGlyph,agentLabel,brandMark,kindOf,labelOf } from './agents.js';
 import { approvalCard } from './approvals.js';
-import { esc,hue,mdToHtml,money } from './format.js';
+import { esc,hue,mdToHtml,money,tokens } from './format.js';
 import { ICONS } from './icons.js';
 import { toast } from './notifications.js';
 import { state } from './state.js';
@@ -124,6 +124,17 @@ import { orchGoalName } from './team.js';
     // An agent in "always ask" waiting on you: a card with the two answers.
     // Its answer arrives as a second event, which folds the card (append()),
     // so this line only shows when the card itself is out of the window.
+    // Native harness housekeeping. Compaction is shown while it runs (the
+    // row folds when it ends, see thread.js) and once it is done; the rest of
+    // the usage reports feed the agent's context meter, not the thread.
+    if (e.kind === "status") {
+      if (p.state === "compacting") return '<div class="sys live compacting" data-agent="' + esc(e.agentId || "") + '"><span class="busy"></span> ' +
+        esc(labelOf(e.agentId)) + " is compacting its context\u2026</div>";
+      if (p.state === "native_compacted") return '<div class="sys">\u21bb ' + esc(labelOf(e.agentId)) + " compacted its context" +
+        (p.preTokens ? " \u00b7 " + tokens(p.preTokens) + (p.postTokens ? " \u2192 " + tokens(p.postTokens) : "") + " tokens" : "") + "</div>";
+      if (p.state === "notice" && p.message) return '<div class="sys warn">! ' + esc(String(p.message).slice(0, 300)) + (p.retrying ? " \u2014 retrying" : "") + "</div>";
+      return "";
+    }
     if (e.kind === "approval") {
       if (p.phase === "requested") return approvalCard({ approvalId: p.approvalId, agent: e.agentId, tool: p.tool, input: p.input, ts: e.ts });
       if (p.phase === "decided") return '<div class="sys apl">' + (p.behavior === "allow" ? '<span class="ok">\u2713 allowed</span> ' : '<span class="no">\u2715 denied</span> ') +

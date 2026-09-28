@@ -22,18 +22,26 @@ export const CoverageV1 = z.strictObject({ source: SourceRefV1,
 export const BindingV1 = z.strictObject({ id: Id, conversationId: Id,
   agentInstanceId: Id, harnessKind: z.enum(["codex", "claude-code"]),
   workspaceId: Hash, compatibilityFingerprint: Hash, nativeSessionId: Id.nullable(),
-  sessionEpoch: Counter, retention: z.enum(["unknown", "observed"]) });
+  // "compacted": the harness reported native compaction; the next packet rebuilds state.
+  sessionEpoch: Counter, retention: z.enum(["unknown", "observed", "compacted"]) });
 export const ContextPacketV1 = z.strictObject({ version: z.literal(1), id: Id,
   conversationId: Id, requestId: Id, target: BindingV1,
   snapshot: z.strictObject({ throughEventId: Counter, conversationRevision: Counter,
     protectedStateRevision: Counter, workspace: WorkspaceRefV1, instructionFilesFingerprint: Hash }),
   mode: z.enum(["reconstruction", "delta"]), currentRequest: SourceRefV1,
+  // The accepted packet a delta builds on; its native session already holds
+  // everything that packet delivered.
+  basis: z.strictObject({ packetId: Id, protectedStateRevision: Counter }).nullable().optional(),
   supplement: Text,
   retrieval: z.strictObject({ hash: Hash, relativePath: z.string().regex(/^\.loom\/brain\/artifacts\/[a-f0-9]{64}\.json$/),
     bytes: Counter }).nullable(),
   items: z.array(ContextItemV1).max(10_000),
   messages: z.array(z.strictObject({ source: SourceRefV1,
     origin: z.enum(["user", "agent", "external"]), text: Text })).max(10_000),
+  // Older user messages sent as a one-line headline; full text is in the retrieval file.
+  references: z.array(z.strictObject({ source: SourceRefV1, headline: z.string().max(1000) })).max(10_000).optional(),
+  // Counts of sources that are covered but not listed individually in the rendered text.
+  unlisted: z.strictObject({ references: Counter, observations: Counter }).optional(),
   evidence: z.array(z.strictObject({ source: SourceRefV1, text: Text,
     outcome: z.enum(["reported", "pending", "success", "failure", "cancelled", "unknown"]) })).max(1000),
   coverage: z.array(CoverageV1).max(20_000),
@@ -68,6 +76,12 @@ export class ContinuityError extends Error {
 /** Only adapters with evidence that no process was launched may use this. */
 export class NativeDispatchRejected extends Error {
   constructor(message: string) { super(message); this.name = "NativeDispatchRejected"; }
+}
+
+/** The bound native session could not be resumed and no turn was started.
+ * Safe to rebuild: the binding moves to a new epoch and reconstructs. */
+export class NativeSessionMissing extends NativeDispatchRejected {
+  constructor(message: string) { super(message); this.name = "NativeSessionMissing"; }
 }
 
 /** The native parent may have exited while a tool descendant still owns files. */

@@ -28,7 +28,7 @@ import { planModeBriefing } from '../runtime-support.js';
 import { randomUUID } from "node:crypto";
 import { ContinuityError, NativeDispatchRejected } from "../../core/continuity/contracts.js";
 import type { ContinuityEngine } from "../../core/continuity/engine.js";
-import { probeContinuity } from "../../core/continuity/capabilities.js";
+import type { HarnessHealth } from "../../core/continuity/capabilities.js";
 
 export interface TurnOptions {
   source?: "user" | "route"; chat?: string; plan?: boolean; fromQueue?: boolean;
@@ -40,6 +40,8 @@ export interface TurnResult { agentId: string; queued?: number; queueId?: string
 /** Dependencies owned by the project coordinator, read live for each operation. */
 export interface RuntimeTurnsHost {
   continuity: ContinuityEngine | null;
+  /** Current reachability of a native harness CLI (see HarnessMonitor). */
+  harness: (agentId: string) => Promise<HarnessHealth>;
   kickQueue: () => void;
   nativeOptions: (agentId: string) => Record<string, unknown>;
   chatExists: (chat: string) => boolean;
@@ -124,6 +126,8 @@ export class RuntimeTurns {
    */
   busySince = new Map<string, number>();
   private readonly preparing = new Map<string, AbortController>();
+  /** Native requests between capture and settlement (or queueing). */
+  private readonly inFlight = new Set<string>();
 
   /**
    * Write down what the files are, before a turn changes them (#101).
@@ -438,16 +442,25 @@ export class RuntimeTurns {
       throw new ContinuityError("unsupported", "arbitrary CLI arguments have unverified session/context semantics; remove extraArgs for native continuity");
     this.host.enforceQuarantine(target); this.host.enforceBudget(target);
     if (this.host.teamPolicy && !agentAllowed(this.host.teamPolicy, cfg.kind)) throw new Error(`team policy doesn't allow ${cfg.kind}`);
+    // Every check that can refuse the turn runs before the request enters the
+    // conversation: a refused request must not become history.
+    const health = await this.host.harness(target);
+    if (!health.available) throw new ContinuityError("unsupported", health.error ?? `${cfg.kind} CLI is not reachable`);
     if (this.busySince.size && (!opts.requestId || !brain.store.request(opts.requestId))) this.host.queue.assertCanAdd({ text });
     const captured = brain.capture({ id: opts.requestId ?? randomUUID(), conversationId: chat, agentInstanceId: target,
       text, source, model: opts.capturedModel !== undefined ? opts.capturedModel : bound.agentId === target ? bound.model ?? null : null,
       plan: Boolean(opts.plan), targetAddedTokens: 6000 });
     const request = captured.request;
     const previous = brain.store.receipts(request.id).at(-1);
-    if (!captured.created && !opts.resume && !opts.fromQueue) return { agentId: target, requestId: request.id,
-      ...(previous ? { receiptId: previous.id, packetId: previous.packetId, continuityStatus: previous.status } : { continuityStatus: "captured" }) };
+    const status = (continuityStatus: string): TurnResult => ({ agentId: target, requestId: request.id, continuityStatus,
+      ...(previous ? { receiptId: previous.id, packetId: previous.packetId } : {}) });
+    // A retried ID is a no-op only while that request is live or was submitted.
+    // An unsent one (refused, overflowed, failed before launch) runs again.
+    if (!captured.created && !opts.fromQueue &&
+      (this.inFlight.has(request.id) || this.host.queue.snapshot().items.some(i => i.continuity?.requestId === request.id)))
+      return status(this.inFlight.has(request.id) ? "preparing" : "queued");
     if (previous && (previous.status === "accepted" || previous.status === "submitting" || previous.status === "outcome_unknown"))
-      return { agentId: target, requestId: request.id, receiptId: previous.id, packetId: previous.packetId, continuityStatus: previous.status };
+      return status(previous.status);
     // Default sequential foreground execution. A pinned chat does not bypass a
     // workspace's writer lock. The queued target/model remain those captured now.
     if (this.busySince.size) {
@@ -457,14 +470,13 @@ export class RuntimeTurns {
       return { agentId: target, queued: this.host.queue.length, queueId: item.id, requestId: request.id };
     }
     this.busySince.set(target, Date.now()); this.turnChat.set(target, chat);
+    this.inFlight.add(request.id);
     const preparation = new AbortController(); this.preparing.set(target, preparation);
     const assertPrepared = () => { if (preparation.signal.aborted || this.host.closed || !this.host.isCurrentAgent(agent))
       throw new ContinuityError("conflict", "native dispatch preparation was cancelled or replaced"); };
     let mcp: ReturnType<typeof writeMcpSession> = null, runId: string | undefined;
     try {
       const options = structuredClone(this.host.nativeOptions(target));
-      const profile = await probeContinuity(cfg.kind, options);
-      assertPrepared();
       const holder = this.host.validHolder();
       if (holder && holder !== target) await this.host.handoff(target, { source });
       else if (!holder) this.host.baton.acquire(target);
@@ -477,10 +489,10 @@ export class RuntimeTurns {
       assertPrepared();
       const supplement = [this.host.activeSkillsBlock(), opts.plan ? planModeBriefing(text) : ""].filter(Boolean).join("\n");
       let prepared = await brain.prepare({ ...request, targetAddedTokens: opts.contextTarget ?? request.targetAddedTokens }, cfg.kind,
-        this.host.agentDir(target), { ...options, continuityProfile: profile }, supplement);
+        this.host.agentDir(target), options, supplement);
       assertPrepared();
       const finishOverflow = (): TurnResult => {
-        this.preparing.delete(target); this.busySince.delete(target); mcp?.cleanup();
+        this.preparing.delete(target); this.busySince.delete(target); this.inFlight.delete(request.id); mcp?.cleanup();
         this.host.kickQueue();
         return { agentId: target, requestId: request.id, receiptId: prepared.receipt.id,
           packetId: prepared.packet.id, continuityStatus: "overflow" };
@@ -497,7 +509,7 @@ export class RuntimeTurns {
           assertPrepared();
           if (!(error instanceof ContinuityError) || error.code !== "stale" || attempt >= 2) throw error;
           prepared = await brain.prepare({ ...request, targetAddedTokens: opts.contextTarget ?? request.targetAddedTokens }, cfg.kind,
-            this.host.agentDir(target), { ...options, continuityProfile: profile }, supplement);
+            this.host.agentDir(target), options, supplement);
           assertPrepared();
           if (prepared.packet.budget.overflow === "mandatory") return finishOverflow();
         }
@@ -524,6 +536,7 @@ export class RuntimeTurns {
         this.postTurn.delete(target);
         // Native error events may arrive before the process exits. Only this
         // settlement releases the runtime's foreground preparation barrier.
+        this.inFlight.delete(request.id);
         if (!this.host.closed && this.host.isCurrentAgent(agent)) {
           this.busySince.delete(target); this.host.kickQueue();
         }
@@ -532,6 +545,7 @@ export class RuntimeTurns {
         packetId: prepared.packet.id, continuityStatus: "submitting" };
     } catch (error) {
       this.preparing.delete(target);
+      this.inFlight.delete(request.id);
       mcp?.cleanup();
       if (runId) brain.settled(runId, error);
       this.host.dispatchFailed(agent, chat, error);

@@ -12,7 +12,6 @@ export interface RouteContext {
   terminals: TerminalManager;
   auth: AuthManager;
   askHuman: (req: { project: string; agent: string; tool: string; input: unknown; summary?: string; }) => Promise<ApprovalDecision>;
-  abandonApprovals: (projectId: string, agent: string) => void;
   cachedRelease: (refresh: boolean) => Promise<Release | null>;
   updating: boolean;
   close: () => Promise<void>;

@@ -7,7 +7,6 @@ import path from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 import {
   setApprovalBroker,
-  setApprovalEndpoint,
   type ApprovalDecision
 } from "../core/approvals.js";
 import { logbook } from "../core/logbook.js";
@@ -164,9 +163,9 @@ export class LoomDaemon {
   /**
    * Put a tool use in front of a person and wait.
    *
-   * One implementation for both callers: a CLI agent asking over HTTP through
-   * the MCP approval server, and a model agent asking from inside this
-   * process (core/approvals.ts registers this as the broker). The card, the
+   * One implementation for every caller — CLI adapters and model agents all
+   * ask from inside this process (core/approvals.ts registers this as the
+   * broker). The card, the
    * thread entry, the timeout and the audit trail are the same either way,
    * because "who is asking" should not change what you are shown.
    */
@@ -176,7 +175,9 @@ export class LoomDaemon {
     tool: string;
     input: unknown;
     summary?: string;
+    signal?: AbortSignal;
   }): Promise<ApprovalDecision> {
+    if (req.signal?.aborted) return { behavior: "deny", message: "The agent stopped waiting." };
     const rt = await this.runtime(req.project).catch(() => null);
     if (!rt) return { behavior: "deny", message: "project not open" };
     const id = crypto.randomBytes(6).toString("hex");
@@ -190,8 +191,10 @@ export class LoomDaemon {
       payload: { phase: "requested", approvalId: id, tool, input: preview },
     });
     return new Promise<ApprovalDecision>((resolve) => {
+      const abandoned = () => settle({ behavior: "deny", message: "The agent stopped waiting." });
       const settle = (d: ApprovalDecision) => {
         clearTimeout(timer);
+        req.signal?.removeEventListener("abort", abandoned);
         if (!this.approvals.delete(id)) return;
         rt.log.append({
           kind: "approval",
@@ -214,16 +217,9 @@ export class LoomDaemon {
         createdAt: Date.now(),
         settle,
       });
+      // An agent whose turn ended has stopped waiting; don't hold the card open.
+      req.signal?.addEventListener("abort", abandoned, { once: true });
     });
-  }
-
-  /** Deny anything this agent was still waiting on — it has gone away. */
-  private abandonApprovals(projectId: string, agent: string): void {
-    for (const a of [...this.approvals.values()]) {
-      if (a.projectId === projectId && a.agent === agent) {
-        a.settle({ behavior: "deny", message: "The agent stopped waiting." });
-      }
-    }
   }
 
   /** Loom Cloud relay, when enabled. See daemon/relay.ts. */
@@ -268,7 +264,6 @@ export class LoomDaemon {
       get terminals() { return daemon.terminals; },
       get auth() { return daemon.auth; },
       askHuman: (...args) => this.askHuman(...args),
-      abandonApprovals: (...args) => this.abandonApprovals(...args),
       cachedRelease: (...args) => this.cachedRelease(...args),
       get updating() { return daemon.updating; },
       set updating(value) { daemon.updating = value; },
@@ -559,8 +554,7 @@ export class LoomDaemon {
     if (addr && typeof addr === "object") this.port = addr.port; // ephemeral port support
 
     this.wss = this.attachWs(this.server!);
-    setApprovalEndpoint(`http://127.0.0.1:${this.port}`);
-    // In-process agents ask the same way, without the HTTP round trip.
+    // Agents ask from inside the daemon (core/approvals.ts).
     setApprovalBroker((req) => this.askHuman(req));
 
     // Fan every log record out to connected clients (the Console tab).

@@ -18,15 +18,16 @@ for process close, and refuses unproven quiescence. Preparing turns can also be 
 
 | Capability | Current support |
 | --- | --- |
-| Codex | Checked CLI profiles `0.142.4`, `0.155.0`; explicit `exec resume <id>`; ordinary turn input. |
-| Claude Code | Checked CLI profiles `2.1.83`, `2.1.193`; explicit `--resume <id>`; dynamic context in ordinary input. |
-| Unknown versions | Unsupported until a protocol fixture is verified. Bounded version probes do not make model calls. |
-| Per-chat model | Supported for Codex/Claude in this mode; compatibility changes select a different binding. |
+| Codex | Any installed version; `codex app-server`, explicit `thread/resume`; context in ordinary turn input (stdin, no argv limit). Acceptance is the `turn/start` response or `turn/started`. |
+| Claude Code | Any installed version, driven through the Claude Agent SDK; explicit resume by session; context in the ordinary user message (stdin). Acceptance is the `requesting` status or the first output. |
+| Lost native session | A resume that finds no session fails before any turn starts. The adapter reports `NativeSessionMissing`; the receipt fails and the binding moves to a new epoch, so the next packet reconstructs into a fresh session. |
+| Harness health | Each native CLI is probed with `--version` every 20 s and before dispatch. An unreachable CLI refuses the turn before the request is recorded. Status reports `available` and `cliVersion`; transitions are logged. Protocol drift appears as missing acceptance evidence, never as success. |
+| Per-chat model | Supported. Changing the model keeps the same native session (both CLIs accept a model on resume); other configuration changes select a new binding. |
 | OpenCode/bridges | Native continuity unsupported until protocol/acceptance fixtures pass; legacy workflow available. |
 | Parallel subagents/orchestra | Unsupported in this sequential mode. |
 | Embeddings/inference/cheap helpers | Not loaded or launched by this mode; helpers disabled. |
 | Attachments | Existing `[image]`/`[file]` upload protocol rejected; ordinary workspace references usable. |
-| Native compaction | Retention unknown; protected intent resent; no private transcript modifications. |
+| Native compaction | Both harnesses report it: Claude as `status: compacting` then `compact_boundary`, Codex as a `contextCompaction` item. The binding is marked compacted, and the next packet rebuilds reviewed state and recent history into the same resumed session. The UI shows compaction while it runs, and the context in use against the model's window. No private transcript modifications. |
 
 Checked fixtures are not live account validation on every listed version or
 cross-platform packaging certification.
@@ -34,9 +35,19 @@ cross-platform packaging certification.
 ## Context and storage
 
 One ordinary foreground request contains an origin-labelled historical block and
-the current request once. The block carries exact unprocessed user messages/decisions,
-current reviewed instructions/corrections/topics/pending items, active skills/mode,
-and optional recent/retrieved observations. Discussion is not automatically accepted
+the current request once. What the block carries depends on the target session:
+
+- **Resumed session (delta).** The native session already holds everything earlier
+  packets gave it and its own turns. It receives only what it lacks: user messages
+  sent to another agent meanwhile, other agents' work since its last turn, and
+  reviewed items if they changed. Returning after a short detour costs roughly the
+  size of that detour, not the conversation.
+- **New or compacted session (reconstruction).** Current reviewed items, the most
+  recent user messages exactly, one-line headlines for older user messages (full
+  text in a local evidence file) and recent observations, all within the target.
+
+A request becomes conversation history only once it may have reached a harness.
+Queued, overflowed or refused requests are not shown to other turns. Discussion is not automatically accepted
 as a decision; agent claims are not automatically verified work. Corrections carry
 revision/supersession and source references. Small user points never depend on top-K.
 
@@ -63,8 +74,13 @@ rounded up. This is a heuristic, not a provider tokenizer or verified native cap
 Native history, tools, output and provider caching affect usage outside
 that estimate. The wire field retains its v1 name `estimatedAddedTokens`. Resuming a native session does not imply free or unlimited context.
 
-Optional observations are dropped first. Mandatory user intent is never clipped.
-Overflow saves the request/packet without starting a coding turn. The review dialog
+Priority is: reviewed items and the current request, then user messages (exact
+newest-first up to about 75% of the target, then headlines), then observations.
+Nothing is dropped silently: each source is recorded as exact, summarized
+(reviewed checkpoint), referenced (headline plus evidence file) or omitted.
+Omitted observations are reconsidered by the next delta. Overflow now occurs only
+when reviewed items plus the current request exceed the target. It saves the
+request/packet without starting a coding turn. The review dialog
 lets you increase the target or create a reviewed checkpoint from selected originals,
 then resume the saved request. Increasing the target can consume more quota and
 still exceed native capacity. Exact restrictions and unresolved questions belong in
@@ -74,6 +90,9 @@ Original checkpoint evidence is accessible as content-addressed local JSON under
 `.loom/brain/artifacts/`. It is flushed and atomically finalized before reference.
 Submission checks integrity and rejects unsafe paths. Unreferenced crash artifacts
 are retained for now; automatic GC/deletion/retention remains a release gate.
+
+Checkpoints can be created or changed only while no agent turn is running, so a
+running agent cannot forge user-reviewed context through the local API.
 
 Protocol limits: 4 MB serialized contract input, nesting depth 32, 1 million
 characters per text field, 1 MB rendered context, 10,000 protected messages/items,
@@ -146,12 +165,13 @@ reconciliation.
 
 ## Verification and follow-ups
 
-Fake CLIs test switching, chat isolation, corrections, explicit resume after restart,
+Protocol fakes (a Claude CLI speaking the SDK control protocol, a Codex app-server
+speaking JSON-RPC; `test/native-fakes.ts`) test switching, chat isolation, corrections, explicit resume after restart,
 captured queue targets/models, idempotency, protected overflow and uncertain delivery.
 Storage tests exercise migration conflicts/rollback, SQLite contention, commit-before-
 publication and unknown schema rejection. Ordinary tests make no paid model calls.
 
-Remaining gates include native compaction observation, isolated account-supported
+Remaining gates include isolated account-supported
 cheap helpers, OpenCode parity, retention/GC, full platform packaging and long-history
 quality/performance comparisons. Electron optimization remains future work.
 See [architecture](../ARCHITECTURE.md) and the linked notes/TODO for measured evidence.

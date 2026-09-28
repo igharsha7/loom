@@ -12,6 +12,15 @@ export function registerBrainRoutes(app: Express, withRuntime: WithRuntime): voi
     if (!rt.continuity) throw new ContinuityError("unsupported", "enable brain.continuity in project settings first");
     return rt.continuity;
   };
+  // Reviewed items and checkpoints carry user authority. Any local process can
+  // obtain the admin token, and a native agent can only act while it runs — so
+  // user-authority writes are refused while any turn is preparing or running.
+  const requireIdle = (rt: Parameters<Parameters<WithRuntime>[0]>[0]) => {
+    const brain = requireBrain(rt);
+    if (rt.anyBusy() || brain.store.activeReceipts().length)
+      throw new ContinuityError("conflict", "reviewed context can only change while no agent turn is running");
+    return brain;
+  };
   const failure = (res: import("express").Response, error: unknown) => {
     res.status(error instanceof ContinuityError ? (error.code === "unsupported" ? 422 : error.code === "invalid" ? 400 : 409) : 400)
       .json({ error: error instanceof Error ? error.message : String(error), code: error instanceof ContinuityError ? error.code : "invalid" });
@@ -45,12 +54,12 @@ export function registerBrainRoutes(app: Express, withRuntime: WithRuntime): voi
     catch (error) { failure(res, error); }
   }));
   app.post("/api/projects/:id/brain/continuity/items", withRuntime(async (rt, req, res) => {
-    try { res.json({ item: requireBrain(rt).putItem(parseBounded(ContextItemV1, req.body)) }); }
+    try { res.json({ item: requireIdle(rt).putItem(parseBounded(ContextItemV1, req.body)) }); }
     catch (error) { failure(res, error); }
   }));
   app.post("/api/projects/:id/brain/continuity/checkpoint", withRuntime(async (rt, req, res) => {
     try {
-      const brain = requireBrain(rt);
+      const brain = requireIdle(rt);
       const input = parseBounded(z.strictObject({ chat: Id, itemId: Id,
         eventIds: z.array(z.number().int().positive()).min(1).max(1000), reviewed: z.literal(true) }), req.body);
       brain.store.disposeMany(input.eventIds, input.chat, input.itemId);

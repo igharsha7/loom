@@ -1,3 +1,4 @@
+import { usageMeter } from '../usage.js';
 import { agentGlyph,agentLabel,agentSub,labelOf } from '../agents.js';
 import { api } from '../connection.js';
 import { clog } from '../console.js';
@@ -638,6 +639,11 @@ export function createComposer(view) {
       if (lbl) lbl.textContent = (cur && cur.model) ? cur.model : "model";
       var mp = document.getElementById("modelpick");
       if (mp) mp.style.display = state.auto || state.cmode === "orch" ? "none" : "";
+      var meter = document.getElementById("cctx");
+      if (meter) {
+        var m = cur && !state.auto && state.cmode !== "orch" ? usageMeter(cur) : "";
+        meter.innerHTML = m; meter.style.display = m ? "" : "none";
+      }
       var chip = document.getElementById("cagent");
       if (!chip) return;
       // Always visible in Chat: hiding it is what made the agent unswitchable

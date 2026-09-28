@@ -9,6 +9,7 @@ import { state } from '../state.js';
 import { drawStatusbar } from '../statusbar.js';
 import { onTeamFrame } from '../team.js';
 import { lineFor } from '../transcript.js';
+import { observeUsage,usageMeter } from '../usage.js';
 
 /** thread behavior for one mounted project.
  * view contains live accessors to the owning project view's state and callbacks.
@@ -28,7 +29,7 @@ export function createThread(view) {
         var sel = a.id === state.selected;
         return '<button class="chip' + (sel ? " sel" : "") + '" data-id="' + esc(a.id) + '">' +
           brandMark(a.kind) + esc(a.id) + ' <span class="role">' + esc(a.role) + (a.id === p.holder ? " \u2190" : "") + "</span>" +
-          (a.busy ? ' <span class="busy"></span>' : "") + "</button>";
+          (a.busy ? ' <span class="busy"></span>' : "") + usageMeter(a) + "</button>";
       }).join("");
       Array.prototype.forEach.call(chips.querySelectorAll(".chip"), function(chip){
         chip.onclick = function(){ state.selected = chip.getAttribute("data-id"); drawStatus(); };
@@ -183,7 +184,7 @@ export function createThread(view) {
       var feed = document.getElementById("feed"); if (!feed) return;
       // only the loading placeholder gets cleared — never real history
       if (feed.firstChild && feed.firstChild.className === "loader") feed.innerHTML = "";
-      var html = "", added = false;
+      var html = "", added = false, meters = false;
       events.forEach(function(e){
         if (e.id <= state.lastId) return;
         state.lastId = e.id;
@@ -191,12 +192,23 @@ export function createThread(view) {
         // An answered approval folds the card it answers. Only when that card
         // is out of the loaded window does it need a line of its own — and
         // the card may be in the html not yet inserted, so flush first.
+        if (observeUsage(state.project, e)) meters = true;
+        // A compaction that ended folds its "compacting…" row; flush first,
+        // since the row may be in the html not yet inserted.
+        var pl = e.payload || {};
+        if (e.agentId && (pl.state === "native_compacted" || pl.state === "interrupted" || e.kind === "run_complete" || e.kind === "error")) {
+          if (html) { feed.insertAdjacentHTML("beforeend", html); html = ""; added = true; }
+          Array.prototype.forEach.call(feed.querySelectorAll(".sys.compacting"), function(row){
+            if (row.getAttribute("data-agent") === e.agentId) row.parentNode.removeChild(row);
+          });
+        }
         if (e.kind === "approval" && e.payload && e.payload.phase === "decided") {
           if (html) { feed.insertAdjacentHTML("beforeend", html); html = ""; added = true; }
           if (settleApprovalCards(e.payload.approvalId, e.payload.behavior, e.payload.message)) return;
         }
         html += lineFor(e);
       });
+      if (meters) { drawChips(); view.updateModelLabel(); }
       if (html || added) { if (html) feed.insertAdjacentHTML("beforeend", html);
         var sc = feed.parentNode;
         if (sc && sc.scrollHeight) sc.scrollTop = sc.scrollHeight;

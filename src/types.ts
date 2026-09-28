@@ -510,6 +510,8 @@ export interface AgentStatus {
   role: AgentRole;
   tier: AgentTier;
   available: boolean;
+  /** Native continuity: the harness CLI version seen by the last health probe. */
+  cliVersion?: string | null;
   busy: boolean;
   holdsBaton: boolean;
   /** The model override in effect, or "" for the CLI's own default. */
@@ -518,6 +520,29 @@ export interface AgentStatus {
   enabled?: boolean;
   /** Permission mode in effect: bypass | auto | ask. See core/permissions.ts. */
   permissions?: string;
+  /** Native harnesses: tokens in context and the model's window, from the last report. */
+  context?: AgentContextUsage | null;
+  /** Native harnesses: the provider account's usage-limit windows, from the last report. */
+  limits?: ProviderLimits | null;
+}
+
+export interface AgentContextUsage {
+  usedTokens: number;
+  /** The model's context window, when the harness has said. */
+  maxTokens: number | null;
+  /** The harness is compacting its context right now. */
+  compacting: boolean;
+  /** When the harness last finished compacting (ms). */
+  compactedAt: number | null;
+  at: number;
+}
+
+export interface ProviderLimits {
+  provider: string;
+  windows: Array<{ id: string; usedPercent: number; windowMinutes?: number; resetsAt?: number }>;
+  /** The window whose limit was hit, when one was. */
+  reached: string | null;
+  at: number;
 }
 
 export interface ProjectStatus {

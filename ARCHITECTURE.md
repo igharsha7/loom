@@ -35,9 +35,12 @@ flowchart TD
 | `core/continuity/contracts.ts` | Strict bounded versioned Zod wire shapes and inferred types; separate semantic validation. |
 | `core/continuity/store.ts` | Existing database connection, transactions, project fencing, workspace writer leases, item revisions and FTS projections. |
 | `core/continuity/engine.ts` | Exact unprocessed user intent, reviewed checkpoints, scoped evidence, render hashes, frozen workspace/instruction observations and budget checks. |
-| `core/continuity/capabilities.ts` | Bounded binary/version probe and conservative fixture-backed protocol profiles. |
+| `core/continuity/capabilities.ts` | Bounded binary/version probe, protocol profiles and the 20 s `HarnessMonitor` reachability poll. |
 | `core/continuity/artifacts.ts` | Flush and atomically finalize content-addressed source JSON before packets reference it. |
 | `daemon/runtime/turns.ts` | Captured targets/models, sequential dispatch, queueing, preparation cancellation and cleanup. |
+| `adapters/codex.ts`, `adapters/codex-rpc.ts` | Codex over `codex app-server` JSON-RPC, one process group per turn: thread start/resume, turn start/interrupt, items, token usage and context window, compaction, rate limits, approval requests. |
+| `adapters/claude-code.ts` | Claude Code over the Claude Agent SDK, pointed at the installed `claude` and spawned by Loom in its own process group: resume, `canUseTool` approvals, interrupt, compaction status, context window, rate limits. |
+| `daemon/runtime/native-usage.ts` | Latest context-in-use, compaction state and provider usage-limit readings per native agent, for status and the composer meter. |
 | `daemon/runtime/agents.ts` | Instance lifecycle; a failed stop remains a rejected successor barrier. |
 | Native adapters | Explicit scoped session IDs, ordinary turn context, correlated events and POSIX process-group/parent-exit containment and bounded output-drain evidence. |
 | HTTP/UI | Project-authenticated diagnostics, explicit checkpoint review and resumable overflow; delivery follows persistence. |
@@ -180,8 +183,8 @@ An Adapter MUST implement all of:
 5. `diff()` — current working-tree changes attributable to this agent
 6. `interrupt()` — stop/pause the active agent
 
-v1 Adapters: **OpenCode** (`serve` HTTP + event API), **Claude Code** (headless / SDK,
-streaming JSON, memory files).
+v1 Adapters: **OpenCode** (`serve` HTTP + event API), **Claude Code** (Claude Agent
+SDK over the installed CLI), **Codex** (`codex app-server` JSON-RPC).
 
 ## Bridge contract (read-mostly — for GUI agents)
 

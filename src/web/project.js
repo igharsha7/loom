@@ -257,6 +257,8 @@ import { bindTheme } from './theme.js';
       // What the chosen agent may do without asking. Drawn by drawPermChip().
       '<button class="cperm" id="cperm" type="button" aria-haspopup="menu" style="display:none"></button>' +
       '<button class="ctool" id="modelpick" type="button" title="pick a model" aria-label="pick a model">' + '<span class="cmodel" id="cmodellabel">model</span>' + '<span class="cchev">' + ICONS.chevron + "</span></button>" +
+      // The chosen agent's context meter and usage limits (usage.js).
+      '<span class="cctx" id="cctx" style="display:none"></span>' +
       '<span class="cdiv"></span>' +
       // MCPs and Skills live behind this rather than beside it: they are
       // occasional settings, and the row they were on has to hold the model,

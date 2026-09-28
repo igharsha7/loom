@@ -18,12 +18,13 @@ import path from "node:path";
 import { JSDOM, VirtualConsole } from "jsdom";
 import WebSocket from "ws";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { approvalEndpoint } from "../src/core/approvals.js";
+import { requestApproval } from "../src/core/approvals.js";
 import { readDaemonConfig } from "../src/core/registry.js";
 import { APP_HTML } from "../src/daemon/app-page.js";
 import { DaemonClient } from "../src/daemon/client.js";
 import { LoomDaemon } from "../src/daemon/server.js";
 import { makeProjectDir, tmpDir, waitUntil } from "./helpers.js";
+import { CODEX_OK, codexItem, codexMessage, codexNotify, codexTokens, fakeCodex } from "./native-fakes.js";
 
 let daemon: LoomDaemon;
 let baseUrl: string;
@@ -32,6 +33,8 @@ let clientToken: string;
 let projectId: string;
 /** An OpenCode agent beside an echo one — status lists it, CLI or not. */
 let ocProjectId: string;
+/** A Codex agent on a fake app-server that compacts mid-turn. */
+let cxProjectId: string;
 
 beforeAll(async () => {
   process.env.LOOM_HOME = tmpDir("home-composer-dom");
@@ -59,6 +62,15 @@ beforeAll(async () => {
   const client = new DaemonClient(readDaemonConfig()!);
   projectId = (await client.addProject(dir)).project.id;
   ocProjectId = (await client.addProject(ocDir)).project.id;
+  const cxBin = fakeCodex({ script: [CODEX_OK[0]!, codexTokens(250000, 0, 1000),
+    codexNotify("account/rateLimits/updated", { rateLimits: { primary: { usedPercent: 91, windowDurationMins: 300, resetsAt: null }, secondary: null } }),
+    codexNotify("item/started", { item: { id: "c", type: "contextCompaction" } }), { sleep: 1500 },
+    codexItem({ type: "contextCompaction" }), codexTokens(260000, 0, 1100, 272000),
+    { out: { method: "thread/tokenUsage/updated", params: { threadId: "$THREAD", turnId: "$TURN", tokenUsage: { modelContextWindow: 272000,
+      total: { totalTokens: 262000, inputTokens: 260000, cachedInputTokens: 0, outputTokens: 2000, reasoningOutputTokens: 0 },
+      last: { totalTokens: 30000, inputTokens: 29000, cachedInputTokens: 0, outputTokens: 1000, reasoningOutputTokens: 0 } } } } },
+    codexMessage("Done after compacting."), CODEX_OK[3]!] });
+  cxProjectId = (await client.addProject(makeProjectDir({ name: "codexy", agents: [{ id: "cx", kind: "codex", role: "builder", options: { bin: cxBin } }] }))).project.id;
 
   const { token } = await client.newPairingToken();
   const claim = await fetch(`${baseUrl}/api/pair/claim`, {
@@ -467,18 +479,38 @@ describe("web app · permissions", () => {
   });
 });
 
+describe("web app · native context", () => {
+  it("shows a harness compacting, then its context meter and usage limits", async () => {
+    const m = await opened(cxProjectId);
+    await waitUntil(() => !!$(m, "#feed") && !$(m, "#feed .loader"));
+    await rest("POST", "/messages", { text: "long task", agent: "cx" }, cxProjectId);
+    await waitUntil(() => !!$(m, "#feed .sys.compacting"), 10_000);
+    expect(text(m, "#feed .sys.compacting")).toContain("compacting its context");
+    // the composer shows the chosen agent's meter: compacting now, and the hot limit window
+    await waitUntil(() => text(m, "#cctx").includes("compacting"));
+    expect(text(m, "#cctx")).toContain("5-hour 91%");
+    await waitUntil(() => text(m, "#feed").includes("compacted its context"), 10_000);
+    // the live row folds once compaction is done
+    await waitUntil(() => !$(m, "#feed .sys.compacting"));
+    expect(text(m, "#feed")).toContain("251k tokens");
+    await waitUntil(() => text(m, "#cctx").includes("11%"));
+    const meter = $(m, "#cctx .ctxm")!;
+    expect(meter.getAttribute("title")).toContain("30,000 of 272,000 tokens (11%)");
+    // what the daemon folded agrees with what the page folded
+    const status = await rest<{ project: { agents: Array<{ id: string; context: { usedTokens: number; maxTokens: number }; limits: { windows: Array<{ usedPercent: number }> } }> } }>("GET", "", undefined, cxProjectId);
+    const cx = status.project.agents.find((a) => a.id === "cx")!;
+    expect(cx.context).toMatchObject({ usedTokens: 30000, maxTokens: 272000, compacting: false });
+    expect(cx.limits.windows[0]!.usedPercent).toBe(91);
+    expect(m.errors.join("\n")).toBe("");
+  }, 30_000);
+});
+
 describe("web app · approvals", () => {
   it("renders a request as a card, answers it with Allow, and folds it", async () => {
     const m = await opened();
     await waitUntil(() => !!$(m, "#feed") && !$(m, "#feed .loader"));
-    const ep = approvalEndpoint()!;
-    expect(ep, "the daemon registered its approval endpoint").toBeTruthy();
-    // The agent's side: blocks until a human decides. Not awaited.
-    const decision = fetch(`${ep.url}/api/approvals/request`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-loom-approval": ep.secret },
-      body: JSON.stringify({ project: projectId, agent: "plannerbot", tool: "Bash", input: { command: "rm -rf build", description: "clean" } }),
-    }).then((r) => r.json() as Promise<{ behavior: string; message?: string }>);
+    // The agent's side (an adapter asking the daemon): blocks until a human decides. Not awaited.
+    const decision = requestApproval({ project: projectId, agent: "plannerbot", tool: "Bash", input: { command: "rm -rf build", description: "clean" } });
 
     await waitUntil(() => !!$(m, '#feed .apcard [data-apact="allow"]'));
     const card = $(m, "#feed .apcard")!;
@@ -501,13 +533,7 @@ describe("web app · approvals", () => {
   it("denies with a reason from the badge's list, and a stale card folds on a 404", async () => {
     const m = await opened();
     await waitUntil(() => !!$(m, "#feed") && !$(m, "#feed .loader"));
-    const ep = approvalEndpoint()!;
-    const file = (tool: string) =>
-      fetch(`${ep.url}/api/approvals/request`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-loom-approval": ep.secret },
-        body: JSON.stringify({ project: projectId, agent: "execbot", tool, input: { path: "a.txt" } }),
-      }).then((r) => r.json() as Promise<{ behavior: string; message?: string }>);
+    const file = (tool: string) => requestApproval({ project: projectId, agent: "execbot", tool, input: { path: "a.txt" } });
     const first = file("Write");
     await waitUntil(() => text(m, "#apbadge .apn") === "1");
     click($(m, "#apbadge"));

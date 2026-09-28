@@ -11,8 +11,8 @@
  *            skip flag set explicitly, a headless turn stalls on a prompt
  *            nobody can answer).
  *   auto   — edit files freely; the agent's own guardrails decide the rest.
- *   ask    — nothing changes without you. Where the agent supports routing a
- *            permission prompt to a tool (Claude Code), each request appears
+ *   ask    — nothing changes without you. Where the agent can hand its
+ *            permission prompts to Loom (Claude Code, Codex), each request appears
  *            in Loom as an approval you allow or deny. Where it doesn't, "ask"
  *            is the agent's read-only / plan mode — it proposes, it doesn't
  *            touch — and the UI says which of the two you're getting.
@@ -52,10 +52,10 @@ export const PERMISSION_PROFILES: Record<string, PermissionProfile> = {
   "claude-code": {
     default: "auto",
     modes: {
-      bypass: { flags: "--permission-mode bypassPermissions", label: "Bypass — runs any tool, never asks" },
-      auto: { flags: "--permission-mode acceptEdits", label: "Auto — edits files; other tools only if pre-allowed" },
+      bypass: { flags: "permissionMode: bypassPermissions", label: "Bypass — runs any tool, never asks" },
+      auto: { flags: "permissionMode: acceptEdits", label: "Auto — edits files; other tools only if pre-allowed" },
       ask: {
-        flags: "--permission-mode manual --permission-prompt-tool mcp__loom__approve",
+        flags: "permissionMode: default, canUseTool → Loom approvals",
         label: "Always ask — every tool call waits for your approval in Loom",
         ask: "approvals",
       },
@@ -64,9 +64,9 @@ export const PERMISSION_PROFILES: Record<string, PermissionProfile> = {
   codex: {
     default: "auto",
     modes: {
-      bypass: { flags: "--dangerously-bypass-approvals-and-sandbox", label: "Bypass — no sandbox, no approvals" },
-      auto: { flags: "-s workspace-write", label: "Auto — writes inside the project, sandboxed" },
-      ask: { flags: "-s read-only", label: "Ask — read-only: proposes changes, makes none", ask: "read-only" },
+      bypass: { flags: "sandbox: danger-full-access, approvalPolicy: never", label: "Bypass — no sandbox, no approvals" },
+      auto: { flags: "sandbox: workspace-write, approvalPolicy: never", label: "Auto — writes inside the project, sandboxed" },
+      ask: { flags: "sandbox: read-only, approvalPolicy: untrusted", label: "Always ask — commands and edits wait for your approval in Loom", ask: "approvals" },
     },
   },
   "antigravity-cli": {

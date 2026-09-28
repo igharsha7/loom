@@ -1,43 +1,33 @@
 /**
- * Codex adapter — drives the `codex` CLI headless, one process per turn,
- * resuming the same thread across turns.
+ * Codex adapter — drives `codex app-server` (JSON-RPC over stdio), one
+ * app-server process per turn, resuming the same thread across turns.
  *
- *   codex exec --json --skip-git-repo-check -C <dir> -s <sandbox> \
- *              [-c mcp_servers.<name>=<toml>] "<text>"
- *   codex exec resume <threadId> --json … "<text>"
+ *   initialize → thread/start | thread/resume → turn/start → … → turn/completed
  *
- * The CLI ships inside the desktop app as well as on PATH, so `available()`
- * looks in both places — a Mac with Codex.app installed and nothing on PATH is
- * the common case, and refusing to find it there would be wrong.
+ * The protocol follows the bindings `codex app-server generate-ts` emits (checked
+ * against codex-cli 0.153.4). Over `codex exec --json` it adds what continuity
+ * needs: `thread/tokenUsage/updated` (tokens in context and the model's context
+ * window), `contextCompaction` items (compaction as it starts and ends), account
+ * rate limits, and approval requests that Loom answers — so "ask" is real
+ * approvals rather than a read-only stand-in.
  *
- * Event surface verified against codex-cli 0.142.4 by running it and reading
- * what came out, not by guessing:
+ * One process per turn keeps the lifecycle Brain relies on: the turn owns a
+ * process group, and the writer lease is released only after that group has
+ * exited.
  *
- *   {"type":"thread.started","thread_id":"019f…"}
- *   {"type":"turn.started"}
- *   {"type":"item.started","item":{"id":"item_1","type":"command_execution",…}}
- *   {"type":"item.completed","item":{"id":"item_1","type":"command_execution",
- *      "command":"/bin/zsh -lc 'echo hi'","aggregated_output":"hi\n","exit_code":0}}
- *   {"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"…"}}
- *   {"type":"item.completed","item":{"id":"item_3","type":"file_change",
- *      "changes":[{"path":"/abs/note.txt","kind":"add"}]}}
- *   {"type":"turn.completed","usage":{"input_tokens":52831,"output_tokens":120,…}}
- *
- * Note what is NOT in there: money. Codex reports tokens, never a dollar
- * figure, so this adapter reports tokens and no cost. Inventing a USD number
- * from a price table we'd have to keep current is how you end up with a fake
- * $0.001 in the UI presented as fact.
+ * Codex reports tokens, never money, so this adapter reports tokens and no cost.
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
-import readline from "node:readline";
-import type { AgentCapabilities, SendInput } from "../types.js";
-import { codexMcpArgs } from "../core/mcp.js";
-import { AdapterBase, ADAPTER_CAPABILITIES, agentEnv, interruptProcess, trackNativeExit, guardNativeOutput, cliAvailable, frameBriefing } from "./base.js";
+import type { AgentCapabilities, McpServerEntry, SendInput } from "../types.js";
+import { AdapterBase, ADAPTER_CAPABILITIES, agentEnv, cliAvailable, frameBriefing, guardNativeOutput, quiesceProcessGroup, trackNativeExit } from "./base.js";
+import { CodexRpc, type Json, type RpcError } from "./codex-rpc.js";
 import { permissionFor } from "../core/permissions.js";
+import { requestApproval } from "../core/approvals.js";
 import { ContextArtifacts } from "../core/continuity/artifacts.js";
-import { NativeDispatchRejected } from "../core/continuity/contracts.js";
+import { NativeDispatchRejected, NativeQuiescenceUnknown, NativeSessionMissing } from "../core/continuity/contracts.js";
+import { VERSION } from "../version.js";
 
 interface CodexOptions {
   /** Sandbox policy for model-run commands; default "workspace-write". */
@@ -46,8 +36,10 @@ interface CodexOptions {
   model?: string;
   /** Absolute path to the codex binary, when it's somewhere unusual. */
   bin?: string;
-  /** Extra CLI args, escape hatch. */
+  /** Extra `codex app-server` args (e.g. `-c key=value`), escape hatch. */
   extraArgs?: string[];
+  /** Loom project id, for approval cards. */
+  loomProject?: string;
 }
 
 /** The CLI bundled inside the desktop app, per platform. */
@@ -55,12 +47,12 @@ const BUNDLED = [
   "/Applications/Codex.app/Contents/Resources/codex",
   `${process.env.HOME ?? ""}/Applications/Codex.app/Contents/Resources/codex`,
 ];
+const SIGNED_OUT = /\b(?:not\s+(?:logged|signed)\s+in|not\s+authenticated|authentication\s+required|login\s+required|please\s+log\s+in)\b/i;
+const MISSING_THREAD = /not found|missing thread|no such thread|unknown thread|does not exist|no rollout found/i;
 
-function codexExitMessage(code: number | null, stderr: string): string {
-  if (/\b(?:not\s+(?:logged|signed)\s+in|not\s+authenticated|authentication\s+required|login\s+required|please\s+log\s+in)\b/i.test(stderr)) {
-    return "codex not signed in — run `codex login` and try again";
-  }
-  return `codex exited ${code}`;
+function codexFailure(message: string, stderr = ""): string {
+  if (SIGNED_OUT.test(`${message}\n${stderr}`)) return "codex not signed in — run `codex login` and try again";
+  return message;
 }
 
 /**
@@ -75,17 +67,41 @@ export function codexBin(override?: string): string | null {
   return "codex"; // let PATH resolution (and cliAvailable) decide
 }
 
+/** A project MCP server as a Codex `mcp_servers.<key>` config value. */
+function codexMcpServer(entry: McpServerEntry): Json {
+  if (entry.type === "stdio") return { command: entry.command, ...(entry.args ? { args: entry.args } : {}), ...(entry.env ? { env: entry.env } : {}) };
+  // Codex's key for per-server HTTP headers is unverified; a guessed key is
+  // either ignored or rejected, so headers are deliberately not sent.
+  return { url: entry.url };
+}
+
+type Usage = { input: number; cached: number; output: number; reasoning: number };
+const usageOf = (u: Json | undefined): Usage => ({ input: Number(u?.inputTokens ?? 0), cached: Number(u?.cachedInputTokens ?? 0),
+  output: Number(u?.outputTokens ?? 0), reasoning: Number(u?.reasoningOutputTokens ?? 0) });
+
+interface Turn {
+  child: ChildProcess;
+  rpc: CodexRpc;
+  threadId: string | null;
+  turnId: string | null;
+  /** Settles with the turn's final status, or rejects when the process dies first. */
+  done: Promise<{ status: string; error: string | null }>;
+  interrupted: boolean;
+  closed: boolean;
+  stderr: () => string;
+  /** Aborted at shutdown, so approval cards still open are closed. */
+  abort: AbortController;
+  /** Waits for inherited-pipe drain and descendant cleanup after exit. */
+  quiesce: () => Promise<void>;
+}
+
 export class CodexAdapter extends AdapterBase {
-  /** `codex -c mcp_servers.…` is real, so this adapter accepts SendInput.mcp. */
+  /** Project MCP servers ride `thread/start` config, so SendInput.mcp is real. */
   override readonly capabilities: AgentCapabilities = { ...ADAPTER_CAPABILITIES, mcp: true };
-  private child: ChildProcess | null = null;
   private options: CodexOptions;
-  // Token usage from turn.completed, stashed so it also rides run_complete
-  // (which fires on close). Cleared each turn.
-  private lastUsage: { input: number; output: number } | null = null;
-  // The model codex actually ran, captured from whichever event carries it, so
-  // the turn's gen_ai span reports a real model even with no override set.
-  // Cleared each turn.
+  private turn: Turn | null = null;
+  private settled: Promise<void> | null = null;
+  // The model codex actually ran, for the turn's gen_ai span. Cleared each turn.
   private lastModel: string | null = null;
 
   constructor(id: string, projectDir: string, options: Record<string, unknown> = {}) {
@@ -118,6 +134,19 @@ export class CodexAdapter extends AdapterBase {
     await this.interrupt();
   }
 
+  /** Thread settings from the permission mode, applied on start and resume. */
+  private threadParams(input: SendInput): Json {
+    // bypass: no sandbox, no approvals. auto: sandboxed writes, never asks.
+    // ask: read-only sandbox; every command and edit waits for approval in Loom.
+    const mode = permissionFor("codex", this.options as Record<string, unknown>);
+    const sandbox = this.options.sandbox ?? (mode === "bypass" ? "danger-full-access" : mode === "ask" ? "read-only" : "workspace-write");
+    const model = input.model ?? this.options.model;
+    const mcp = input.mcp?.servers.length
+      ? Object.fromEntries(input.mcp.servers.map(s => [`mcp_servers.${s.key}`, codexMcpServer(s.entry)])) : undefined;
+    return { cwd: this.projectDir, sandbox, approvalPolicy: mode === "ask" ? "untrusted" : "never", approvalsReviewer: "user",
+      ...(model ? { model } : {}), ...(mcp ? { config: mcp } : {}) };
+  }
+
   async send(input: SendInput): Promise<void> {
     if (this._busy) throw new Error(`codex agent "${this.id}" is busy`);
     const bin = codexBin(this.options.bin);
@@ -125,291 +154,380 @@ export class CodexAdapter extends AdapterBase {
     this._busy = true;
     this.beginContinuity(input);
     const started = Date.now();
-    let launched = false;
+    let release!: () => void;
+    this.settled = new Promise(resolve => { release = resolve; });
+    let child: ChildProcess | null = null, turnStarted = false;
     try {
-
-      // Codex exec has no --append-system-prompt, so the briefing rides in front
-      // of the text — but framed as an unmissable authoritative block (see
-      // frameBriefing), not a loose preamble the model skims past.
+      // Codex has no per-turn system channel, so a briefing rides in front of
+      // the text, framed as an unmissable block (see frameBriefing).
       const text = input.continuity
         ? [input.continuity.context, input.briefing, input.text].filter(Boolean).join("\n\n")
         : input.briefing ? `${frameBriefing(input.briefing)}\n\n${input.text}` : input.text;
+      const args = ["app-server", ...(this.options.extraArgs ?? [])];
+      child = spawn(bin, args, { cwd: this.projectDir, detached: process.platform !== "win32",
+        stdio: ["pipe", "pipe", "pipe"], env: agentEnv() });
+      const proc = child;
+      if (!proc.pid) await new Promise<void>((_, reject) => proc.once("error", e => reject(new NativeDispatchRejected(e.message))));
+      const turn = this.openTurn(proc);
+      await turn.rpc.request("initialize", { clientInfo: { name: "loom", title: "Loom", version: VERSION },
+        capabilities: { experimentalApi: true, requestAttestation: false } });
+      turn.rpc.notify("initialized");
 
-      // `codex exec` takes -C (working root) and -s (sandbox); `codex exec resume`
-      // takes NEITHER — a resumed session keeps the original turn's root + sandbox,
-      // and passing them is a hard "unexpected argument" error that fails every
-      // follow-up turn. So only the fresh turn sets them; resume inherits (and the
-      // spawn's cwd is projectDir regardless).
-      //
-      // Permissions (core/permissions.ts): bypass drops the sandbox entirely;
-      // auto/ask pick workspace-write/read-only. A resumed session can't take
-      // -s, but it does take `-c sandbox_mode=…` and the bypass flag, so a mode
-      // changed mid-conversation still applies to the next turn.
-      const mode = permissionFor("codex", this.options as Record<string, unknown>);
-      const sandbox = this.options.sandbox ?? (mode === "ask" ? "read-only" : "workspace-write");
-      const bypass = mode === "bypass" && !this.options.sandbox;
-      const args = this.threadId
-        ? [
-            "exec",
-            "resume",
-            this.threadId,
-            "--json",
-            "--skip-git-repo-check",
-            ...(bypass ? ["--dangerously-bypass-approvals-and-sandbox"] : ["-c", `sandbox_mode="${sandbox}"`]),
-          ]
-        : [
-            "exec",
-            "--json",
-            "--skip-git-repo-check",
-            "-C",
-            this.projectDir,
-            ...(bypass ? ["--dangerously-bypass-approvals-and-sandbox"] : ["-s", sandbox]),
-          ];
-      if (input.model ?? this.options.model) args.push("-m", (input.model ?? this.options.model)!);
-      // The project's MCP servers, for this turn only. Codex has no
-      // `--mcp-config <file>` flag — its servers live in the `mcp_servers` table
-      // of config.toml, and `-c <dotted.path>=<toml>` is its documented
-      // per-invocation override for exactly that, so that's what we use rather
-      // than inventing a flag or writing to the user's config file. See
-      // core/mcp.ts#codexMcpArgs for how it was verified.
-      if (input.mcp?.servers.length) args.push(...codexMcpArgs(input.mcp.servers));
-      if (this.options.extraArgs) args.push(...this.options.extraArgs);
-      args.push(text);
+      const params = this.threadParams(input);
+      const bound = this.threadId;
+      let opened: Json;
+      try {
+        opened = bound
+          ? await turn.rpc.request("thread/resume", { threadId: bound, ...params, excludeTurns: true })
+          : await turn.rpc.request("thread/start", params);
+      } catch (error) {
+        const message = (error as Error).message;
+        // No turn exists yet, so nothing was submitted. A lost native session
+        // is rebuilt by Brain; a plain resume slot just starts fresh.
+        if (bound && MISSING_THREAD.test(message)) {
+          if (input.continuity) throw new NativeSessionMissing(`codex thread ${bound} could not be resumed: ${message}`);
+          opened = await turn.rpc.request("thread/start", params);
+        } else throw new NativeDispatchRejected(codexFailure(`codex could not open its thread: ${message}`, turn.stderr()));
+      }
+      const thread = (opened.thread ?? {}) as Json;
+      const threadId = String(thread.id ?? bound ?? "");
+      if (!threadId) throw new NativeDispatchRejected("codex app-server returned no thread id");
+      turn.threadId = threadId;
+      this.threadId = threadId;
+      if (typeof opened.model === "string" && opened.model) this.lastModel = opened.model;
+      this.emit({ kind: "status", payload: { state: "turn_started", session: threadId } });
+      if (turn.interrupted) throw new NativeDispatchRejected("interrupted before the turn started");
 
-      await new Promise<void>((resolve, reject) => {
-        const child = spawn(bin, args, {
-          cwd: this.projectDir,
-          detached: Boolean(input.continuity) && process.platform !== "win32",
-          // stdin closed: with a pipe open, `codex exec` waits on stdin for
-          // additional input and the turn never starts.
-          stdio: ["ignore", "pipe", "pipe"],
-          env: agentEnv(),
-        });
-        this.child = child;
-        launched = Boolean(child.pid);
-        let lastMessage = "";
-        let sawTurn = false;
-        let failedTurn = false;
-        let streamFailure: unknown;
-        const quiesceOnClose = input.continuity ? trackNativeExit(child, error => { streamFailure = error; reject(error); }) : undefined;
-        let stderrTail = "";
+      turnStarted = true; // from here the prompt may have been submitted
+      let response: Json;
+      try {
+        response = await turn.rpc.request("turn/start", { threadId, input: [{ type: "text", text, text_elements: [] }],
+          ...(input.continuity ? { clientUserMessageId: input.continuity.runId } : {}),
+          ...(params.model ? { model: params.model } : {}) });
+      } catch (error) {
+        // An error *response* is a refusal: the server did not start the turn.
+        // A dead process or timeout is not — that outcome stays unknown.
+        if ((error as RpcError).code === undefined) throw error;
+        const message = codexFailure(`codex refused the turn: ${(error as Error).message}`, turn.stderr());
+        this.emit({ kind: "error", payload: { message } });
+        throw new NativeDispatchRejected(message);
+      }
+      const turnId = String((response.turn as Json | undefined)?.id ?? "");
+      if (turnId) turn.turnId = turnId;
+      this.accepted();
+      if (turn.interrupted && turnId) await turn.rpc.request("turn/interrupt", { threadId, turnId }).catch(() => {});
 
-        const rl = readline.createInterface({ input: child.stdout! });
-        if (input.continuity) guardNativeOutput(child, error => {
-          streamFailure = error; rl.close(); child.stdout?.destroy();
-          try { child.kill("SIGKILL"); } catch { /* Busy/lease remains until verified settlement. */ }
-        });
-        rl.on("line", (line) => {
-          if (streamFailure) return;
-          const trimmed = line.trim();
-          if (!trimmed.startsWith("{")) return;
-          let evt: Record<string, unknown>;
-          try {
-            evt = JSON.parse(trimmed) as Record<string, unknown>;
-          } catch {
-            return;
-          }
-          try { this.handleEvent(evt, (t) => (lastMessage = t)); }
-          catch (error) { streamFailure = error; try { child.kill("SIGKILL"); } catch { /* Preserve the foreground barrier. */ } }
-          if (evt.type === "turn.completed") sawTurn = true;
-          if (evt.type === "turn.failed" || evt.type === "error") failedTurn = true;
-        });
-
-        child.stderr!.on("data", (d: Buffer) => {
-          stderrTail = (stderrTail + d.toString()).slice(-2000);
-        });
-
-        child.on("error", (err) => reject(!child.pid ? new NativeDispatchRejected(err.message) : err));
-        child.on("close", async (code, signal) => {
-          try { await quiesceOnClose?.(); }
-          catch (error) { reject(error); return; }
-          if (streamFailure) { reject(streamFailure); return; }
-          if (this.child === child) this.child = null;
-          if (signal) {
-            this.emit({ kind: "status", payload: { state: "interrupted", signal } });
-            if (streamFailure) reject(streamFailure); else resolve();
-            return;
-          }
-          if (code !== 0 && !sawTurn) {
-            const message = codexExitMessage(code, stderrTail);
-            this.emit({
-              kind: "error",
-              payload: { message, stderr: stderrTail },
-            });
-            reject(new Error(`${message}: ${stderrTail.slice(0, 200)}`));
-            return;
-          }
-          if (input.continuity && !sawTurn) { reject(new Error("codex closed without turn.completed; native outcome is unknown")); return; }
-          if (streamFailure) { reject(streamFailure); return; }
-          if (input.continuity && (failedTurn || code !== 0)) { reject(new Error("codex reported a failed turn")); return; }
-          // Same blocked-on-human heuristic the other adapters use: the turn
-          // ended on a question, so the baton is really with you.
-          if (/\?\s*$/.test(lastMessage.trim())) {
-            this.emit({ kind: "needs_input", payload: { question: lastMessage.slice(-500) } });
-          }
-          this.emit({
-            kind: "run_complete",
-            payload: {
-              durationMs: Date.now() - started,
-              ...(this.lastModel ? { model: this.lastModel } : {}),
-              ...(this.lastUsage
-                ? { inputTokens: this.lastUsage.input, outputTokens: this.lastUsage.output }
-                : {}),
-            },
-          });
-          this.lastUsage = null;
-          this.lastModel = null;
-          resolve();
-        });
-      });
+      const outcome = await turn.done;
+      await this.shutdown(turn);
+      if (outcome.status === "interrupted") {
+        this.emit({ kind: "status", payload: { state: "interrupted" } });
+        return;
+      }
+      if (outcome.status !== "completed") {
+        const message = codexFailure(outcome.error ?? "codex reported a failed turn", turn.stderr());
+        this.emit({ kind: "error", payload: { message } });
+        throw new Error(message);
+      }
+      // Blocked-on-human heuristic: the turn ended on a question.
+      if (/\?\s*$/.test(this.lastMessage.trim())) {
+        this.emit({ kind: "needs_input", payload: { question: this.lastMessage.slice(-500) } });
+      }
+      this.emit({ kind: "run_complete", payload: { durationMs: Date.now() - started,
+        ...(this.lastModel ? { model: this.lastModel } : {}),
+        // Codex's input already includes cached tokens, and its output already
+        // includes reasoning (totalTokens = input + output), as t3code reads it.
+        ...(this.turnUsage ? { inputTokens: this.turnUsage.input, outputTokens: this.turnUsage.output } : {}) } });
     } catch (error) {
-      if (input.continuity && !launched && !(error instanceof NativeDispatchRejected))
-        throw new NativeDispatchRejected("native argument/config preparation failed before process launch");
+      const turn = this.turn;
+      if (turn) {
+        try { await this.shutdown(turn); }
+        catch (shutdownError) { if (shutdownError instanceof NativeQuiescenceUnknown) throw shutdownError; }
+      }
+      if (error instanceof NativeQuiescenceUnknown) throw error;
+      if (turn?.interrupted && !turnStarted) {
+        // Stopped before any prompt reached Codex: interrupted, not failed.
+        this.emit({ kind: "status", payload: { state: "interrupted" } });
+        if (input.continuity) throw new NativeDispatchRejected("interrupted before the turn started");
+        return;
+      }
+      if (error instanceof NativeDispatchRejected) throw error;
+      const stderr = turn?.stderr() ?? "";
+      if (!turnStarted) {
+        const message = codexFailure((error as Error).message, stderr);
+        this.emit({ kind: "error", payload: { message, ...(stderr ? { stderr } : {}) } });
+        throw new NativeDispatchRejected(message);
+      }
+      if (!this.turnFinished) {
+        // A stream failure (an oversized record, a handler error) says what
+        // went wrong; a bare exit only that the process is gone.
+        const cause = (error as Error).message;
+        const message = /exited before the turn completed/.test(cause)
+          ? codexFailure("codex app-server exited before the turn completed; native outcome is unknown", stderr)
+          : `${cause}; native outcome is unknown`;
+        this.emit({ kind: "error", payload: { message, ...(stderr ? { stderr } : {}) } });
+        throw new Error(message);
+      }
       throw error;
     } finally {
+      this.turn = null;
+      this.turnBaseline = null;
+      this.turnUsage = null;
+      this.turnFinished = false;
+      this.lastModel = null;
+      this.lastMessage = "";
+      this.compacting = false;
       this._busy = false;
-      this.child = null;
       this.endContinuity();
+      release();
     }
   }
 
-  private handleEvent(evt: Record<string, unknown>, setLast: (t: string) => void): void {
-    const type = evt.type as string;
+  // Per-turn state read by the notification handlers.
+  private lastMessage = "";
+  private turnUsage: Usage | null = null;
+  private turnFinished = false;
+  private compacting = false;
+  private acceptedEmitted = false;
 
-    // Codex reports the model on different events across CLI versions (the
-    // thread config, the turn, or the assistant item). Capture it wherever it
-    // shows up so a real gen_ai.request.model lands on the turn span.
-    const m = evt.model ?? (evt.thread as Record<string, unknown> | undefined)?.model;
-    if (typeof m === "string" && m) this.lastModel = m;
+  private accepted(): void {
+    if (this.acceptedEmitted) return;
+    this.acceptedEmitted = true;
+    if (this.continuityTurn) this.emit({ kind: "status", payload: { state: "native_turn_accepted" } });
+  }
 
-    if (type === "thread.started") {
-      const id = evt.thread_id as string | undefined;
-      if (id) this.threadId = id;
-      this.emit({ kind: "status", payload: { state: "turn_started", session: id ?? null } });
-      return;
+  private openTurn(child: ChildProcess): Turn {
+    this.acceptedEmitted = false;
+    let stderrTail = "";
+    child.stderr?.on("data", (d: Buffer) => { stderrTail = (stderrTail + d.toString()).slice(-2000); });
+    let finish!: (value: { status: string; error: string | null }) => void, fail!: (error: Error) => void;
+    const done = new Promise<{ status: string; error: string | null }>((resolve, reject) => { finish = resolve; fail = reject; });
+    done.catch(() => {});
+    const rpc = new CodexRpc(child, {
+      notification: (method, params) => {
+        try { this.notification(method, params, finish); }
+        catch (error) { fail(error as Error); }
+      },
+      request: (method, params) => this.serverRequest(method, params),
+    });
+    const quiesce = trackNativeExit(child, error => fail(error));
+    // An oversized record is dropped, not imported: stop reading before failing.
+    guardNativeOutput(child, error => { rpc.close(error); fail(error); try { child.kill("SIGKILL"); } catch { /* lease stays held */ } });
+    child.once("close", code => {
+      rpc.close(new Error(`codex app-server exited${code === null ? "" : ` ${code}`}`));
+      fail(new Error("codex app-server exited before the turn completed"));
+    });
+    const turn: Turn = { child, rpc, threadId: null, turnId: null, done,
+      interrupted: false, closed: false, stderr: () => stderrTail, abort: new AbortController(), quiesce };
+    this.turn = turn;
+    return turn;
+  }
+
+  /** End the per-turn process and its group; a group that won't die holds the lease. */
+  private async shutdown(turn: Turn): Promise<void> {
+    if (turn.closed) return;
+    turn.closed = true;
+    turn.abort.abort();
+    const { child } = turn;
+    turn.rpc.close(new Error("turn finished"));
+    child.stdin?.end();
+    if (child.exitCode === null && child.signalCode === null) {
+      const closed = new Promise<void>(resolve => child.once("close", () => resolve()));
+      if (child.pid && process.platform !== "win32") {
+        try { process.kill(-child.pid, "SIGTERM"); } catch { /* already gone */ }
+      } else child.kill("SIGTERM");
+      const timeout = new Promise<"timeout">(resolve => setTimeout(() => resolve("timeout"), 3000).unref());
+      if (await Promise.race([closed, timeout]) === "timeout") {
+        try { child.kill("SIGKILL"); } catch { /* checked below */ }
+        await Promise.race([closed, new Promise(resolve => setTimeout(resolve, 3000).unref())]);
+      }
     }
-    if (type === "turn.started") {
-      if (this.continuityTurn) this.emit({ kind: "status", payload: { state: "native_turn_accepted" } });
-      return;
-    }
+    await turn.quiesce();
+    if (child.pid && process.platform !== "win32") await quiesceProcessGroup(child.pid);
+  }
 
-    if (type === "item.completed" || type === "item.started") {
-      const item = (evt.item ?? {}) as Record<string, unknown>;
-      // Only completed items are reported: an in_progress command has no exit
-      // code yet, and a half-written file_change has nothing useful to say.
-      if (type !== "item.completed") return;
-      this.handleItem(item, setLast);
-      return;
-    }
-
-    if (type === "turn.completed") {
-      const usage = (evt.usage ?? {}) as Record<string, number>;
-      this.lastUsage = {
-        input: (usage.input_tokens ?? 0) + (usage.cached_input_tokens ?? 0),
-        output: (usage.output_tokens ?? 0) + (usage.reasoning_output_tokens ?? 0),
-      };
-      this.emit({
-        kind: "status",
-        payload: {
-          state: "turn_tokens",
-          inputTokens: usage.input_tokens ?? 0,
-          cachedInputTokens: usage.cached_input_tokens ?? 0,
-          outputTokens: usage.output_tokens ?? 0,
-          reasoningTokens: usage.reasoning_output_tokens ?? 0,
-        },
-      });
-      return;
-    }
-
-    if (type === "turn.failed" || type === "error") {
-      const err = (evt.error ?? evt) as Record<string, unknown>;
-      this.emit({ kind: "error", payload: { message: String(err.message ?? "codex failed") } });
+  private notification(method: string, params: Json, finish: (value: { status: string; error: string | null }) => void): void {
+    const turn = this.turn;
+    // Sub-agent threads report their own items; this turn's thread is the one.
+    if (turn?.threadId && typeof params.threadId === "string" && params.threadId !== turn.threadId) return;
+    switch (method) {
+      case "turn/started":
+        this.accepted();
+        return;
+      case "item/started": {
+        const item = (params.item ?? {}) as Json;
+        if (item.type === "contextCompaction" && !this.compacting) {
+          this.compacting = true;
+          this.emit({ kind: "status", payload: { state: "compacting" } });
+        }
+        return; // an item that only started has nothing to report yet
+      }
+      case "item/completed":
+        this.item((params.item ?? {}) as Json);
+        return;
+      case "thread/compacted": // deprecated form; the item carries it on current versions
+        if (!this.compacting) this.compacted();
+        return;
+      case "thread/tokenUsage/updated":
+        this.tokenUsage((params.tokenUsage ?? {}) as Json);
+        return;
+      case "account/rateLimits/updated":
+        this.rateLimits((params.rateLimits ?? {}) as Json);
+        return;
+      case "error": {
+        // A retried stream error is a notice; a final failure also arrives as
+        // a failed turn/completed, which is what fails the turn.
+        const error = (params.error ?? {}) as Json;
+        this.emit({ kind: "status", payload: { state: "notice", message: String(error.message ?? "codex error"),
+          ...(params.willRetry === true ? { retrying: true } : {}) } });
+        return;
+      }
+      case "turn/completed": {
+        const t = (params.turn ?? {}) as Json;
+        if (turn?.turnId && t.id !== turn.turnId) return;
+        this.turnFinished = true;
+        const error = (t.error ?? null) as Json | null;
+        finish({ status: String(t.status ?? "failed"), error: error ? String(error.message ?? "codex failed") : null });
+        return;
+      }
+      default:
+        return;
     }
   }
 
-  private handleItem(item: Record<string, unknown>, setLast: (t: string) => void): void {
+  private tokenUsage(usage: Json): void {
+    const total = usageOf(usage.total as Json), last = usageOf(usage.last as Json);
+    const window = typeof usage.modelContextWindow === "number" ? usage.modelContextWindow : null;
+    // `last` is the newest model response; the context now holds its total.
+    const used = Number((usage.last as Json | undefined)?.totalTokens ?? 0);
+    // Turn usage: growth of the running total, seeded by the first response.
+    this.turnBaseline ??= { total, first: last };
+    const b = this.turnBaseline;
+    this.turnUsage = { input: total.input - b.total.input + b.first.input, cached: total.cached - b.total.cached + b.first.cached,
+      output: total.output - b.total.output + b.first.output, reasoning: total.reasoning - b.total.reasoning + b.first.reasoning };
+    if (this.turnUsage.input < 0) this.turnUsage = last; // Codex reset its running total
+    this.emit({ kind: "status", payload: { state: "turn_tokens", inputTokens: this.turnUsage.input,
+      cachedInputTokens: this.turnUsage.cached, outputTokens: this.turnUsage.output, reasoningTokens: this.turnUsage.reasoning } });
+    if (used > 0) this.contextUsed = used;
+    if (used > 0) this.emit({ kind: "status", payload: { state: "context_usage", usedTokens: used,
+      ...(window ? { maxTokens: window } : {}), autoCompacts: true } });
+  }
+  private turnBaseline: { total: Usage; first: Usage } | null = null;
+  /** Tokens in context at the last report; what a compaction started from. Outlives turns. */
+  private contextUsed: number | null = null;
+
+  private compacted(): void {
+    // Codex reports the size after compaction on its next token update.
+    this.emit({ kind: "status", payload: { state: "native_compacted", trigger: "auto",
+      ...(this.contextUsed ? { preTokens: this.contextUsed } : {}) } });
+  }
+
+  private rateLimits(snapshot: Json): void {
+    const windows = (["primary", "secondary"] as const).flatMap(key => {
+      const w = snapshot[key] as Json | null | undefined;
+      if (!w || typeof w.usedPercent !== "number") return [];
+      return [{ id: key, usedPercent: w.usedPercent, ...(typeof w.windowDurationMins === "number" ? { windowMinutes: w.windowDurationMins } : {}),
+        ...(typeof w.resetsAt === "number" ? { resetsAt: w.resetsAt * 1000 } : {}) }];
+    });
+    if (windows.length) this.emit({ kind: "status", payload: { state: "usage_limits", provider: "codex", windows,
+      ...(typeof snapshot.rateLimitReachedType === "string" ? { reached: snapshot.rateLimitReachedType } : {}) } });
+  }
+
+  private item(item: Json): void {
     switch (item.type) {
-      case "agent_message": {
+      case "agentMessage": {
         const text = String(item.text ?? "");
         if (!text.trim()) return;
-        setLast(text);
+        this.lastMessage = text;
         this.emit({ kind: "message", payload: { text } });
         return;
       }
       case "reasoning": {
-        const text = String(item.text ?? "").trim();
+        const parts = [...((item.summary as unknown[]) ?? []), ...((item.content as unknown[]) ?? [])].map(String);
+        const text = parts.join("\n").trim();
         if (text) this.emit({ kind: "message", payload: { text, reasoning: true } });
         return;
       }
-      case "command_execution": {
+      case "commandExecution": {
         const command = String(item.command ?? "");
-        const exit = item.exit_code;
-        const outputArtifact = this.continuityTurn && typeof item.aggregated_output === "string" && item.aggregated_output.length > 100_000
-          ? new ContextArtifacts(this.projectDir).put(JSON.stringify({ version: 1, output: item.aggregated_output })) : undefined;
-        this.emit({
-          kind: "tool_call",
-          payload: {
-            tool: "shell",
-            summary: `shell: ${command.replace(/\s+/g, " ").slice(0, 160)}`,
-            exitCode: typeof exit === "number" ? exit : null,
-            ...(this.continuityTurn ? { outcome: typeof exit === "number" ? exit === 0 ? "success" : "failure" : "unknown",
-              output: typeof item.aggregated_output === "string" ? item.aggregated_output.slice(0, 100_000) : null,
-              ...(outputArtifact ? { outputArtifact } : {}),
-              outputTruncated: typeof item.aggregated_output === "string" && item.aggregated_output.length > 100_000 } : {}),
-          },
-        });
+        const exit = item.exitCode;
+        const output = typeof item.aggregatedOutput === "string" ? item.aggregatedOutput : null;
+        const outputArtifact = this.continuityTurn && output !== null && output.length > 100_000
+          ? new ContextArtifacts(this.projectDir).put(JSON.stringify({ version: 1, output })) : undefined;
+        this.emit({ kind: "tool_call", payload: { tool: "shell", summary: `shell: ${command.replace(/\s+/g, " ").slice(0, 160)}`,
+          exitCode: typeof exit === "number" ? exit : null,
+          ...(this.continuityTurn ? { outcome: typeof exit === "number" ? exit === 0 ? "success" : "failure" : item.status === "declined" ? "cancelled" : "unknown",
+            output: output?.slice(0, 100_000) ?? null, ...(outputArtifact ? { outputArtifact } : {}),
+            outputTruncated: output !== null && output.length > 100_000 } : {}) } });
         return;
       }
-      case "file_change": {
-        const changes = (item.changes ?? []) as Array<{ path?: string; kind?: string }>;
-        for (const c of changes) {
-          if (!c.path) continue;
-          this.emit({
-            kind: "file_edit",
-            payload: { path: String(c.path), tool: `file_change:${c.kind ?? "edit"}` },
-          });
+      case "fileChange": {
+        for (const change of (item.changes as Array<{ path?: string; kind?: { type?: string } }> | undefined) ?? []) {
+          if (!change.path) continue;
+          this.emit({ kind: "file_edit", payload: { path: String(change.path), tool: `file_change:${change.kind?.type ?? "update"}` } });
         }
         return;
       }
-      case "mcp_tool_call": {
-        this.emit({
-          kind: "tool_call",
-          payload: { tool: String(item.tool ?? "mcp"), summary: `mcp: ${String(item.tool ?? "")}` },
-        });
+      case "mcpToolCall":
+        this.emit({ kind: "tool_call", payload: { tool: String(item.tool ?? "mcp"), summary: `mcp: ${String(item.tool ?? "")}` } });
         return;
-      }
-      case "web_search": {
-        this.emit({
-          kind: "tool_call",
-          payload: { tool: "web_search", summary: `search: ${String(item.query ?? "")}`.slice(0, 160) },
-        });
+      case "webSearch":
+        this.emit({ kind: "tool_call", payload: { tool: "web_search", summary: `search: ${String(item.query ?? "")}`.slice(0, 160) } });
         return;
-      }
-      case "error": {
-        // Codex emits item-level `error` for non-fatal NOTICES too — a model
-        // falling back to default metadata, "skill descriptions were shortened
-        // to fit the context budget", and the like — not only real failures. A
-        // genuinely failed turn ALSO arrives as `turn.failed` (and a crash as a
-        // non-zero exit), which is what should fail a route. So surface an
-        // item-level error as a visible notice, not a fatal error event, or a
-        // benign warning would sink an otherwise-successful turn mid-route.
-        this.emit({ kind: "status", payload: { state: "notice", message: String(item.message ?? "codex notice") } });
+      case "contextCompaction":
+        this.compacting = false;
+        this.compacted();
         return;
-      }
       default:
-        // todo_list and whatever Codex adds next: not every item is worth an
-        // event, and inventing a rendering for one we don't understand is worse
-        // than staying quiet.
+        // Plans, images and whatever Codex adds next: inventing a rendering
+        // for an item we don't understand is worse than staying quiet.
         return;
     }
   }
 
+  /** Server requests. Approvals go to the person, through Loom; anything
+   * this adapter can't answer is declined rather than left waiting. */
+  private async serverRequest(method: string, params: Json): Promise<Json> {
+    const signal = this.turn?.abort.signal;
+    const ask = async (tool: string, input: Json, summary: string) => (await requestApproval({
+      project: String(this.options.loomProject ?? ""), agent: this.id, tool, input, summary, ...(signal ? { signal } : {}) })).behavior === "allow";
+    switch (method) {
+      case "item/commandExecution/requestApproval": {
+        const command = String(params.command ?? "");
+        return { decision: await ask("shell", { command, cwd: params.cwd ?? null, reason: params.reason ?? null }, `shell: ${command}`.slice(0, 200)) ? "accept" : "decline" };
+      }
+      case "item/fileChange/requestApproval":
+        return { decision: await ask("file_change", { reason: params.reason ?? null, grantRoot: params.grantRoot ?? null }, "apply file changes") ? "accept" : "decline" };
+      case "execCommandApproval": {
+        const command = Array.isArray(params.command) ? params.command.join(" ") : String(params.command ?? "");
+        return { decision: await ask("shell", { command }, `shell: ${command}`.slice(0, 200)) ? "approved" : { denied: { rejection: "Denied in Loom." } } };
+      }
+      case "applyPatchApproval":
+        return { decision: await ask("file_change", { reason: params.reason ?? null }, "apply file changes") ? "approved" : { denied: { rejection: "Denied in Loom." } } };
+      case "item/permissions/requestApproval":
+        return { permissions: {}, scope: "turn" }; // an empty grant withholds the escalation
+      case "mcpServer/elicitation/request":
+        return { action: "decline", content: null, _meta: null };
+      case "item/tool/requestUserInput":
+        return { answers: {} };
+      default:
+        throw new Error(`Loom does not handle ${method}`);
+    }
+  }
+
   async interrupt(): Promise<void> {
-    const child = this.child;
-    if (!child) {
+    const turn = this.turn;
+    if (!turn) {
       if (this._busy) throw new Error("native turn is still preparing; quiescence is not established");
       return;
     }
-    await interruptProcess(child, Boolean(this.continuityTurn));
+    turn.interrupted = true;
+    if (turn.threadId && turn.turnId) await turn.rpc.request("turn/interrupt", { threadId: turn.threadId, turnId: turn.turnId }, 5000).catch(() => {});
+    else if (turn.child.pid && process.platform !== "win32") { try { process.kill(-turn.child.pid, "SIGINT"); } catch { /* gone */ } }
+    // The turn settles once its process group has exited; an unproven stop
+    // is an error, never a silent release.
+    const settled = this.settled ?? Promise.resolve();
+    const deadline = new Promise<"timeout">(resolve => setTimeout(() => resolve("timeout"), 10_000).unref());
+    if (await Promise.race([settled.then(() => "done" as const), deadline]) === "timeout")
+      throw new NativeQuiescenceUnknown("codex did not stop after interruption; quiescence unknown");
   }
 }

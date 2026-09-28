@@ -70,7 +70,8 @@ recovery state; no duplicate action execution or cross-chat session reuse.
 ## P3 — Long conversations and lightweight performance
 
 - [x] Implement source-backed checkpoints and deterministic compaction/fidelity policy.
-- [ ] Handle native compaction and unknown retention; E13–E14.
+- [x] Handle native compaction (both harnesses report it); E13. Retention after an
+  uncompacted resume stays "unknown"; E14.
 - [ ] Measure tokenizer/heuristic budgets and retrieval/helper/native overhead separately.
 - [x] Implement resumable mandatory overflow UX; E41.
 - [ ] Test buried small preferences, rejected alternatives and unresolved user dispositions.
@@ -158,3 +159,54 @@ See [BRAIN-AUDIT](BRAIN-AUDIT.md) for both review axes and all 64 case statuses.
 Cleanup validation: build/typecheck, 1,408 daemon tests, 125 browser tests, 87 focused
 checks, documentation links/64 audit rows, whitespace and packaging dry run passed.
 The 17 skips and all partial/gated matrix rows remain visible release limitations.
+
+## Validation follow-up — 2026-09-28
+
+An independent review reproduced four defects against the committed implementation;
+all are fixed with regressions in `test/continuity.test.ts`.
+
+- [x] Return deltas examined only the latest 50 events; older work by another agent
+  got no coverage and was never revisited (E42). Deltas now cover every observation
+  since their basis packet.
+- [x] Queued, overflowed or pre-launch-failed requests were rendered as history in
+  earlier turns and made unsent packets stale (E08, E23). Only requests with a
+  submitting/accepted/unknown receipt are conversation history.
+- [x] The harness check ran after capture, and a retried request ID silently no-oped.
+  Reachability is checked before capture; an unsent request re-runs on retry.
+- [x] Superseding a checkpoint left its originals hidden. Only current checkpoints
+  replace originals.
+- [x] Exact CLI version pinning removed. Any reachable version runs; a 20 s
+  `HarnessMonitor` probe reports reachability transitions and gates dispatch.
+- [x] Usage-aware switching: resumed sessions receive only what they lack; new or
+  compacted sessions get a bounded packet (recent exact tail, older headlines, full
+  text on file). Model changes within a harness keep its native session.
+- [x] Claude `compact_boundary` marks the binding compacted; the next packet rebuilds
+  state into the same resumed session (E13 for Claude).
+- [x] User-authority writes (reviewed items, checkpoints) are refused while a turn runs.
+
+Transport (app-server / Agent SDK):
+
+- [x] Codex on `codex app-server` JSON-RPC and Claude Code on the Claude Agent SDK,
+  following t3code. The `exec --json` / `-p` transports and the MCP approval shim
+  are removed; "ask" is real approvals on both, answered in-process.
+- [x] Lost native session (`NativeSessionMissing`): receipt failed, binding moves to
+  a new epoch, next packet reconstructs.
+- [x] Context in use, model window, compaction progress and provider usage limits
+  reported by both adapters and shown in the composer.
+- [x] Live smoke turn per harness (codex-cli 0.153.4, claude 2.1.278).
+- [ ] Cap packet size by the remaining context window. Not done: the per-agent
+  reading can't tell which chat's session it measured, and the 6,000-token default
+  is ~3% of current windows. Revisit for small-window models.
+
+Later:
+
+- [x] Linux argv limit: resolved by the transport change. Both harnesses now receive
+  the prompt over stdin (Agent SDK user message, app-server `turn/start`), so the
+  128 KiB `MAX_ARG_STRLEN` cap no longer applies. Linux is still untested live.
+- [x] Codex compaction signal: `codex app-server` reports `contextCompaction` items;
+  the binding is marked compacted like Claude's.
+- [ ] Optional cheap-model summaries of referenced history (P4); headlines are the
+  deterministic default.
+- [ ] Local admin-token exposure: any same-user process can fetch it from
+  `/api/bootstrap`. The idle guard narrows the Brain window; a per-client or
+  UI-confirmed authority token is the durable fix.

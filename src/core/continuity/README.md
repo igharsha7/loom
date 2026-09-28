@@ -10,7 +10,7 @@ project identity. Native harnesses execute the turn; Brain constructs evidence.
 - `engine.ts`: source/scope validation, mandatory intent, checkpoints, snapshots
   and explicit delivery transitions.
 - `artifacts.ts`: flushed immutable source JSON for native file retrieval.
-- `capabilities.ts`: fixture-backed version checks; unknown is unsupported.
+- `capabilities.ts`: bounded `--version` probe and `HarnessMonitor` (20 s reachability poll); any reachable version runs.
 
 EventLog captures a request and its original message transactionally, then publishes.
 Submission intent commits before calling the harness. Receipts, rendered text and
@@ -26,5 +26,6 @@ only its own temporary project and makes no model calls.
 Read [the guide](../../../docs/brain-continuity.md),
 [architecture](../../../ARCHITECTURE.md) and
 [remaining gates](../../../docs/refactoring/BRAIN-TODO.md) before changing lifecycle
-or deciding a source may be omitted. Helpers, compaction observation, retention/GC
-and OpenCode parity remain gated.
+or deciding a source may be omitted. Helpers, retention/GC and OpenCode parity
+remain gated. Adapter tests use protocol fakes (`test/native-fakes.ts`), never the
+real harnesses.

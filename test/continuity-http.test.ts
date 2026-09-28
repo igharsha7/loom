@@ -1,6 +1,6 @@
 import path from "node:path";
 import type { Express, Request, Response } from "express";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { ProjectRuntime } from "../src/daemon/runtime.js";
 import { registerBrainRoutes } from "../src/daemon/routes/brain.js";
 import { registerMessagesRoutes } from "../src/daemon/routes/messages.js";
@@ -78,4 +78,15 @@ it("bounds diagnostics inputs and exposes explicit index rebuild", async () => {
   expect((await call("GET", "", { query: { requestId: "x".repeat(257) } })).status).toBe(400);
   expect((await call("POST", "/search/rebuild", { body: {} })).body).toMatchObject({ rebuilt: true });
   expect((await call("POST", "/search/rebuild", { body: { unknown: true } })).status).toBe(400);
+});
+it("refuses user-authority writes while an agent turn is running", async () => {
+  const { call, brain } = await routes();
+  const { event } = brain.capture({ id: "said", conversationId: "main", agentInstanceId: "codex", text: "keep tabs", source: "user", model: null, plan: false, targetAddedTokens: 6000 });
+  const item = { id: "i", revision: 1, conversationId: "main", kind: "instruction", text: "keep tabs", origin: "user", status: "accepted",
+    sources: [brain.store.source(event, "project")], supersedes: null };
+  const busy = vi.spyOn(runtime!, "anyBusy").mockReturnValue(true);
+  expect((await call("POST", "/items", { body: item })).status).toBe(409);
+  expect((await call("POST", "/checkpoint", { body: { chat: "main", itemId: "i", eventIds: [event.id], reviewed: true } })).status).toBe(409);
+  busy.mockRestore();
+  expect((await call("POST", "/items", { body: item })).status).toBe(200);
 });
