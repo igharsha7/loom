@@ -406,6 +406,12 @@ describe("web app · plan mode", () => {
 
 describe("web app · permissions", () => {
   it("shows the chosen agent's mode as a chip, and changes it from the dropdown", async () => {
+    // A mode change is refused mid-turn (it rebuilds the agent), and an earlier
+    // test's turn can still be finishing on a slow runner: start from idle.
+    await waitUntil(
+      async () => !(await rest<{ project: { agents: Array<{ busy?: boolean }> } }>("GET", "")).project.agents.some((a) => a.busy),
+      { timeoutMs: 30_000 },
+    );
     const m = await opened();
     await ready(m, "#cperm");
     await waitUntil(() => shown($(m, "#cperm")) && text(m, "#cperm") === "Auto");
