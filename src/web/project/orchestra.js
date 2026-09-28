@@ -308,7 +308,7 @@ export function createOrchestra(view) {
       var card = ev.target.closest && ev.target.closest(".nicard");
       if (!card) return false;
       var pick = ev.target.closest("[data-nipick]");
-      if (pick) { answerAgent(card, pick.getAttribute("data-nipick")); return true; }
+      if (pick) { answerAgent(card, pick.getAttribute("data-nipick"), pick.getAttribute("data-niqid")); return true; }
       if (ev.target.closest(".nisend")) {
         var box = card.querySelector(".nitext");
         answerAgent(card, box ? box.value : "");
@@ -328,8 +328,9 @@ export function createOrchestra(view) {
      * agent. The card carries who asked and in which thread; that is what is
      * used, whatever the composer happens to be pointed at.
      */
-    function answerAgent(card, text){
+    function answerAgent(card, text, qid){
       if (!card) return;
+      if (card.getAttribute("data-nireq")) return answerRequest(card, text, qid);
       var answer = String(text || "").trim();
       if (!answer) { var box = card.querySelector(".nitext"); if (box) box.focus(); return; }
       var who = card.getAttribute("data-niask") || undefined;
@@ -347,6 +348,43 @@ export function createOrchestra(view) {
         card.classList.add("done");
         view.refresh();
       }).catch(function(err){ toast(err.message); lock(false); });
+    }
+
+
+    /**
+     * Answer a structured question the agent's turn is waiting on. Each
+     * question takes a pick or typed words; once every one has an answer they
+     * go back to that request, and the turn carries on.
+     */
+    function answerRequest(card, text, qid){
+      var blocks = Array.prototype.slice.call(card.querySelectorAll(".niqb"));
+      var answer = String(text || "").trim();
+      if (!answer) { var box = card.querySelector(".nitext"); if (box) box.focus(); return; }
+      // Typed words answer the first question still open.
+      var target = qid || (blocks.filter(function(b){ return !b.getAttribute("data-nians"); })[0] || blocks[0]).getAttribute("data-niqid");
+      blocks.forEach(function(b){
+        if (b.getAttribute("data-niqid") !== target) return;
+        b.setAttribute("data-nians", answer);
+        Array.prototype.forEach.call(b.querySelectorAll("[data-nipick]"), function(o){ o.classList.toggle("sel", o.getAttribute("data-nipick") === answer); });
+      });
+      var t = card.querySelector(".nitext"); if (t && !qid) t.value = "";
+      if (blocks.some(function(b){ return !b.getAttribute("data-nians"); })) return;
+      var answers = {};
+      blocks.forEach(function(b){ answers[b.getAttribute("data-niqid")] = b.getAttribute("data-nians"); });
+      var who = card.getAttribute("data-niask");
+      var where = card.getAttribute("data-nichat") || view.chatId;
+      Array.prototype.forEach.call(card.querySelectorAll("button,input"), function(el){ el.disabled = true; });
+      api("/api/projects/" + view.pid + "/agents/" + encodeURIComponent(who) + "/answers", {
+        method: "POST",
+        body: JSON.stringify({ chat: where, requestId: card.getAttribute("data-nireq"), answers: answers }),
+      }).then(function(){
+        var done = card.querySelector(".nidone");
+        if (done) done.textContent = "\u21b3 " + Object.keys(answers).map(function(k){ return answers[k]; }).join(" \u00b7 ");
+        card.classList.add("done");
+      }).catch(function(err){
+        toast(err.message);
+        Array.prototype.forEach.call(card.querySelectorAll("button,input"), function(el){ el.disabled = false; });
+      });
     }
 
 

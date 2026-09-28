@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs";
-import { codexBin } from "../../adapters/codex.js";
-import { claudeBin } from "../../adapters/claude-code.js";
+import { codexBin } from "../../providers/codex/adapter.js";
+import { claudeBin } from "../../providers/claude/adapter.js";
 import { digest } from "./contracts.js";
 
 const exec = promisify(execFile);

@@ -15,8 +15,8 @@ import { listProviders } from "./providers.js";
 import type { AgentConfig } from "../types.js";
 import { agyBin } from "../adapters/antigravity-cli.js";
 import { cliAvailable } from "../adapters/base.js";
-import { claudeBin } from "../adapters/claude-code.js";
-import { codexBin } from "../adapters/codex.js";
+import { claudeBin } from "../providers/claude/adapter.js";
+import { codexBin } from "../providers/codex/adapter.js";
 import { grokBin } from "../adapters/grok.js";
 
 interface AdeCommon {

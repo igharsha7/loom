@@ -87,6 +87,23 @@ import { orchGoalName } from './team.js';
       // answer sent it to the wrong agent entirely (#106).
       var q = String(p.question || "what next?");
       var who = String(e.agentId || "agent");
+      // A structured question the turn is waiting on: its own options, and the
+      // answer goes back to that request rather than as a new message.
+      if (p.requestId && p.responseMode !== "message" && Array.isArray(p.questions) && p.questions.length) {
+        return '<div class="nicard" data-niask="' + esc(who) + '" data-nichat="' + esc(e.chat || "") + '" data-nireq="' + esc(p.requestId) + '">' +
+          '<div class="nih">' + brandMark(kindOf(who)) + '<span class="niwho">' + esc(who) + "</span>" +
+          '<span class="nitag">needs you</span></div>' +
+          p.questions.map(function(qq){
+            return '<div class="niqb" data-niqid="' + esc(qq.id) + '">' + (qq.header ? '<div class="nitag">' + esc(qq.header) + "</div>" : "") +
+              '<div class="niq">' + esc(qq.question) + "</div>" +
+              ((qq.options || []).length ? '<div class="niopts">' + qq.options.map(function(o){
+                return '<button class="nio" type="button" data-nipick="' + esc(o.label) + '" data-niqid="' + esc(qq.id) + '" title="' + esc(o.description || "") + '">' + esc(o.label) + "</button>";
+              }).join("") + "</div>" : "") + "</div>";
+          }).join("") +
+          '<div class="nirow"><input class="nitext" placeholder="or answer in your words…" spellcheck="false">' +
+          '<button class="btn primary xs nisend" type="button">Send</button></div>' +
+          '<div class="nidone"></div></div>';
+      }
       var opts = questionChoices(q);
       return '<div class="nicard" data-niask="' + esc(who) + '" data-nichat="' + esc(e.chat || "") + '">' +
         '<div class="nih">' + brandMark(kindOf(who)) + '<span class="niwho">' + esc(who) + "</span>" +

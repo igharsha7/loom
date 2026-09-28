@@ -5,8 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { EventLog } from "../src/core/eventlog.js";
 import { ContinuityEngine, renderPacket, estimateTokens } from "../src/core/continuity/engine.js";
 import { ContextPacketV1, digest, parseBounded, RequestV1, NativeDispatchRejected, NativeQuiescenceUnknown, NativeSessionMissing, type ContextItem } from "../src/core/continuity/contracts.js";
-import { ClaudeCodeAdapter } from "../src/adapters/claude-code.js";
-import { CodexAdapter } from "../src/adapters/codex.js";
+import { ClaudeCodeAdapter } from "../src/providers/agent.js";
+import { CodexAdapter } from "../src/providers/agent.js";
 import { ProjectRuntime } from "../src/daemon/runtime.js";
 import { RuntimeAgents } from "../src/daemon/runtime/agents.js";
 import { AdapterBase } from "../src/adapters/base.js";
@@ -14,7 +14,7 @@ import { ContextArtifacts } from "../src/core/continuity/artifacts.js";
 import { HarnessMonitor } from "../src/core/continuity/capabilities.js";
 import { makeProjectDir, tmpDir, waitUntil } from "./helpers.js";
 import type { SendInput } from "../src/types.js";
-import { CLAUDE_OK, CODEX_OK, callsOf, claudeInit, claudeInitOf, claudePromptOf, claudeResult, claudeText, fakeClaude, fakeCodex, rpcOf } from "./native-fakes.js";
+import { CLAUDE_OK, CODEX_OK, callsOf, claudeInit, claudeInitOf, claudePromptOf, claudeResult, claudeText, fakeClaude, fakeCodex, rpcOf, turnsOf } from "./native-fakes.js";
 
 const open: Array<{ close: () => void | Promise<void> }> = [];
 afterEach(async () => { for (const item of open.splice(0).reverse()) await item.close(); });
@@ -217,14 +217,17 @@ describe("Brain cleanup regressions", () => {
     }
     brain.settled(continuity.runId, new NativeDispatchRejected("no launch"));
   });
-  it.skipIf(process.platform === "win32")("terminates inherited tool children before reporting completion", async () => {
-    const { brain, log, dir } = await setup(), marker = path.join(dir, "child-writes");
-    const childScript = `const fs=require('node:fs'); setInterval(()=>fs.appendFileSync(${JSON.stringify(marker)},'x'),20);`;
-    const bin = fakeCodex({ script: [{ spawn: childScript }, { sleep: 200 }, ...CODEX_OK] });
+  // Turn-level settlement: the session stays warm, and a turn settles once the
+  // harness reports it done and no command it started is still running.
+  it("settles a turn only once its running commands have finished", async () => {
+    const { brain, log, dir } = await setup();
+    const command = (type: string, status: string) => ({ out: { method: type, params: { threadId: "$THREAD", turnId: "$TURN",
+      item: { id: "cmd-1", type: "commandExecution", command: "sleep 1", status, exitCode: status === "completed" ? 0 : null } } } });
+    const bin = fakeCodex({ script: [CODEX_OK[0]!, command("item/started", "inProgress"), ...CODEX_OK.slice(1), { sleep: 400 }, command("item/completed", "completed")] });
+    const started = Date.now();
     await runNative(brain, log, dir, request(brain), "codex", bin);
-    const after = fs.readFileSync(marker, "utf8");
-    await new Promise(resolve => setTimeout(resolve, 100));
-    expect(fs.readFileSync(marker, "utf8")).toBe(after);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(350);
+    expect(log.list().some(e => e.kind === "tool_call" && e.payload.tool === "shell")).toBe(true);
     expect(brain.store.activeReceipts()).toHaveLength(0);
   }, 12_000);
   it("rejects unsupported orchestra before creating a run or conversation", async () => {
@@ -256,10 +259,11 @@ describe("Brain cleanup regressions", () => {
       await runtime.sendMessage("change first", "codex", { requestId: "commit-first" });
       await waitUntil(() => fs.existsSync(marker));
       const next = await runtime.sendMessage("change second", "codex", { requestId: "commit-next" });
-      expect(next.queued).toBe(1); expect(calls(bin)).toHaveLength(1);
+      expect(next.queued).toBe(1); expect(turnsOf(bin)).toHaveLength(1);
     } finally { fs.writeFileSync(release, "go"); }
     await waitUntil(() => runtime.continuity!.store.receipts("commit-next").at(-1)?.execution === "complete" && !runtime.anyBusy());
-    expect(calls(bin)).toHaveLength(2);
+    // Both turns ran on one warm app-server.
+    expect(turnsOf(bin)).toHaveLength(2); expect(calls(bin)).toHaveLength(1);
     expect(execFileSync("git", ["log", "--oneline"], { cwd: dir, encoding: "utf8" }).trim().split("\n")).toHaveLength(3);
   }, 10_000);
   it("bounds native output records before importing oversized partial responses", async () => {

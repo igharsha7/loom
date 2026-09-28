@@ -9,14 +9,17 @@
  * wrong, which you can't summon on demand and shouldn't pay for.
  */
 
-import { afterEach, describe, expect, it } from "vitest";
-import { ClaudeCodeAdapter } from "../src/adapters/claude-code.js";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { ClaudeCodeAdapter, stopAllProviderSessions } from "../src/providers/agent.js";
 import { setApprovalBroker, type ApprovalRequest } from "../src/core/approvals.js";
 import { NativeSessionMissing } from "../src/core/continuity/contracts.js";
 import type { AdapterEvent, SendInput } from "../src/types.js";
 import { makeProjectDir } from "./helpers.js";
 import { CLAUDE_OK, callsOf, claudeInit, claudeInitOf, claudePromptOf, claudeResult, claudeText, claudeThink, claudeTool,
   fakeClaude, stdinOf, type FakeClaudeOptions, type Step } from "./native-fakes.js";
+
+// Provider sessions stay warm between turns; end them with the file.
+afterAll(async () => { await stopAllProviderSessions(); });
 
 afterEach(() => setApprovalBroker(null));
 
@@ -75,10 +78,14 @@ describe("claude-code · a normal turn", () => {
     expect(flag(callsOf(second.bin)[0]!, "--resume")).toBe(session);
   });
 
-  it("passes a handoff briefing through the system-prompt channel, not the prompt", async () => {
+  /**
+   * A warm session's system prompt is fixed when it starts, so a handoff
+   * briefing rides in front of the turn's text, framed as authoritative.
+   */
+  it("puts a handoff briefing in front of the prompt, framed", async () => {
     const { bin } = await run(CLAUDE_OK, {}, { text: "go", briefing: "you are picking up from opencode" });
-    expect(claudeInitOf(bin).appendSystemPrompt).toBe("you are picking up from opencode");
-    expect(claudePromptOf(bin)).toBe("go");
+    expect(claudeInitOf(bin).appendSystemPrompt).toBeUndefined();
+    expect(claudePromptOf(bin)).toMatch(/LOOM SESSION MEMORY[\s\S]*you are picking up from opencode[\s\S]*\n\ngo$/);
   });
 
   it("loads Claude Code's own settings, as an interactive claude would", async () => {
@@ -114,7 +121,8 @@ describe("claude-code · a normal turn", () => {
 describe("claude-code · what it did, not just what it said", () => {
   it("reports tool calls with a readable summary", async () => {
     const { events } = await run([claudeInit, claudeTool("Bash", { command: "npm test" }), claudeText("green"), claudeResult()]);
-    expect(of(events, "tool_call")[0]).toMatchObject({ tool: "Bash" });
+    // Commands are one canonical kind across providers.
+    expect(of(events, "tool_call")[0]).toMatchObject({ tool: "shell" });
     expect(String(of(events, "tool_call")[0]?.summary)).toContain("npm test");
   });
 
@@ -123,9 +131,9 @@ describe("claude-code · what it did, not just what it said", () => {
    * must fire for the tools that write and stay quiet for the ones that don't.
    */
   it("raises file_edit for writes, and not for reads", async () => {
-    const { events } = await run([claudeInit, claudeTool("Read", { file_path: "/repo/read-only.ts" }),
-      claudeTool("Edit", { file_path: "/repo/changed.ts" }), claudeTool("Write", { file_path: "/repo/new.ts" }), claudeResult()]);
-    expect(of(events, "file_edit").map((p) => p.path)).toEqual(["/repo/changed.ts", "/repo/new.ts"]);
+    const { events } = await run([claudeInit, claudeTool("Read", { file_path: "src/read-only.ts" }),
+      claudeTool("Edit", { file_path: "src/changed.ts" }), claudeTool("Write", { file_path: "src/new.ts" }), claudeResult()]);
+    expect(of(events, "file_edit").map((p) => p.path)).toEqual(["src/changed.ts", "src/new.ts"]);
   });
 
   it("surfaces extended-thinking blocks as reasoning, kept apart from the reply", async () => {
@@ -142,8 +150,8 @@ describe("claude-code · what it did, not just what it said", () => {
   });
 
   it("follows a notebook edit to its notebook", async () => {
-    const { events } = await run([claudeInit, claudeTool("NotebookEdit", { notebook_path: "/repo/nb.ipynb" }), claudeResult()]);
-    expect(of(events, "file_edit")[0]).toMatchObject({ path: "/repo/nb.ipynb", tool: "NotebookEdit" });
+    const { events } = await run([claudeInit, claudeTool("NotebookEdit", { notebook_path: "nb.ipynb" }), claudeResult()]);
+    expect(of(events, "file_edit")[0]).toMatchObject({ path: "nb.ipynb", tool: "NotebookEdit" });
   });
 });
 
@@ -232,12 +240,13 @@ describe("claude-code · when it needs you", () => {
 });
 
 describe("claude-code · when it goes wrong", () => {
-  it("surfaces an error result and still finishes the turn", async () => {
+  it("surfaces an error result as the turn's end", async () => {
     const { events, error } = await run([claudeInit,
       claudeResult({ subtype: "error_during_execution", is_error: true, errors: ["rate limited"] })]);
     expect(of(events, "error")[0]).toMatchObject({ message: "rate limited" });
-    // a reported error is a completed turn, not a crashed adapter
-    expect(kinds(events)).toContain("run_complete");
+    // a failed turn is an error, not a completion (t3code's rule); the error
+    // event ends it, so send() does not report it a second time
+    expect(kinds(events)).not.toContain("run_complete");
     expect(error).toBeUndefined();
   });
 
@@ -323,7 +332,7 @@ describe("claude-code · continuity", () => {
 
 describe("claude-code · interrupt", () => {
   it("stops a running turn and says it was interrupted", async () => {
-    const bin = fakeClaude({ script: [claudeInit, { sleep: 10_000 }, claudeText("never gets here"), claudeResult()] });
+    const bin = fakeClaude({ scripts: [[claudeInit, { sleep: 10_000 }, claudeText("never gets here"), claudeResult()]], script: CLAUDE_OK });
     const agent = new ClaudeCodeAdapter("claude-code", makeProjectDir({ name: "cc" }), { bin });
     const events: AdapterEvent[] = [];
     agent.onEvent((e) => events.push(e));
@@ -335,8 +344,13 @@ describe("claude-code · interrupt", () => {
     // interrupted is not completed, and the interrupt's own error result is not an error
     expect(kinds(events)).not.toContain("run_complete");
     expect(kinds(events)).not.toContain("error");
-    expect(stdinOf(bin).some((m) => (m.request as Record<string, unknown> | undefined)?.subtype === "interrupt")).toBe(true);
+    // A hard boundary, as t3code has it: the session's process is gone, and the
+    // next turn resumes the same native session.
     expect(agent.busy()).toBe(false);
+    await agent.send({ text: "again" });
+    const launches = callsOf(bin);
+    expect(launches).toHaveLength(2);
+    expect(flag(launches[1]!, "--resume")).toBe(flag(launches[0]!, "--session-id"));
   }, 20_000);
 
   it("is a no-op when nothing is running", async () => {

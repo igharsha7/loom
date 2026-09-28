@@ -13,8 +13,7 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { ClaudeCodeAdapter } from "../src/adapters/claude-code.js";
-import { CodexAdapter } from "../src/adapters/codex.js";
+import { ClaudeCodeAdapter, CodexAdapter, stopAllProviderSessions } from "../src/providers/agent.js";
 import { mcpKey, probeMcpServer, resolveMcpServers, writeMcpSession } from "../src/core/mcp.js";
 import { ProjectRuntime } from "../src/daemon/runtime.js";
 import type { McpServerConfig, McpTurnConfig } from "../src/types.js";
@@ -37,6 +36,8 @@ const CONFIGURED: McpServerConfig[] = [
 
 const sessions: Array<{ cleanup: () => void }> = [];
 afterAll(() => sessions.forEach((s) => s.cleanup()));
+// Provider sessions stay warm between turns; end them with the file.
+afterAll(async () => { await stopAllProviderSessions(); });
 
 describe("selecting servers", () => {
   it("takes the ones with somewhere to connect to, and leaves the placeholders out", () => {

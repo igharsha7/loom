@@ -6,16 +6,21 @@ tool before the adapter was written. Re-verify when versions move.
 ## Claude Code (verified: v2.1.278, Agent SDK 0.3.283)
 
 Loom drives the user's installed `claude` through the Claude Agent SDK
-(`@anthropic-ai/claude-agent-sdk`), one `query()` per turn, the way t3code does.
-The SDK speaks the CLI's stream-json control protocol over stdio:
+(`@anthropic-ai/claude-agent-sdk`), one warm streaming-input `query()` per chat
+session, the way t3code does (`src/providers/claude/adapter.ts`). Each turn is one
+more user message on the open stream. The SDK speaks the CLI's stream-json control
+protocol over stdio:
 
 ```
 claude --output-format stream-json --verbose --input-format stream-json \
   --permission-prompt-tool stdio --setting-sources=user,project,local \
-  --permission-mode <mode> [--resume=<session-id>] [--model <m>] [--mcp-config <json>]
-stdin:  control_request {subtype: "initialize", appendSystemPrompt?}  → control_response
-        {type: "user", message: {content: [{type: "text", text}]}}
+  --permission-mode <mode> (--session-id=<uuid> | --resume=<uuid>) [--model <m>]
+  [--include-partial-messages] [--mcp-config <json>]
+stdin:  control_request {subtype: "initialize"}  → control_response
+        {type: "user", message: {content: [{type: "text", text}]}, uuid: <turn id>}  (per turn)
+        control_request {subtype: "set_model", model}                          (model switch)
 stdout: system/init (session_id) · system/status (requesting | compacting) ·
+        stream_event (message_start, content_block_delta text/thinking) ·
         system/compact_boundary {pre_tokens, post_tokens} · assistant (content, usage) ·
         rate_limit_event {utilization 0–1, rateLimitType, resetsAt s} ·
         result (usage, total_cost_usd, modelUsage[*].contextWindow)
@@ -24,17 +29,22 @@ stdout: system/init (session_id) · system/status (requesting | compacting) ·
 - `pathToClaudeCodeExecutable` points the SDK at the user's `claude`, so the
   signed-in version runs. `spawnClaudeCodeProcess` lets Loom spawn it in its own
   process group (quiescence for Brain), and capture stderr.
-- `systemPrompt: {type: "preset", preset: "claude_code", append}` and
+- `systemPrompt: {type: "preset", preset: "claude_code"}` and
   `settingSources: ["user", "project", "local"]` reproduce an interactive
-  `claude`; the SDK loads neither by default. The handoff briefing is `append`.
+  `claude`; the SDK loads neither by default. A warm session's system prompt is
+  fixed when it starts, so a handoff briefing rides in front of the turn's text.
+- The session id is chosen up front (`--session-id`, a UUID) and is the resume
+  cursor; `initializationResult()` proves the session opened before any prompt.
 - Permissions: "ask" is `permissionMode: default` with `canUseTool` answered
   in-process by Loom's approval broker (no MCP shim); "auto" is `acceptEdits`;
   "bypass" is `bypassPermissions` with `allowDangerouslySkipPermissions`.
-- Interrupt is the `interrupt` control request; the CLI answers with an
-  `error_during_execution` result and exits. Loom reports `interrupted`, not an error.
+- Interrupt closes the session (query and process group), as t3code does:
+  `interrupt()` can acknowledge while background tasks keep the CLI alive. Loom
+  reports `interrupted`; the next turn resumes the same session.
 - A resumed session that no longer exists: the CLI prints `No conversation found`
-  and exits before reading the prompt. Loom starts a new session, or with Brain
-  continuity reports `NativeSessionMissing` so Brain rebuilds into a new epoch.
+  and exits before reading the prompt; `initializationResult()` rejects with it
+  (verified live, 2.1.x). Loom starts a new session, or with Brain continuity
+  reports `NativeSessionMissing` so Brain rebuilds into a new epoch.
 - Context in use is the main thread's last response usage (input + cache read +
   cache creation + output); the window comes from the result's `modelUsage`.
 - The SDK package pulls a platform binary as an optional dependency (~228 MB);
@@ -42,14 +52,19 @@ stdout: system/init (session_id) · system/status (requesting | compacting) ·
 
 ## Codex (verified: codex-cli 0.153.4)
 
-Loom drives `codex app-server`, one process per turn: newline-delimited JSON-RPC
-(`{id, method, params}`, no `jsonrpc` field), the protocol t3code uses.
+Loom keeps one warm `codex app-server` per chat session
+(`src/providers/codex/adapter.ts`): newline-delimited JSON-RPC (`{id, method,
+params}`, no `jsonrpc` field), the protocol t3code uses. The thread stays open, so
+each turn is one `turn/start` on the same connection.
 
 ```
 initialize {clientInfo, capabilities: {experimentalApi: true}} → initialized
 thread/start {cwd, sandbox, approvalPolicy, model?, config?}
   | thread/resume {threadId, excludeTurns: true, …same}
-turn/start {threadId, input: [{type: "text", text, text_elements: []}], clientUserMessageId?}
+turn/start {threadId, input: [{type: "text", text, text_elements: []}], model?, effort?,
+  clientUserMessageId?}
+… item/agentMessage/delta · item/reasoning/textDelta · item/reasoning/summaryTextDelta ·
+  item/commandExecution/outputDelta · turn/plan/updated · turn/diff/updated · model/rerouted
 … item/started · item/completed (agentMessage, reasoning, commandExecution, fileChange,
   mcpToolCall, webSearch, contextCompaction) · thread/tokenUsage/updated
   {total, last, modelContextWindow} · account/rateLimits/updated · error {willRetry}
@@ -70,6 +85,20 @@ turn/interrupt {threadId, turnId}
 - The account's own default model comes from `~/.codex/config.toml`. A model the
   account can't use fails the turn with Codex's 400; `model/list` says which
   models the account offers.
+
+### Warm sessions and Brain continuity
+
+A session per (chat, agent) stays up between turns and is reaped after 30 minutes
+idle (its binding keeps the resume cursor). A turn — Brain continuity turns included
+— settles at turn level: the provider reported it complete and no command it started
+(`commandExecution` / Bash item) is still running.
+
+Plan mode: Codex `turn/start.collaborationMode {mode: "plan" | "default", settings:
+{model, reasoning_effort, developer_instructions}}`; Claude `setPermissionMode("plan")`,
+and the plan arrives as the `ExitPlanMode` tool's input (Claude first writes it to
+`~/.claude/plans/`). Questions: Codex `item/tool/requestUserInput` → `{answers: {id:
+{answers: [..]}}}`; Claude `AskUserQuestion` through `canUseTool` → `updatedInput:
+{questions, answers: {<question text>: <label>}}`.
 
 ## OpenCode (verified: v1.17.20)
 

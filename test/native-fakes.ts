@@ -30,8 +30,10 @@ import { tmpDir } from "./helpers.js";
 export type Step = Record<string, unknown>;
 
 export interface FakeClaudeOptions {
-  /** The turn: steps run after the user message arrives. Defaults to CLAUDE_OK. */
+  /** The turn: steps run after each user message arrives. Defaults to CLAUDE_OK. */
   script?: Step[];
+  /** Per-turn scripts (turn 1, turn 2, …); a turn past the end uses `script`. */
+  scripts?: Step[][];
   /** Exit code when stdin closes (after the result). */
   code?: number;
   /** A `--resume` of any session fails as the real CLI does. */
@@ -73,7 +75,7 @@ const fill = (value, vars) => JSON.parse(JSON.stringify(value).replace(/\\$(SESS
 /** A fake `claude` for the Agent SDK. Returns its path. */
 export function fakeClaude(options: FakeClaudeOptions = {}): string {
   const dir = tmpDir("fake-claude"), bin = path.join(dir, "claude");
-  const config = { script: options.script ?? CLAUDE_OK, code: options.code ?? 0, missingSession: options.missingSession ?? false,
+  const config = { script: options.script ?? CLAUDE_OK, scripts: options.scripts ?? [], code: options.code ?? 0, missingSession: options.missingSession ?? false,
     stderr: options.stderr ?? "", version: options.version ?? "2.1.283 (Claude Code)" };
   fs.writeFileSync(bin, `#!/usr/bin/env node
 ${RUNNER}
@@ -82,16 +84,18 @@ const args = process.argv.slice(2);
 record("calls.jsonl", args);
 if (args.includes("--version")) { console.log(config.version); process.exit(0); }
 if (config.stderr) process.stderr.write(config.stderr + "\\n");
-const r = args.findIndex((a) => a === "--resume" || a.startsWith("--resume=")), resume = r < 0 ? null : args[r].includes("=") ? args[r].slice(9) : args[r + 1];
+const flag = (name) => { const i = args.findIndex((a) => a === name || a.startsWith(name + "=")); return i < 0 ? null : args[i].includes("=") ? args[i].slice(name.length + 1) : args[i + 1]; };
+const resume = flag("--resume");
 if (resume && config.missingSession) {
   process.stderr.write("No conversation found with session ID: " + resume + "\\n");
   process.exit(1);
 }
-const vars = { SESSION: resume || require("node:crypto").randomUUID() };
+const vars = { SESSION: resume || flag("--session-id") || require("node:crypto").randomUUID() };
 const pending = new Map();
-let seq = 0, interrupted = false, running = null;
-async function run() {
-  for (const step of config.script) {
+let seq = 0, turns = 0, interrupted = false, running = null;
+const queued = [];
+async function run(script) {
+  for (const step of script) {
     if (interrupted) return;
     if ("out" in step) out(fill(step.out, vars));
     else if ("raw" in step) process.stdout.write(step.raw + "\\n");
@@ -120,16 +124,30 @@ require("node:readline").createInterface({ input: process.stdin }).on("line", (l
   } else if (m.type === "control_response") {
     const resolve = pending.get(m.response.request_id);
     if (resolve) { pending.delete(m.response.request_id); resolve(m.response); }
-  } else if (m.type === "user" && !running) running = run();
+  } else if (m.type === "user") { queued.push(m); if (!running) running = drain(); }
 });
+// One CLI serves many turns: each user message runs the next script.
+async function drain() {
+  while (queued.length) {
+    queued.shift();
+    const script = config.scripts[turns] || config.script;
+    turns++;
+    interrupted = false;
+    record("turns.jsonl", { turn: turns, pid: process.pid });
+    await run(script);
+  }
+  running = null;
+}
 process.stdin.on("end", async () => { if (running && !interrupted) await running; process.exit(config.code); });
 `, { mode: 0o755 });
   return bin;
 }
 
 export interface FakeCodexOptions {
-  /** Notifications and requests after turn/start. Defaults to CODEX_OK. */
+  /** Notifications and requests after each turn/start. Defaults to CODEX_OK. */
   script?: Step[];
+  /** Per-turn scripts (turn 1, turn 2, …); a turn past the end uses `script`. */
+  scripts?: Step[][];
   /** thread/resume answers "no rollout found". */
   missingThread?: boolean;
   /** turn/start is refused with an error response. */
@@ -163,7 +181,7 @@ export const CODEX_OK: Step[] = [
 /** A fake `codex` that serves `app-server`. Returns its path. */
 export function fakeCodex(options: FakeCodexOptions = {}): string {
   const dir = tmpDir("fake-codex"), bin = path.join(dir, "codex");
-  const config = { script: options.script ?? CODEX_OK, missingThread: options.missingThread ?? false,
+  const config = { script: options.script ?? CODEX_OK, scripts: options.scripts ?? [], missingThread: options.missingThread ?? false,
     refuseTurn: options.refuseTurn ?? null, dieAtStart: options.dieAtStart ?? null, model: options.model ?? "gpt-test",
     version: options.version ?? "codex-cli 0.155.0" };
   fs.writeFileSync(bin, `#!/usr/bin/env node
@@ -174,12 +192,12 @@ record("calls.jsonl", args);
 if (args.includes("--version")) { console.log(config.version); process.exit(0); }
 if (args[0] !== "app-server") { console.error("unexpected args"); process.exit(2); }
 if (config.dieAtStart) { process.stderr.write(config.dieAtStart.stderr + "\\n"); process.exit(config.dieAtStart.code); }
-const vars = { THREAD: "", TURN: "turn-" + process.pid, SESSION: "" };
+const vars = { THREAD: "", TURN: "", SESSION: "" };
 const pending = new Map();
-let seq = 0, interrupted = false;
+let seq = 0, turns = 0, interrupted = false;
 const reply = (id, result) => out({ id, result });
-async function run() {
-  for (const step of config.script) {
+async function run(script) {
+  for (const step of script) {
     if (interrupted) return;
     if ("out" in step) out(fill(step.out, vars));
     else if ("raw" in step) process.stdout.write(step.raw + "\\n");
@@ -211,8 +229,16 @@ require("node:readline").createInterface({ input: process.stdin }).on("line", (l
       return reply(m.id, { thread: { id: vars.THREAD }, model: config.model });
     case "turn/start":
       if (config.refuseTurn) return out({ id: m.id, error: { code: -32600, message: config.refuseTurn } });
+      // One app-server serves many turns on the same thread.
+      turns++;
+      vars.TURN = "turn-" + process.pid + "-" + turns;
+      interrupted = false;
+      record("turns.jsonl", { turn: turns, pid: process.pid, thread: vars.THREAD });
       reply(m.id, { turn: { id: vars.TURN, items: [], status: "inProgress", error: null } });
-      void run();
+      void run(config.scripts[turns - 1] || config.script);
+      return;
+    case "thread/compact/start":
+      reply(m.id, {});
       return;
     case "turn/interrupt":
       interrupted = true;
@@ -257,3 +283,10 @@ export const claudePromptOf = (bin: string): string => {
 /** The last SDK initialize request a fake claude received. */
 export const claudeInitOf = (bin: string): Record<string, unknown> =>
   ((stdinOf(bin).filter((m) => m.type === "control_request" && (m.request as Record<string, unknown>)?.subtype === "initialize").at(-1)?.request) ?? {}) as Record<string, unknown>;
+
+/** Every turn a fake served: `{ turn, pid }` per turn, in order. */
+export const turnsOf = (bin: string): Array<{ turn: number; pid: number; thread?: string }> => {
+  const file = path.join(path.dirname(bin), "turns.jsonl");
+  if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as { turn: number; pid: number; thread?: string });
+};

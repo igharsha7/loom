@@ -105,8 +105,9 @@ Users then declare it in `.loom/config.json`:
 ```
 
 `cfg.options` arrives in your constructor if you define one — see
-`src/adapters/claude-code.ts` and `src/adapters/opencode.ts` for real examples,
-including session persistence via project state.
+`src/adapters/opencode.ts` for a real example, including session persistence via
+project state. Codex and Claude Code are built differently — as warm provider
+sessions on the contract in `src/providers/` (see `providers/agent.ts`).
 
 ### A bridge
 

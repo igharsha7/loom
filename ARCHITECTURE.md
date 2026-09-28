@@ -38,8 +38,10 @@ flowchart TD
 | `core/continuity/capabilities.ts` | Bounded binary/version probe, protocol profiles and the 20 s `HarnessMonitor` reachability poll. |
 | `core/continuity/artifacts.ts` | Flush and atomically finalize content-addressed source JSON before packets reference it. |
 | `daemon/runtime/turns.ts` | Captured targets/models, sequential dispatch, queueing, preparation cancellation and cleanup. |
-| `adapters/codex.ts`, `adapters/codex-rpc.ts` | Codex over `codex app-server` JSON-RPC, one process group per turn: thread start/resume, turn start/interrupt, items, token usage and context window, compaction, rate limits, approval requests. |
-| `adapters/claude-code.ts` | Claude Code over the Claude Agent SDK, pointed at the installed `claude` and spawned by Loom in its own process group: resume, `canUseTool` approvals, interrupt, compaction status, context window, rate limits. |
+| `providers/` | t3code's provider core, ported ([the port](docs/proposals/t3code-port.md)): the adapter contract and canonical runtime events, `ProviderService` routing (chat, agent) to warm sessions, the session directory (`.loom/providers/sessions.json`) and idle reaper, ingestion into Loom's log, the approval bridge, and coalesced live deltas. |
+| `providers/codex/` | Codex on the contract: one warm `codex app-server` per chat session (JSON-RPC, own process group); thread start/resume, turns and interrupts on one connection, items and deltas, token usage and context window, compaction, rate limits, approval requests. |
+| `providers/claude/` | Claude Code on the contract: one warm Agent SDK streaming-input query per chat session, pointed at the installed `claude` and spawned in its own process group; session id chosen up front, `setModel` in-session, `canUseTool` approvals, compaction, context window, rate limits. |
+| `providers/agent.ts` | `ProviderAgent`: the runtime's Adapter over a warm session per chat. One `ProviderService` per working directory. Sessions stay warm; a turn settles when the harness reports it done and no command it started is running. Questions, plan mode, compaction. |
 | `daemon/runtime/native-usage.ts` | Latest context-in-use, compaction state and provider usage-limit readings per native agent, for status and the composer meter. |
 | `daemon/runtime/agents.ts` | Instance lifecycle; a failed stop remains a rejected successor barrier. |
 | Native adapters | Explicit scoped session IDs, ordinary turn context, correlated events and POSIX process-group/parent-exit containment and bounded output-drain evidence. |

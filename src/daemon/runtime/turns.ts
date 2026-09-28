@@ -25,6 +25,7 @@ import type {
 } from "../../types.js";
 import { MAIN_CHAT, isAdapter } from "../../types.js";
 import { planModeBriefing } from '../runtime-support.js';
+import { ProviderAgent } from "../../providers/agent.js";
 import { randomUUID } from "node:crypto";
 import { ContinuityError, NativeDispatchRejected } from "../../core/continuity/contracts.js";
 import type { ContinuityEngine } from "../../core/continuity/engine.js";
@@ -373,8 +374,11 @@ export class RuntimeTurns {
       const pendingBriefing = this.host.consumePendingBriefing(target);
       // Prepend the enabled skills so every turn carries them, alongside any
       // one-shot handoff briefing. Empty when no skills are on.
+      // A provider agent plans in its own plan mode; the plan it proposes is
+      // saved under plans/ by the runtime. Other agents get Loom's briefing.
+      const nativePlan = Boolean(opts.plan) && agent instanceof ProviderAgent;
       const briefing =
-        [this.host.activeSkillsBlock(), pendingBriefing, opts.plan ? planModeBriefing(text) : ""]
+        [this.host.activeSkillsBlock(), pendingBriefing, opts.plan && !nativePlan ? planModeBriefing(text) : ""]
           .filter(Boolean)
           .join("\n")
           .trim() || undefined;
@@ -388,6 +392,8 @@ export class RuntimeTurns {
       const perTurnModel = bound.agentId === target ? bound.model : undefined;
       const input: SendInput = {
         text,
+        chat,
+        ...(nativePlan ? { interactionMode: "plan" as const } : {}),
         ...(briefing ? { briefing } : {}),
         ...(perTurnModel ? { model: perTurnModel } : {}),
         ...(mcp ? { mcp: { configPath: mcp.configPath, servers: mcp.servers } } : {}),
@@ -487,7 +493,8 @@ export class RuntimeTurns {
       this.preTurnTree.set(target, await porcelainStatus(this.host.agentDir(target)));
       await this.checkpointBefore(target, text);
       assertPrepared();
-      const supplement = [this.host.activeSkillsBlock(), opts.plan ? planModeBriefing(text) : ""].filter(Boolean).join("\n");
+      const nativePlan = Boolean(opts.plan) && agent instanceof ProviderAgent;
+      const supplement = [this.host.activeSkillsBlock(), opts.plan && !nativePlan ? planModeBriefing(text) : ""].filter(Boolean).join("\n");
       let prepared = await brain.prepare({ ...request, targetAddedTokens: opts.contextTarget ?? request.targetAddedTokens }, cfg.kind,
         this.host.agentDir(target), options, supplement);
       assertPrepared();
@@ -516,7 +523,7 @@ export class RuntimeTurns {
       }
       runId = continuity.runId;
       this.preparing.delete(target);
-      const input: SendInput = { text, continuity,
+      const input: SendInput = { text, chat, continuity, ...(nativePlan ? { interactionMode: "plan" as const } : {}),
         ...(request.model ? { model: request.model } : {}), ...(mcp ? { mcp: { configPath: mcp.configPath, servers: mcp.servers } } : {}) };
       // Never consume a legacy handoff briefing into the new packet path.
       this.host.pendingBriefings.delete(target);

@@ -38,12 +38,13 @@ export function registerApprovalsRoutes(app: Express, ctx: Pick<RouteContext, "a
       const a = ctx.approvals.get(String(req.params.approvalId));
       if (!a || a.projectId !== rt.info.id) return void res.status(404).json({ error: "no such approval (already answered?)" });
       const b = (req.body ?? {}) as { decision?: string; message?: string };
-      if (b.decision !== "allow" && b.decision !== "deny") {
-        return void res.status(400).json({ error: 'decision must be "allow" or "deny"' });
+      if (b.decision !== "allow" && b.decision !== "allow_session" && b.decision !== "deny") {
+        return void res.status(400).json({ error: 'decision must be "allow", "allow_session" or "deny"' });
       }
+      if (b.decision === "allow_session" && !a.sessionOption) return void res.status(400).json({ error: "this request can't be allowed for the session" });
       a.settle(
-        b.decision === "allow"
-          ? { behavior: "allow" }
+        b.decision === "allow" ? { behavior: "allow" }
+          : b.decision === "allow_session" ? { behavior: "allow", scope: "session" }
           : { behavior: "deny", message: String(b.message ?? "Denied in Loom.").slice(0, 500) },
       );
       res.json({ ok: true });

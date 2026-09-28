@@ -400,6 +400,18 @@ export interface ProjectInfo {
 
 export interface SendInput {
   text: string;
+  /**
+   * The conversation this turn belongs to (default: the main chat). Provider
+   * agents keep one native session per chat, so each conversation has its own
+   * native history.
+   */
+  chat?: string;
+  /**
+   * "plan": the agent investigates and proposes a plan without changing
+   * anything, in its own plan mode (Codex collaboration mode, Claude's plan
+   * permission mode). Provider agents only.
+   */
+  interactionMode?: "default" | "plan";
   /** App-owned conversation binding; native IDs never cross chat/workspace scopes.
    * Context is injected into the ordinary input on every invocation. */
   continuity?: { runId: string; bindingId: string; sessionEpoch: number;

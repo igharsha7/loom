@@ -95,6 +95,8 @@ import { RuntimeTurns, type TurnOptions, type TurnResult } from './runtime/turns
 import { ContinuityEngine } from "../core/continuity/engine.js";
 import { ContinuityError } from "../core/continuity/contracts.js";
 import { HarnessMonitor, isNativeKind } from "../core/continuity/capabilities.js";
+import { ProviderAgent } from "../providers/agent.js";
+import { LiveDeltaThrottle, type LiveFrame } from "../providers/live.js";
 export { BudgetExceededError, CLOCK_TICK_MS, LOOM_ASK_TIMEOUT_MESSAGE, LOOM_ASK_TIMEOUT_MS, LoomAskTimeoutError, QuarantinedError, type ServerFrame, type TeamBrainHook, activityLine, planModeBriefing, relativeToProject, withLoomAskTimeout } from './runtime-support.js';
 
 export class ProjectRuntime {
@@ -131,6 +133,9 @@ export class ProjectRuntime {
   /** One preview proxy per server — see core/preview-proxy.ts. */
   private proxies = new Map<string, PreviewProxy>();
   private serverListeners = new Set<(f: ServerFrame) => void>();
+  private liveListeners = new Set<(d: LiveFrame) => void>();
+  /** Streamed text and tool progress from provider agents, coalesced for clients. Not persisted. */
+  private readonly live = new LiveDeltaThrottle((d) => { for (const cb of this.liveListeners) cb(d); });
 
   private constructor(info: ProjectInfo, config: ProjectConfig, log: EventLog) {
     this.info = info;
@@ -763,6 +768,7 @@ export class ProjectRuntime {
       this.continuity?.ingest(event);
       this.nativeUsage.observe(event);
       if (liveRun) this.afterAgentEvent(event);
+      if (liveRun && e.kind === "message" && p.proposedPlan === true) this.saveProposedPlan(agent.id, chat, String(p.text ?? ""));
       if (turnOver && !this.continuity) this.kickQueue();
       } catch {
         // A failed durable ingest is a project fault, not a disposable UI
@@ -771,6 +777,10 @@ export class ProjectRuntime {
         if (isAdapter(agent) && agent.busy()) void agent.interrupt().catch(() => {});
       }
     });
+    if (agent instanceof ProviderAgent) {
+      agent.onLive((d) => { if (!this.closed && this.agents.get(agent.id) === agent) this.live.push(d); });
+      agent.onLiveItem((i) => { if (!this.closed && this.agents.get(agent.id) === agent) this.live.pushItem(i); });
+    }
     return agent;
   }
 
@@ -1781,6 +1791,56 @@ export class ProjectRuntime {
   }
 
   /** Live server state and output, for the socket. Returns unsubscribe. */
+  /** Streamed text and tool progress as a turn produces them; what finishes lands in the log. */
+  onLiveDelta(cb: (d: LiveFrame) => void): () => void {
+    this.liveListeners.add(cb);
+    return () => this.liveListeners.delete(cb);
+  }
+
+  /**
+   * Answer a structured question an agent is waiting on (a needs_input event
+   * with a requestId). The turn carries on with the answer.
+   */
+  async answerQuestion(agentId: string, chat: string, requestId: string, answers: Record<string, unknown>): Promise<void> {
+    const agent = this.agents.get(agentId);
+    if (!(agent instanceof ProviderAgent)) throw new Error(`agent "${agentId}" can't take answers to questions`);
+    this.releaseQuestionHold(agentId);
+    await agent.respondToUserInput(chat, requestId, answers);
+  }
+
+  /** Compact an agent's native context for a chat now, instead of waiting for the harness to. */
+  async compactAgent(agentId: string, chat: string = MAIN_CHAT): Promise<void> {
+    const agent = this.agents.get(agentId);
+    if (!(agent instanceof ProviderAgent)) throw new Error(`agent "${agentId}" can't be compacted from Loom`);
+    if (agent.busy() || this.turns.busySince.has(agentId)) throw new Error(`"${agentId}" is mid-turn — wait for it to finish, then compact`);
+    await this.ensureStarted(agentId);
+    this.turns.turnChat.set(agentId, chat);
+    await agent.compact(chat);
+  }
+
+  /**
+   * A plan turn on a provider agent runs in the agent's own plan mode, which
+   * changes nothing; Loom keeps the plan it proposes under plans/, as its plan
+   * mode always has.
+   */
+  private saveProposedPlan(agentId: string, chat: string | undefined, markdown: string): void {
+    if (!markdown.trim()) return;
+    try {
+      const heading = /^#+\s*(.+)$/m.exec(markdown)?.[1] ?? markdown.split("\n")[0] ?? "plan";
+      const slug = heading.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "plan";
+      const day = new Date().toISOString().slice(0, 10);
+      const dir = path.join(this.agentDir(agentId), "plans");
+      fs.mkdirSync(dir, { recursive: true });
+      let file = path.join(dir, `${day}-${slug}.md`);
+      for (let n = 2; fs.existsSync(file); n++) file = path.join(dir, `${day}-${slug}-${n}.md`);
+      fs.writeFileSync(file, `---\ntitle: ${JSON.stringify(heading.trim())}\nstatus: proposed\nagent: ${agentId}\n---\n\n${markdown.trim()}\n`);
+      this.log.append({ kind: "status", agentId, ...(chat ? { chat } : {}),
+        payload: { state: "plan_saved", path: path.relative(this.agentDir(agentId), file) } });
+    } catch (error) {
+      logbook.warn("plan", `could not save ${agentId}'s proposed plan`, String(error), this.info.id);
+    }
+  }
+
   onServerEvent(cb: (f: ServerFrame) => void): () => void {
     this.serverListeners.add(cb);
     return () => this.serverListeners.delete(cb);
@@ -2072,6 +2132,7 @@ export class ProjectRuntime {
     const mcp = child.capabilities.mcp ? writeMcpSession(this.healthyMcps()) : null;
     const input: SendInput = {
       text: task,
+      chat,
       briefing: this.subtaskBriefing(parentAgentId, opts.agentId, task),
       ...(mcp ? { mcp: { configPath: mcp.configPath, servers: mcp.servers } } : {}),
     };
@@ -2592,6 +2653,7 @@ export class ProjectRuntime {
     await this.orchestra.shutdown().catch(() => { });
     this.closed = true;
     this.harnesses.stop();
+    this.live.close();
     this.briefings.close();
     if (this.mcpTimer) { clearInterval(this.mcpTimer); this.mcpTimer = null; }
     await this.agentLifecycle.close();

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { agyBin } from "../adapters/antigravity-cli.js";
-import { codexBin } from "../adapters/codex.js";
+import { codexBin } from "../providers/codex/adapter.js";
 import { grokBin } from "../adapters/grok.js";
 import { allModels } from "../core/providers.js";
 import { type ServerConfig } from "../core/servers.js";

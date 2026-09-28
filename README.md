@@ -112,10 +112,11 @@ config (`.loom/config.json` → `codex → model: "gpt-5.6-terra"`) at high reas
 > how this got caught.
 
 - **Codex holds the baton like any other agent.** The adapter
-  ([`src/adapters/codex.ts`](src/adapters/codex.ts)) drives `codex app-server` (JSON-RPC):
-  it opens a thread, streams Codex's items (`agentMessage` / `commandExecution` /
-  `fileChange`), its context usage and compaction, and **resumes the same thread across
-  turns** so Codex keeps its own context between handoffs.
+  ([`src/providers/codex/adapter.ts`](src/providers/codex/adapter.ts)) keeps a warm
+  `codex app-server` (JSON-RPC) per chat: it opens a thread, streams Codex's items
+  (`agentMessage` / `commandExecution` / `fileChange`), its context usage and compaction,
+  and **keeps the same thread across turns** (resuming it after a restart) so Codex keeps
+  its own context between handoffs.
 - **Codex reads and writes the shared brain.** Before a Codex turn, Loom projects the
   unified memory (imported ADE memory + decisions + the thread) into its briefing; its
   replies and memory writes land back in the one shared store. So a handoff

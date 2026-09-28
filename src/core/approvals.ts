@@ -10,6 +10,8 @@
 
 export interface ApprovalDecision {
   behavior: "allow" | "deny";
+  /** "session": allow this kind of call for the rest of the agent's session, where the agent supports it. */
+  scope?: "once" | "session";
   updatedInput?: Record<string, unknown>;
   message?: string;
 }
@@ -33,6 +35,8 @@ export interface ApprovalRequest {
   summary?: string;
   /** Aborted when the asking turn ends; the card is then denied and closed. */
   signal?: AbortSignal;
+  /** The agent can take "allow for this session". */
+  sessionOption?: boolean;
 }
 
 export type ApprovalBroker = (req: ApprovalRequest) => Promise<ApprovalDecision>;

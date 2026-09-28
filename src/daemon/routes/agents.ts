@@ -49,6 +49,37 @@ export function registerAgentsRoutes(app: Express, withRuntime: WithRuntime): vo
     }),
   );
 
+  // Answer a structured question an agent is waiting on (needs_input with a requestId).
+  // answers: { [questionId]: string | string[] }.
+  app.post(
+    "/api/projects/:id/agents/:agentId/answers",
+    withRuntime(async (rt, req, res) => {
+      const b = (req.body ?? {}) as { chat?: string; requestId?: string; answers?: unknown };
+      if (!b.requestId || typeof b.requestId !== "string") return void res.status(400).json({ error: "requestId is required" });
+      if (!b.answers || typeof b.answers !== "object" || Array.isArray(b.answers)) return void res.status(400).json({ error: "answers must be an object" });
+      try {
+        await rt.answerQuestion(String(req.params.agentId), typeof b.chat === "string" ? b.chat : "main", b.requestId, b.answers as Record<string, unknown>);
+        res.json({ ok: true });
+      } catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+      }
+    }),
+  );
+
+  // Compact the agent's native context for a chat now.
+  app.post(
+    "/api/projects/:id/agents/:agentId/compact",
+    withRuntime(async (rt, req, res) => {
+      const { chat } = (req.body ?? {}) as { chat?: string };
+      try {
+        await rt.compactAgent(String(req.params.agentId), typeof chat === "string" ? chat : "main");
+        res.json({ ok: true });
+      } catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+      }
+    }),
+  );
+
   // The models this agent can run, and where the list came from.
   //
   // This comment used to promise "every real model this agent can run, asked

@@ -155,6 +155,7 @@ export class LoomDaemon {
       agent: string;
       tool: string;
       input: unknown;
+      sessionOption?: boolean;
       createdAt: number;
       settle: (d: ApprovalDecision) => void;
     }
@@ -176,6 +177,7 @@ export class LoomDaemon {
     input: unknown;
     summary?: string;
     signal?: AbortSignal;
+    sessionOption?: boolean;
   }): Promise<ApprovalDecision> {
     if (req.signal?.aborted) return { behavior: "deny", message: "The agent stopped waiting." };
     const rt = await this.runtime(req.project).catch(() => null);
@@ -188,7 +190,7 @@ export class LoomDaemon {
       kind: "approval",
       agentId: req.agent,
       ...(chat ? { chat } : {}),
-      payload: { phase: "requested", approvalId: id, tool, input: preview },
+      payload: { phase: "requested", approvalId: id, tool, input: preview, ...(req.sessionOption ? { sessionOption: true } : {}) },
     });
     return new Promise<ApprovalDecision>((resolve) => {
       const abandoned = () => settle({ behavior: "deny", message: "The agent stopped waiting." });
@@ -200,7 +202,7 @@ export class LoomDaemon {
           kind: "approval",
           agentId: req.agent,
           ...(chat ? { chat } : {}),
-          payload: { phase: "decided", approvalId: id, tool, behavior: d.behavior, ...(d.message ? { message: d.message } : {}) },
+          payload: { phase: "decided", approvalId: id, tool, behavior: d.behavior, ...(d.scope === "session" ? { scope: "session" } : {}), ...(d.message ? { message: d.message } : {}) },
         });
         resolve(d);
       };
@@ -214,6 +216,7 @@ export class LoomDaemon {
         agent: req.agent,
         tool,
         input: req.input ?? {},
+        ...(req.sessionOption ? { sessionOption: true } : {}),
         createdAt: Date.now(),
         settle,
       });
@@ -445,6 +448,9 @@ export class LoomDaemon {
         ...(q.reason ? { reason: q.reason } : {}),
         ...(waitingFor ? { waitingFor } : {}),
       }, info.id);
+    });
+    rt.onLiveDelta((d) => {
+      this.broadcastFrame({ type: "phase" in d ? "item" : "delta", projectId: info.id, ...d }, info.id);
     });
     rt.log.onEvent((e) => {
       this.broadcast(info.id, e);

@@ -11,14 +11,17 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { CodexAdapter } from "../src/adapters/codex.js";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { CodexAdapter, stopAllProviderSessions } from "../src/providers/agent.js";
 import { setApprovalBroker, type ApprovalRequest } from "../src/core/approvals.js";
 import { NativeDispatchRejected, NativeSessionMissing } from "../src/core/continuity/contracts.js";
 import type { AdapterEvent, SendInput } from "../src/types.js";
 import { makeProjectDir } from "./helpers.js";
 import { CODEX_OK, codexDone, codexItem, codexMessage, codexNotify, codexTokens, fakeCodex, rpcOf, stdinOf,
   type FakeCodexOptions, type Step } from "./native-fakes.js";
+
+// Provider sessions stay warm between turns; end them with the file.
+afterAll(async () => { await stopAllProviderSessions(); });
 
 afterEach(() => setApprovalBroker(null));
 
@@ -67,7 +70,7 @@ describe("codex · a normal turn", () => {
    */
   it("reports tokens, and never invents a cost", async () => {
     const { events } = await run(CODEX_OK);
-    expect(of(events, "status").find((p) => p.state === "turn_tokens")).toMatchObject({ inputTokens: 52831, outputTokens: 120, cachedInputTokens: 44672 });
+    expect(of(events, "run_complete")[0]).toMatchObject({ inputTokens: 52831, outputTokens: 120 });
     expect(of(events, "status").some((p) => "costUsd" in p)).toBe(false);
   });
 
@@ -167,12 +170,13 @@ describe("codex · what it did", () => {
   });
 
   it("stays quiet about item types it doesn't understand", async () => {
-    const { events } = await run(turn(codexItem({ type: "plan", text: "1. x" }), codexMessage("done")));
+    const { events } = await run(turn(codexItem({ type: "hookPrompt", text: "1. x" }), codexMessage("done")));
     expect(kinds(events).filter((k) => k === "message")).toHaveLength(1);
   });
 
   it("ignores an item that only started — nothing has happened yet", async () => {
-    const { events } = await run(turn(codexNotify("item/started", { item: { id: "i", type: "commandExecution", command: "sleep 1", exitCode: null, status: "inProgress" } })));
+    const { events } = await run(turn(codexNotify("item/started", { item: { id: "i", type: "commandExecution", command: "sleep 1", exitCode: null, status: "inProgress" } })),
+      {}, {}, { commandSettleMs: 50 });
     expect(kinds(events)).not.toContain("tool_call");
   });
 
@@ -253,7 +257,8 @@ describe("codex · when it goes wrong", () => {
 
   it("fails the turn when codex reports the turn itself failed", async () => {
     const { events, error } = await run([started, codexDone("failed", "model unavailable")]);
-    expect(error?.message).toBe("model unavailable");
+    // The error event ends the turn; send() doesn't report it a second time.
+    expect(error).toBeUndefined();
     expect(of(events, "error")[0]).toMatchObject({ message: "model unavailable" });
     expect(kinds(events)).not.toContain("run_complete");
   });

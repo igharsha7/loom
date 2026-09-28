@@ -202,6 +202,11 @@ export function createThread(view) {
             if (row.getAttribute("data-agent") === e.agentId) row.parentNode.removeChild(row);
           });
         }
+        // The finished reply replaces what streamed in while it was written.
+        if (e.agentId && ((e.kind === "message" && !pl.reasoning) || pl.state === "interrupted" || e.kind === "run_complete" || e.kind === "error")) {
+          if (html) { feed.insertAdjacentHTML("beforeend", html); html = ""; added = true; }
+          clearStreaming(feed, e.agentId);
+        }
         if (e.kind === "approval" && e.payload && e.payload.phase === "decided") {
           if (html) { feed.insertAdjacentHTML("beforeend", html); html = ""; added = true; }
           if (settleApprovalCards(e.payload.approvalId, e.payload.behavior, e.payload.message)) return;
@@ -213,6 +218,56 @@ export function createThread(view) {
         var sc = feed.parentNode;
         if (sc && sc.scrollHeight) sc.scrollTop = sc.scrollHeight;
         else window.scrollTo(0, document.body.scrollHeight); }
+    }
+
+    // ---- streamed text: shown while the reply is written, never stored -------
+    function clearStreaming(feed, agentId){
+      Array.prototype.forEach.call(feed.querySelectorAll(".msg.streaming, .tool.running"), function(row){
+        if (row.getAttribute("data-agent") === agentId) row.parentNode.removeChild(row);
+      });
+    }
+
+    function onDelta(frame){
+      if (frame.streamKind !== "assistant_text" || !frame.agentId || !view.historyLoaded) return;
+      if ((frame.chat || "main") !== view.chatId) return;
+      var feed = document.getElementById("feed"); if (!feed) return;
+      var key = String(frame.itemId || frame.turnId || "");
+      var row = null;
+      Array.prototype.forEach.call(feed.querySelectorAll(".msg.streaming"), function(r){
+        if (r.getAttribute("data-agent") === frame.agentId && r.getAttribute("data-item") === key) row = r;
+      });
+      if (!row) {
+        feed.insertAdjacentHTML("beforeend", '<div class="msg agent streaming" data-agent="' + esc(frame.agentId) + '" data-item="' + esc(key) +
+          '"><div class="who" style="color:hsl(' + hue(frame.agentId) + ',60%,var(--agent-l))">' + esc(frame.agentId) +
+          '</div><div class="bubble" style="white-space:pre-wrap;border-left-color:hsl(' + hue(frame.agentId) + ',50%,var(--selvage-l))"></div></div>');
+        row = feed.lastElementChild;
+      }
+      var bubble = row.querySelector(".bubble");
+      bubble.textContent += String(frame.delta || "");
+      var sc = feed.parentNode;
+      if (sc && sc.scrollHeight) sc.scrollTop = sc.scrollHeight;
+    }
+
+    // A tool while it runs: a row that goes when the tool finishes (the finished
+    // tool arrives as its own tool_call line).
+    function onItem(frame){
+      if (!frame.agentId || !frame.itemId || !view.historyLoaded) return;
+      if ((frame.chat || "main") !== view.chatId) return;
+      var feed = document.getElementById("feed"); if (!feed) return;
+      var row = null;
+      Array.prototype.forEach.call(feed.querySelectorAll(".tool.running"), function(r){
+        if (r.getAttribute("data-item") === frame.itemId) row = r;
+      });
+      if (frame.phase === "completed") { if (row) row.parentNode.removeChild(row); return; }
+      var label = frame.itemType === "command_execution" ? "$ " + (frame.detail || "command") : (frame.detail || frame.title || frame.itemType);
+      if (!row) {
+        feed.insertAdjacentHTML("beforeend", '<div class="tool running" data-agent="' + esc(frame.agentId) + '" data-item="' + esc(frame.itemId) +
+          '" style="opacity:.75">\u25cc <span class="rtl"></span></div>');
+        row = feed.lastElementChild;
+      }
+      row.querySelector(".rtl").textContent = String(label).slice(0, 200);
+      var sc = feed.parentNode;
+      if (sc && sc.scrollHeight) sc.scrollTop = sc.scrollHeight;
     }
 
     function flushPending(){
@@ -266,6 +321,10 @@ export function createThread(view) {
           if (frame.type === "queue") { view.onQueueFrame(frame); return; }
           // a dev server started, stopped, crashed, or printed a line
           if (frame.type === "server") { onServerFrame(frame); return; }
+          // a reply being written, a few words at a time
+          if (frame.type === "delta") { onDelta(frame); return; }
+          // a tool starting, or finishing, while the turn runs
+          if (frame.type === "item") { onItem(frame); return; }
           // an agent changed files while a preview is open: show the new page
           if (frame.type === "event" && frame.event && frame.event.kind === "turn_diff") maybeReloadPreview();
           if (frame.type === "event" && frame.event) {

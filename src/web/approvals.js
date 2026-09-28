@@ -37,6 +37,7 @@ import { state } from './state.js';
         '<div class="apact"><input class="apwhy" placeholder="Reason, if you deny (optional)" maxlength="500" aria-label="reason for denying">' +
           (opts.open && a.chat ? '<button class="apopen" type="button" data-apchat="' + esc(a.chat) + '" title="open the thread it came from">thread</button>' : "") +
           '<button class="btn outline sm apdeny" type="button" data-apact="deny" data-apid="' + esc(id) + '">' + ICONS.x + "Deny</button>" +
+          (a.sessionOption ? '<button class="btn outline sm apsess" type="button" data-apact="allow_session" data-apid="' + esc(id) + '" title="allow this for the rest of the agent\'s session">' + ICONS.check + "Allow for session</button>" : "") +
           '<button class="btn primary sm apallow" type="button" data-apact="allow" data-apid="' + esc(id) + '">' + ICONS.check + "Allow</button></div>" +
       "</div>" +
       '<div class="apres"></div></div>';
@@ -57,7 +58,7 @@ import { state } from './state.js';
       var who = (c.querySelector(".apag") || {}).textContent || "";
       var res = c.querySelector(".apres");
       c.classList.add("done");
-      if (res) res.innerHTML = (behavior === "allow" ? '<span class="ok">\u2713 allowed</span>'
+      if (res) res.innerHTML = (behavior === "allow" || behavior === "allow_session" ? '<span class="ok">\u2713 allowed' + (behavior === "allow_session" ? " for the session" : "") + "</span>"
           : behavior === "deny" ? '<span class="no">\u2715 denied</span>' : "<span>\u2713 answered elsewhere</span>") +
         "<span>" + esc(tool) + (who ? " \u00b7 " + esc(who) : "") + (message ? " \u2014 " + esc(message) : "") + "</span>";
     });
