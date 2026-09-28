@@ -17,6 +17,8 @@ import { setTView,tview } from '../transcript.js';
  * Creating this module only binds functions; startup and cleanup belong to project.js.
  */
 export function createComposer(view) {
+    /** The last send's requests, so the next one goes after them. Never rejects. */
+    var lastSend = Promise.resolve();
     var pendingSubmission;
 
 
@@ -94,11 +96,15 @@ export function createComposer(view) {
         return;
       }
 
-      var chain = Promise.resolve();
-      if (!p.continuity && !state.auto && state.selected && state.selected !== p.holder) {
-        chain = api("/api/projects/" + view.pid + "/handoff", { method: "POST", body: JSON.stringify({ to: state.selected }) });
-      }
-      chain.then(function(){
+      // One send on the wire at a time. Each is a handoff and then a message,
+      // so a second prompt typed before the first reached the daemon could
+      // overtake it and run first; now it waits for the one before it.
+      var chain = lastSend.then(function(){
+        if (!p.continuity && !state.auto && state.selected && state.selected !== p.holder) {
+          return api("/api/projects/" + view.pid + "/handoff", { method: "POST", body: JSON.stringify({ to: state.selected }) });
+        }
+      });
+      lastSend = chain.then(function(){
         // into the chat you're looking at — the agent's reply comes back here
         var body = { text: full, agentId: (state.auto ? undefined : state.selected) || undefined, chat: view.chatId, plan: plan || undefined };
         if(p.continuity) {

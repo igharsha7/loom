@@ -87,6 +87,7 @@ import { bindTheme } from './theme.js';
       get drawStatus() { return drawStatus; }
     });
     var { drawStatus, refresh, loadHistory, connect } = createThread({
+      get loadQueue() { return loadQueue; },
       get orchRunForChat() { return orchRunForChat; },
       get planState() { return planState; },
       get orchTerminal() { return orchTerminal; },

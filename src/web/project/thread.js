@@ -308,7 +308,10 @@ export function createThread(view) {
       ws.onmessage = function(ev){
         try {
           var frame = JSON.parse(ev.data);
-          if (frame.type === "hello") { checkBuild(); return; }
+          // The daemon says hello once this socket is subscribed. Anything the
+          // queue did before then went out as a frame this page never got, so
+          // read it again now (a reconnect lands here too).
+          if (frame.type === "hello") { checkBuild(); view.loadQueue(); return; }
           if (frame.type === "term") { view.onTermFrame(frame); return; }
           if (frame.type === "spec" || frame.type === "spec_done") { onSpecFrame(frame); return; }
           // A log record belongs to no chat — a daemon fault has no
