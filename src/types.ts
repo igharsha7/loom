@@ -217,6 +217,9 @@ export interface ProjectionConfig {
 
 /** The brain's phase-2 extractor — learning from each turn. See core/brain-extract.ts. */
 export interface BrainConfig {
+  /** Opt into versioned native continuity (SQLite, Codex/Claude only).
+   * Legacy memory/extraction remains available when false. */
+  continuity?: boolean;
   /**
    * Who reads finished turns for memory:
    *   "auto" (default) — a small Claude, when the CLI is available; a no-op when not.
@@ -420,6 +423,22 @@ export interface ProjectInfo {
 
 export interface SendInput {
   text: string;
+  /**
+   * The conversation this turn belongs to (default: the main chat). Provider
+   * agents keep one native session per chat, so each conversation has its own
+   * native history.
+   */
+  chat?: string;
+  /**
+   * "plan": the agent investigates and proposes a plan without changing
+   * anything, in its own plan mode (Codex collaboration mode, Claude's plan
+   * permission mode). Provider agents only.
+   */
+  interactionMode?: "default" | "plan";
+  /** App-owned conversation binding; native IDs never cross chat/workspace scopes.
+   * Context is injected into the ordinary input on every invocation. */
+  continuity?: { runId: string; bindingId: string; sessionEpoch: number;
+    nativeSessionId: string | null; context: string };
   /** One-shot handoff briefing injected alongside this turn. */
   briefing?: string;
   /**
@@ -555,6 +574,8 @@ export interface AgentStatus {
   role: AgentRole;
   tier: AgentTier;
   available: boolean;
+  /** Native continuity: the harness CLI version seen by the last health probe. */
+  cliVersion?: string | null;
   busy: boolean;
   holdsBaton: boolean;
   /** The model override in effect, or "" for the CLI's own default. */
@@ -569,9 +590,33 @@ export interface AgentStatus {
   sampling?: { temperature?: number; maxTokens?: number };
   /** The agent's own picture, when one was set. */
   avatar?: string;
+  /** Native harnesses: tokens in context and the model's window, from the last report. */
+  context?: AgentContextUsage | null;
+  /** Native harnesses: the provider account's usage-limit windows, from the last report. */
+  limits?: ProviderLimits | null;
+}
+
+export interface AgentContextUsage {
+  usedTokens: number;
+  /** The model's context window, when the harness has said. */
+  maxTokens: number | null;
+  /** The harness is compacting its context right now. */
+  compacting: boolean;
+  /** When the harness last finished compacting (ms). */
+  compactedAt: number | null;
+  at: number;
+}
+
+export interface ProviderLimits {
+  provider: string;
+  windows: Array<{ id: string; usedPercent: number; windowMinutes?: number; resetsAt?: number }>;
+  /** The window whose limit was hit, when one was. */
+  reached: string | null;
+  at: number;
 }
 
 export interface ProjectStatus {
+  continuity?: boolean;
   id: string;
   name: string;
   dir: string;

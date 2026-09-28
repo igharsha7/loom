@@ -379,6 +379,7 @@ async function openBoard(): Promise<Mounted> {
   await waitUntil(() => !!$(m, '.tab[data-tab="board"]'));
   click($(m, '.tab[data-tab="board"]'));
   await waitUntil(() => !!$(m, ".bcol"));
+  await ready(m, '.badd[data-add="needs-you"]');
   return m;
 }
 

@@ -17,7 +17,7 @@ import path from "node:path";
 import os from "node:os";
 import { GuiChatDriver } from "../adapters/bridges/gui-chat.js";
 import { agyBin } from "../adapters/antigravity-cli.js";
-import { codexBin } from "../adapters/codex.js";
+import { codexBin } from "../providers/codex/adapter.js";
 import { profileFor } from "../adapters/bridges/profiles.js";
 import { ADES, detectAdes } from "./ades.js";
 import { listProviders } from "./providers.js";

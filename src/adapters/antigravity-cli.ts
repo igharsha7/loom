@@ -36,7 +36,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { SendInput } from "../types.js";
-import { readProjectState, writeProjectState } from "../core/registry.js";
 import { AdapterBase, agentEnv, cliAvailable, frameBriefing } from "./base.js";
 import { permissionFor } from "../core/permissions.js";
 
@@ -98,14 +97,11 @@ export class AntigravityCliAdapter extends AdapterBase {
 
   /** agy calls it a conversation; loom stores it in the same slot as any session. */
   private get conversationId(): string | undefined {
-    const state = readProjectState(this.projectDir);
-    return state.agents[this.id]?.sessionId as string | undefined;
+    return this.nativeState.read().sessionId as string | undefined;
   }
 
   private set conversationId(value: string | undefined) {
-    const state = readProjectState(this.projectDir);
-    state.agents[this.id] = { ...state.agents[this.id], sessionId: value };
-    writeProjectState(this.projectDir, state);
+    this.nativeState.patch({ sessionId: value });
   }
 
   async available(): Promise<boolean> {

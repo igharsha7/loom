@@ -7,9 +7,9 @@
  *
  *   - dist/, the compiled daemon and CLI;
  *   - its production node_modules — express and ws to serve, and @xterm/*,
- *     which the daemon serves to the browser straight off disk (the web app has
- *     no build step and no CDN, so xterm.js is read out of node_modules on
- *     every request — see daemon/server.ts);
+ *     which the daemon serves to the browser straight off disk (xterm.js remains
+ *     a local runtime asset, separate from the bundled client — see
+ *     daemon/routes/assets.ts);
  *   - package.json, which the CLI reads.
  *
  * None of that was in the DMG. `files: ["../dist/**\/*"]` looks like it ships
@@ -77,6 +77,9 @@ fs.rmSync(path.join(stage, "package-lock.json"), { force: true });
 const required = [
   "dist/cli/index.js",
   "dist/daemon/server.js",
+  "dist/web/app.js",
+  "dist/web/app.css",
+  "dist/web/shell.html",
   "node_modules/express/package.json",
   "node_modules/ws/package.json",
   "node_modules/@xterm/xterm/lib/xterm.js",

@@ -1,8 +1,8 @@
 # Source map
 
 Loom is one Node process, the **daemon**, that drives agent CLIs and serves every
-client: the CLI/TUI, the web app, the desktop shell, the phone. Everything below
-is TypeScript compiled to `dist/` (`npm run build`).
+client: the CLI/TUI, the web app, the desktop shell, the phone. The daemon is TypeScript compiled to `dist/`; the browser is bundled from
+`web/` JavaScript, CSS and HTML (`npm run build`).
 
 ## `core/`: the logic, no HTTP
 
@@ -29,9 +29,9 @@ is TypeScript compiled to `dist/` (`npm run build`).
 
 | File | Role |
 |---|---|
-| `server.ts` | HTTP + WebSocket API, auth, pairing, push |
-| `runtime.ts` | One open project: agents, log, brain, orchestra, briefings |
-| `app-page.ts` | The whole web app, as one HTML string (no build step) |
+| `server.ts`, `routes/` | Daemon lifecycle, WebSocket transport, middleware, and feature HTTP registrars ([map](daemon/routes/README.md)) |
+| `runtime.ts`, `runtime/` | Project coordinator with accounting, briefing, queue and turn modules ([map](daemon/runtime/README.md)) |
+| `app-page.ts` | Assembles generated browser assets into the offline HTML page |
 | `team.ts` | Team Link: this daemon on a team hub |
 | `team-coordinator.ts` | Phase 2: leases, holds, WIP refs, conflict prediction |
 | `team-brain.ts` | Phase 3: publishing, the tiered pool, canon PRs, the inbox |
@@ -39,6 +39,11 @@ is TypeScript compiled to `dist/` (`npm run build`).
 | `runner.ts` | Phase 5: this daemon as a runner |
 | `deploys.ts` | Deploy status and release notes |
 | `relay.ts`, `push.ts` | Loom Cloud relay and phone push |
+
+## Browser client
+
+`web/` contains the browser entry, feature modules, styles and HTML shell.
+See its [source map and build instructions](web/README.md).
 
 ## Elsewhere
 

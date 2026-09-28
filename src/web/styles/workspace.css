@@ -1,0 +1,457 @@
+  /* ── Desktop workspace shell (Orca layout) ────────────── */
+  /* column widths are drag-resizable and persisted; the rail column only
+     exists while .railopen is set. */
+  .dshell{display:grid;height:100dvh;
+    --sbw:264px;--railw:304px;
+    grid-template-columns:var(--sbw) minmax(0,1fr);
+    grid-template-rows:minmax(0,1fr) 25px}
+  .dshell.railopen{grid-template-columns:var(--sbw) minmax(0,1fr) var(--railw)}
+  /* drag handles: wide hit area, hairline that lights up on hover (Orca) */
+  .rz{position:absolute;top:0;bottom:0;width:9px;z-index:12;cursor:col-resize}
+  .rz::after{content:"";position:absolute;top:0;bottom:0;left:50%;width:1px;
+    transform:translateX(-50%);background:transparent;transition:background .12s}
+  .rz:hover::after,.rz.dragging::after{background:var(--ring)}
+  .rz-sidebar{right:-4px}
+  .rz-rail{left:-4px}
+  .rz-dock{left:-4px}
+  body.resizing-x{cursor:col-resize;user-select:none}
+  body.resizing-x *{pointer-events:none}
+  .sidebar{grid-column:1;grid-row:1;border-right:1px solid var(--sidebar-border);
+    display:flex;flex-direction:column;min-width:0;position:relative;
+    background:var(--sidebar);color:var(--sidebar-foreground)}
+  .sidebar .shead{display:flex;align-items:center;gap:10px;height:40px;flex:none;padding:0 12px 0 16px;
+    box-shadow:inset 0 -1px 0 var(--sidebar-border)}
+  .sidebar .slist{flex:1;overflow-y:auto;padding:8px}
+  .sidebar .stitle{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:600;color:var(--muted-foreground);
+    letter-spacing:.05em;text-transform:uppercase;padding:8px 8px 6px;font-family:var(--font-mono)}
+  .stitle .iconbtn{width:22px;height:22px;margin-left:auto}
+  .stitle .iconbtn svg{width:13px;height:13px}
+  /* quiet search row (Orca sidebar nav) */
+  .snav{display:flex;align-items:center;gap:8px;margin:8px 8px 0;padding:0 10px;height:30px;flex:none;
+    border-radius:var(--radius-md);border:1px solid transparent;color:var(--muted-foreground);
+    transition:background .12s,border-color .12s}
+  .snav:focus-within{background:var(--sidebar-accent);border-color:var(--border)}
+  .snav svg{width:14px;height:14px;flex:none}
+  .snav input{flex:1;min-width:0;background:none;border:none;outline:none;box-shadow:none!important;
+    color:var(--sidebar-foreground);font:inherit;font-size:12.5px}
+  .snav input::placeholder{color:color-mix(in srgb, var(--muted-foreground) 65%, transparent)}
+  .sfoot{display:flex;align-items:center;gap:4px;height:40px;flex:none;padding:0 10px;
+    border-top:1px solid var(--sidebar-border)}
+  .sfoot .iconbtn{width:28px;height:28px}
+  .sgroup{margin-bottom:2px}
+  .srow{padding:8px 10px;border-radius:var(--radius-md);border:1px solid transparent;cursor:pointer;
+    transition:background .12s,border-color .12s}
+  .srow:hover{background:var(--sidebar-accent)}
+  .srow.sel{background:var(--sidebar-accent);border-color:var(--border)}
+  .srow .n{font-weight:500;font-size:13px;display:flex;align-items:center;gap:8px;min-width:0}
+  .srow .n .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .srow .n .cnt{margin-left:auto;flex:none;font-family:var(--font-mono);font-size:10.5px;color:var(--muted-foreground)}
+  /* the collapse caret: right-pointing, rotates to down when the project is open */
+  .scaret{display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;flex:none;
+    background:none;border:0;padding:0;margin:-2px 0;color:var(--muted-foreground);cursor:pointer;
+    transition:transform .14s,color .12s;border-radius:4px}
+  .scaret:hover{color:var(--foreground);background:color-mix(in srgb, var(--foreground) 8%, transparent)}
+  .scaret svg{width:13px;height:13px}
+  .scaret.open{transform:rotate(90deg)}
+  /* new-chat agent picker — a floating popover anchored to the New chat row */
+  .pickpop{position:fixed;z-index:60;min-width:190px;max-width:260px;
+    background:var(--popover,var(--background));border:1px solid var(--border);border-radius:10px;
+    box-shadow:0 14px 40px rgba(0,0,0,.32);padding:5px}
+  .pickhead{font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+    color:var(--muted-foreground);padding:6px 9px 5px}
+  .pickrow{display:flex;align-items:center;gap:9px;width:100%;padding:7px 9px;border:0;border-radius:7px;
+    background:none;cursor:pointer;font:inherit;font-size:13px;color:var(--foreground);text-align:left}
+  .pickrow:hover,.pickrow:focus-visible{background:var(--sidebar-accent);outline:none}
+  /* the shared menu: composer More, and every right click */
+  .menupop{min-width:208px}
+  .menupop .mico{width:15px;height:15px;flex:none;display:inline-flex;align-items:center;justify-content:center;
+    color:var(--muted-foreground)}
+  .menupop .mico svg{width:15px;height:15px}
+  .menupop .pickrow.danger{color:var(--err)}
+  .menupop .pickrow.danger .mico{color:var(--err)}
+  .menusep{height:1px;background:var(--border);margin:4px 6px}
+  .pickrow .brand{width:16px;height:16px;flex:none}
+  .pickrow .pnm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pickrow .prole{margin-left:auto;flex:none;font-family:var(--font-mono);font-size:10.5px;color:var(--muted-foreground)}
+  .pglyph{width:18px;height:18px;border-radius:5px;display:inline-flex;align-items:center;justify-content:center;
+    font-family:var(--font-mono);font-size:9.5px;font-weight:700;flex:none;position:relative}
+  .pglyph.hot::after{content:"";position:absolute;inset:-3px;border-radius:8px;
+    border:1px solid var(--live);opacity:.6;animation:pulse 1.8s ease-out infinite}
+  .srow .m{color:var(--muted-foreground);font-family:var(--font-mono);font-size:11px;margin-top:3px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .arow{display:flex;align-items:center;gap:8px;padding:5px 10px 5px 24px;margin-top:1px;
+    border-radius:var(--radius-md);border:1px solid transparent;cursor:pointer;
+    font-size:12.5px;color:var(--muted-foreground);transition:background .12s,color .12s}
+  .arow:hover{background:var(--sidebar-accent);color:var(--sidebar-accent-foreground)}
+  .arow.cur{background:var(--sidebar-accent);color:var(--sidebar-accent-foreground);border-color:var(--border)}
+  .arow .anm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center;gap:6px}
+  .arow .role{margin-left:auto;flex:none;font-family:var(--font-mono);font-size:10.5px;
+    color:color-mix(in srgb, var(--muted-foreground) 75%, transparent)}
+  .adot{width:7px;height:7px;border-radius:50%;flex:none;position:relative;
+    background:color-mix(in srgb, var(--muted-foreground) 40%, transparent)}
+  .adot.busy{background:var(--live)}
+  .adot.busy::after{content:"";position:absolute;inset:-3px;border-radius:50%;
+    border:1px solid var(--live);opacity:.5;animation:pulse 1.8s ease-out infinite}
+  .abadge{flex:none;font-size:9.5px;font-family:var(--font-mono);letter-spacing:.04em;
+    color:var(--muted-foreground);border:1px solid var(--border);border-radius:5px;
+    padding:0 5px;line-height:14px;text-transform:uppercase}
+  .arow.cur .abadge{color:var(--sidebar-accent-foreground)}
+  /* ── chats: a project's conversations, nested under it ── */
+  .crow{display:flex;align-items:center;gap:7px;padding:5px 8px 5px 24px;margin-top:1px;
+    border-radius:var(--radius-sm);cursor:pointer;color:var(--sidebar-foreground);
+    font-size:12.5px;border:1px solid transparent}
+  .crow:hover{background:var(--sidebar-accent);color:var(--sidebar-accent-foreground)}
+  .crow.cur{background:var(--sidebar-accent);color:var(--sidebar-accent-foreground);border-color:var(--border)}
+  .crow .ci{flex:none;display:inline-flex;align-items:center;color:var(--muted-foreground)}
+  .crow .ci svg{width:12px;height:12px}
+  .crow.cur .ci{color:var(--sidebar-accent-foreground)}
+  .crow .cnm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .crow .cx{width:18px;height:18px;margin-left:auto;flex:none;opacity:0;border-radius:4px}
+  .crow .cx svg{width:11px;height:11px}
+  .crow:hover .cx{opacity:.6}
+  .crow .cx:hover{opacity:1;background:color-mix(in srgb, var(--err) 18%, transparent);color:var(--err)}
+  .crow.add{color:var(--muted-foreground)}
+  .crow.add:hover{color:var(--sidebar-accent-foreground)}
+  .chatinput{width:100%;background:var(--background);border:1px solid var(--ring);border-radius:4px;
+    color:var(--foreground);font:inherit;font-size:12.5px;padding:0 3px;outline:none}
+  /* a role is a name you chose, so it reads as editable text, not a label */
+  .role.edit{cursor:text;border-radius:4px;padding:0 3px;margin-right:-3px}
+  .role.edit:hover{background:color-mix(in srgb, var(--muted-foreground) 22%, transparent);
+    color:var(--sidebar-accent-foreground)}
+  .roleinput{width:9ch;background:var(--background);border:1px solid var(--ring);border-radius:4px;
+    color:var(--foreground);font-family:var(--font-mono);font-size:10.5px;padding:0 3px;outline:none}
+  /* the rail's agent roster: click to aim, click the role to rename it */
+  .frow.agentrow{cursor:pointer}
+  .frow.agentrow.cur{background:var(--accent);border-radius:var(--radius-sm)}
+  .frow .role{margin-left:auto;flex:none;font-family:var(--font-mono);font-size:10.5px;
+    color:var(--muted-foreground)}
+  .frow.bridge{opacity:.75}
+  /* a bridge is read-only: no hover affordance, because it can't be targeted */
+  .arow.bridge{cursor:default;opacity:.82}
+  .arow.bridge:hover{background:transparent;color:inherit}
+  .dmain{grid-column:2;grid-row:1;min-width:0;display:flex;flex-direction:column;position:relative;background:var(--background)}
+  .dmain .panel{height:100%}
+  .dmain .composer .inner,.dmain .hint{max-width:none}
+  /* tab strip — the Orca workspace signature; it IS the window's top chrome:
+     project context on the left, document tabs at the seam, actions right */
+  .tabstrip{display:flex;align-items:flex-end;gap:2px;height:40px;flex:none;padding:0 10px;
+    background:var(--sidebar);border-bottom:1px solid var(--border)}
+  .tabstrip .ptitle{align-self:center;display:flex;flex-direction:column;justify-content:center;
+    min-width:0;max-width:240px;padding:0 10px 0 6px;margin-right:6px}
+  .tabstrip .ptitle .nm{font-size:12.5px;font-weight:600;line-height:1.25;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tabstrip .ptitle .st{font-size:10.5px;color:var(--muted-foreground);font-family:var(--font-mono);line-height:1.25;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tabstrip .iconbtn{align-self:center;width:30px;height:30px}
+  .tab{display:inline-flex;align-items:center;gap:7px;height:30px;padding:0 13px;
+    border-radius:8px 8px 0 0;border:1px solid transparent;border-bottom:none;
+    font-size:12.5px;font-weight:500;color:var(--muted-foreground);cursor:pointer;position:relative;
+    transition:color .12s,background .12s}
+  .tab:hover{color:var(--foreground);background:color-mix(in srgb, var(--sidebar-accent) 70%, transparent)}
+  .tab.active{background:var(--background);color:var(--foreground);border-color:var(--border)}
+  .tab.active::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:1px;background:var(--background)}
+  .tab svg{width:13px;height:13px}
+  .tabstrip .spacer{margin-left:auto}
+  .pane{flex:1;min-height:0;overflow-y:auto;padding:16px 16px 20px}
+  .dmain .pane > #feed,.dmain .pane > #routebar,.dmain .pane > .agenthead{max-width:840px;margin-inline:auto}
+  .dmain .msg .bubble{max-width:82%}
+  .pane-inner{max-width:840px;margin:0 auto;display:flex;flex-direction:column;gap:12px}
+  /* diff/preview dock — opens to the RIGHT of the chat on click, closed by default */
+  .paneswrap{flex:1;min-height:0;min-width:0;display:flex}
+  .mainpane{flex:1;min-width:0;display:flex;flex-direction:column}
+  .dockpane{width:var(--dockw,48%);min-width:280px;flex:none;display:none;flex-direction:column;min-height:0;
+    position:relative;border-left:1px solid var(--border);background:var(--editor-surface)}
+  .dockpane.open{display:flex}
+  .dockpane .pane{flex:1}
+  .dockpane .diffwrap{max-width:none}
+  .dockhead{height:36px;flex:none;display:flex;align-items:center;gap:7px;padding:0 8px 0 12px;min-width:0;
+    border-bottom:1px solid var(--border);font-family:var(--font-mono);font-size:11.5px;color:var(--muted-foreground);
+    background:var(--sidebar)}
+  .dockhead .p{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .dockhead .spacer{margin-left:auto}
+  /* the dock's icon slot — every other icon wrapper centres its glyph; without
+     this one the svg sits on the text baseline */
+  .dockhead .di{display:inline-flex;align-items:center;flex:none}
+  .dockhead .iconbtn{width:26px;height:26px}
+  .dockhead .iconbtn svg{width:13px;height:13px}
+  .iconbtn.active{background:var(--accent);color:var(--foreground)}
+  /* read-only file preview in the dock */
+  .filepreview{font-family:var(--font-mono);font-size:11.5px;line-height:1.6;padding:6px 0}
+  .filepreview .fl{display:grid;grid-template-columns:44px 1fr;white-space:pre;min-width:max-content}
+  .filepreview .fl .ln{color:color-mix(in srgb, var(--muted-foreground) 55%, transparent);text-align:right;
+    padding-right:10px;user-select:none;font-size:10px}
+  .filepreview .fl .lc{padding-right:14px}
+  /* agent header block — who holds the pane (Orca terminal header) */
+  .agenthead{display:flex;align-items:center;gap:10px;padding:10px 12px;margin:0 0 10px;
+    border:1px solid var(--border);border-radius:var(--radius);background:var(--card);
+    box-shadow:0 1px 2px rgb(0 0 0 / .04)}
+  .agenthead .ag{width:26px;height:26px;border-radius:7px;display:inline-flex;align-items:center;justify-content:center;
+    font-family:var(--font-mono);font-size:11px;font-weight:700;flex:none}
+  /* a real logo brings its own colour, so its tile stays neutral */
+  .agenthead .ag.brandbox{background:var(--secondary);border:1px solid var(--border)}
+  .agenthead .meta{min-width:0;display:flex;flex-direction:column;gap:1px}
+  .agenthead .l1{font-size:12.5px;font-weight:600;display:flex;gap:8px;align-items:baseline}
+  .agenthead .l1 .role{font-family:var(--font-mono);font-size:10.5px;font-weight:400;color:var(--muted-foreground)}
+  .agenthead .l2{font-family:var(--font-mono);font-size:10.5px;color:var(--muted-foreground);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .agenthead .kind{margin-left:auto}
+  /* terminal-style turn cards (Update blocks) in the thread */
+  .turncard{max-width:88%;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+    padding:9px 12px;margin:10px 0;cursor:pointer;font-family:var(--font-mono);
+    box-shadow:0 1px 2px rgb(0 0 0 / .04);
+    transition:border-color .12s,background .12s}
+  .turncard:hover{border-color:color-mix(in srgb, var(--muted-foreground) 38%, transparent);
+    background:color-mix(in srgb, var(--accent) 40%, var(--card))}
+  .turncard:hover .tchev{color:var(--foreground)}
+  .turncard .tch{display:flex;align-items:center;gap:10px;font-size:12px;font-weight:600}
+  .turncard .tca{color:var(--git-add);margin-left:auto}
+  .turncard .tcd{color:var(--git-del)}
+  .turncard .tchev{color:var(--muted-foreground)}
+  /* Rewind lives on the card whose changes it undoes, and stays out of the
+     way until you look for it — it throws work away when clicked. */
+  .turncard .tcrw{display:inline-flex;align-items:center;gap:4px;height:20px;padding:0 7px;margin-left:8px;
+    border-radius:99px;border:1px solid var(--border);background:var(--background);color:var(--muted-foreground);
+    font:inherit;font-size:10.5px;font-weight:600;cursor:pointer;opacity:0;transition:opacity .12s,color .12s}
+  .turncard .tcrw svg{width:11px;height:11px}
+  .turncard:hover .tcrw,.turncard .tcrw:focus-visible{opacity:1}
+  .turncard .tcrw:hover{color:var(--warn);border-color:color-mix(in srgb, var(--warn) 45%, transparent)}
+  .turncard .tcf{color:var(--muted-foreground);font-size:11px;margin-top:3px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .turncard .tcdiff{margin-top:8px;border-top:1px solid var(--border);max-height:320px;overflow:auto;cursor:auto}
+  /* changes pane — per-file diff cards on the editor surface */
+  .diffwrap{max-width:1000px;margin:0 auto}
+  /* every inline icon in a header/row is 14px — an unsized svg fills its
+     container and reads as a stray glyph. */
+  .dfh svg,.frow svg,.dockhead svg,.rhead svg{width:14px;height:14px;flex:none}
+  .dfile{border:1px solid var(--border);border-radius:var(--radius);margin-bottom:12px;overflow:hidden;
+    background:var(--editor-surface);box-shadow:0 1px 2px rgb(0 0 0 / .05)}
+  .dfh{display:flex;align-items:center;gap:8px;padding:7px 12px;background:var(--card);
+    border-bottom:1px solid var(--border);font-family:var(--font-mono);font-size:12px;min-width:0}
+  .dfh .p{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .dfh .cadd{margin-left:auto;color:var(--git-add);flex:none}
+  .dfh .cdel{color:var(--git-del);flex:none}
+  .dcode{font-family:var(--font-mono);font-size:11.5px;line-height:1.6;overflow-x:auto;padding:6px 0}
+  .dl{display:grid;grid-template-columns:34px 34px 14px 1fr;white-space:pre;min-width:max-content}
+  .dl .ln{color:color-mix(in srgb, var(--muted-foreground) 55%, transparent);text-align:right;
+    padding-right:7px;user-select:none;font-size:10px;line-height:inherit}
+  .dl .lm{user-select:none;text-align:center}
+  .dl .lc{padding-right:14px}
+  .dl.full{display:block;padding:0 12px;min-width:0}
+  .dl.add{background:color-mix(in srgb, var(--git-add) 13%, transparent);color:var(--git-add)}
+  .dl.del{background:color-mix(in srgb, var(--git-del) 13%, transparent);color:var(--git-del)}
+  .dl.hunk{color:var(--thread-ink);opacity:.85;padding-top:3px;padding-bottom:3px}
+  .dl.meta{color:color-mix(in srgb, var(--muted-foreground) 70%, transparent)}
+  /* right rail — multi-view: Explorer / Search / Source Control / Tasks (Orca) */
+  .rail{display:none;grid-column:3;grid-row:1;flex-direction:column;min-width:0;position:relative;
+    background:var(--sidebar);color:var(--sidebar-foreground);border-left:1px solid var(--sidebar-border)}
+  .railbar{display:flex;align-items:center;gap:2px;height:40px;flex:none;padding:0 6px;
+    box-shadow:inset 0 -1px 0 var(--sidebar-border)}
+  .railbar .iconbtn{width:30px;height:30px}
+  .railbar .iconbtn.active{background:var(--sidebar-accent);color:var(--foreground)}
+  .railbar .iconbtn.active::after{content:"";position:absolute}
+  .railbar .rvbtn{position:relative}
+  .railbar .rvbtn.active::before{content:"";position:absolute;left:6px;right:6px;bottom:-6px;height:2px;
+    border-radius:1px;background:var(--foreground)}
+  .railbar .spacer{margin-left:auto}
+  .rail .rhead{display:flex;align-items:center;gap:8px;height:30px;flex:none;padding:0 12px;
+    font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;font-family:var(--font-mono);
+    color:var(--muted-foreground);box-shadow:inset 0 -1px 0 var(--sidebar-border)}
+  .rail .rhead .b{color:var(--foreground);text-transform:none;letter-spacing:0}
+  .rail .rbody{flex:1;overflow-y:auto;overflow-x:hidden;padding:8px}
+  .rail .rbody.pad{padding:12px}
+  .rsec{font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;
+    color:var(--muted-foreground);font-family:var(--font-mono);margin:12px 2px 8px}
+  .rsec:first-child{margin-top:0}
+  .frow{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:var(--radius-sm);
+    font-family:var(--font-mono);font-size:12px;cursor:pointer;min-width:0}
+  .frow:hover{background:var(--sidebar-accent)}
+  .frow .fst{width:14px;flex:none;text-align:center;font-weight:600}
+  .frow .fp{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .fst.add{color:var(--git-add)}
+  .fst.mod{color:var(--git-mod)}
+  .fst.del{color:var(--git-del)}
+  /* explorer tree */
+  .trow{display:flex;align-items:center;gap:6px;height:24px;padding:0 6px;border-radius:var(--radius-sm);
+    font-size:12.5px;cursor:pointer;min-width:0;white-space:nowrap}
+  .trow:hover{background:var(--sidebar-accent)}
+  .trow .tw{width:12px;flex:none;color:var(--muted-foreground);display:inline-flex;justify-content:center}
+  .trow .tw svg{width:11px;height:11px;transition:transform .12s}
+  .trow.open .tw svg{transform:rotate(90deg)}
+  .trow .ti{width:14px;flex:none;color:var(--muted-foreground);display:inline-flex}
+  .trow .ti svg{width:13px;height:13px}
+  .trow .tn{overflow:hidden;text-overflow:ellipsis}
+  .trow.dir .tn{font-weight:500}
+  .tchild{overflow:hidden}
+  /* search */
+  .rsearch{padding:8px}
+  .rsearch input{width:100%;height:32px;background:transparent;border:1px solid var(--input);border-radius:var(--radius-md);
+    color:var(--foreground);padding:0 10px;font:inherit;font-size:12.5px;outline:none}
+  .dark .rsearch input{background:color-mix(in srgb, var(--input) 30%, transparent)}
+  .rsearch input:focus-visible{border-color:var(--ring);box-shadow:0 0 0 3px color-mix(in srgb, var(--ring) 45%, transparent)}
+  .sres{display:flex;flex-direction:column;gap:1px;padding:6px 8px}
+  .sres .frow .fp .dim{color:var(--muted-foreground)}
+  .railcard{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+    padding:10px 12px;margin-bottom:8px;box-shadow:0 1px 2px rgb(0 0 0 / .05)}
+  .railcard .rt{font-weight:600;font-size:12px;margin-bottom:3px;display:flex;align-items:center;gap:7px}
+  .railcard .rm{color:var(--muted-foreground);font-family:var(--font-mono);font-size:11px;line-height:1.5;
+    word-break:break-word}
+  .railcard.warnc{border-left:2px solid var(--warn)}
+  .railcard.threadc{border-left:2px solid color-mix(in srgb, var(--thread) 60%, transparent)}
+  .rempty{color:color-mix(in srgb, var(--muted-foreground) 80%, transparent);
+    font-family:var(--font-mono);font-size:11.5px;padding:2px 2px 6px}
+  .taskbtn{width:100%;margin-bottom:10px}
+  /* status bar (Orca, 25px) */
+  .statusbar{grid-column:1 / -1;grid-row:2;display:flex;align-items:center;gap:14px;
+    padding:0 12px;background:var(--sidebar);border-top:1px solid var(--sidebar-border);
+    font-family:var(--font-mono);font-size:11px;color:var(--muted-foreground);
+    user-select:none;min-width:0;overflow:hidden;white-space:nowrap}
+  .statusbar .sit{display:inline-flex;align-items:center;gap:6px;flex:none}
+  .sdot{width:7px;height:7px;border-radius:50%;background:var(--ok);flex:none}
+  .sdot.off{background:color-mix(in srgb, var(--muted-foreground) 50%, transparent)}
+  .meter{width:56px;height:4px;border-radius:2px;flex:none;overflow:hidden;
+    background:color-mix(in srgb, var(--muted-foreground) 25%, transparent)}
+  .meter i{display:block;height:100%;border-radius:2px;
+    background:color-mix(in srgb, var(--muted-foreground) 70%, transparent)}
+  .dempty{flex:1;display:flex;flex-direction:column;gap:12px;align-items:center;justify-content:center;
+    color:var(--muted-foreground);font-family:var(--font-mono);font-size:13px}
+  .dempty .biglogo{font-size:36px;font-weight:650;letter-spacing:-.02em;color:var(--foreground)}
+  .dempty .hair{width:48px;height:2px;border-radius:1px;
+    background:linear-gradient(90deg,transparent,var(--thread),transparent)}
+  /* ── Terminal dock (Orca bottom terminal splits) ──────── */
+  .termdock{flex:none;display:none;flex-direction:column;height:240px;min-height:110px;max-height:70vh;
+    border-top:1px solid var(--border);background:var(--editor-surface)}
+  .termdock.open{display:flex}
+  .termresize{height:5px;flex:none;cursor:row-resize;margin-top:-3px;position:relative;z-index:2}
+  .termresize::after{content:"";position:absolute;left:0;right:0;top:2px;height:1px;background:transparent;transition:background .12s}
+  .termresize:hover::after{background:var(--ring)}
+  .termtabs{display:flex;align-items:center;gap:2px;height:30px;flex:none;padding:0 8px;
+    border-bottom:1px solid var(--border);background:var(--sidebar)}
+  .termtab{display:inline-flex;align-items:center;gap:7px;height:24px;padding:0 8px 0 10px;border-radius:6px;
+    font-family:var(--font-mono);font-size:11.5px;color:var(--muted-foreground);cursor:pointer;border:1px solid transparent}
+  .termtab:hover{color:var(--foreground);background:color-mix(in srgb, var(--accent) 55%, transparent)}
+  .termtab.active{background:var(--editor-surface);color:var(--foreground);border-color:var(--border)}
+  .termtab .tx{display:inline-flex;opacity:.5;border-radius:3px;width:15px;height:15px;align-items:center;justify-content:center}
+  .termtab .tx:hover{opacity:1;background:var(--accent)}
+  .termtab .tx svg{width:11px;height:11px}
+  .termtabs .iconbtn{width:24px;height:24px}
+  .termtabs .iconbtn svg{width:13px;height:13px}
+  /* one host per tab: xterm mounts into it in pty mode, the line-renderer
+     writes into it in pipe mode. Only the active one is displayed. */
+  .termpanes{flex:1;min-height:0;position:relative}
+  /* ── Source control ───────────────────────────────────
+     Staged and unstaged are separate sections on purpose: a file can be in both
+     at once, and one list would show a checkbox that lies about the commit. */
+  .gbranch{display:flex;align-items:center;gap:6px;padding:7px 10px;border-bottom:1px solid var(--border);
+    font-size:11.5px;color:var(--muted-foreground)}
+  .gbranch svg{width:13px;height:13px;flex:none}
+  .gbranch .bn{color:var(--foreground);font-weight:600;font-family:var(--font-mono);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .gcount{font-family:var(--font-mono);font-size:10px;padding:1px 5px;border-radius:8px;
+    background:var(--sidebar-accent);flex:none}
+  .gcount.dim{opacity:.6}
+  .gbranch .gbranchsel{background:transparent;border:1px solid var(--input);border-radius:6px;color:var(--foreground);
+    font-family:var(--font-mono);font-size:11px;font-weight:600;padding:2px 4px;cursor:pointer;max-width:130px}
+  .gbranch .gbranchsel:focus{outline:none;border-color:var(--ring)}
+  .gbranch .iconbtn.xs{margin-left:0}
+  .ginit{padding:16px 12px;display:flex;flex-direction:column;gap:10px;align-items:flex-start}
+  .ginit .rempty{padding:0}
+  /* commit history at the foot of the source-control panel — a fixed-height,
+     self-scrolling region so a long history never buries the changes above it */
+  .gcommits-h{margin-top:4px;position:sticky;top:0}
+  .gcommits{display:flex;flex-direction:column;max-height:230px;overflow-y:auto}
+  .gclog{display:grid;grid-template-columns:auto 1fr;grid-template-rows:auto auto;column-gap:8px;
+    padding:6px 10px;border-bottom:1px solid color-mix(in srgb, var(--border) 60%, transparent)}
+  .gclog:hover{background:var(--sidebar-accent)}
+  .gcsha{grid-row:1/3;align-self:center;font-family:var(--font-mono);font-size:10px;color:var(--muted-foreground);
+    background:var(--sidebar-accent);border-radius:5px;padding:2px 5px;height:fit-content}
+  .gcsub{font-size:12px;color:var(--foreground);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .gcmeta{font-size:10px;color:var(--muted-foreground);font-family:var(--font-mono);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .rsec .gn{font-family:var(--font-mono);opacity:.65;margin-left:5px;font-weight:400}
+  .rsec .lnk{margin-left:auto;font-size:10.5px;color:var(--muted-foreground);cursor:pointer;
+    background:none;border:0;padding:0 2px}
+  .rsec .lnk:hover{color:var(--foreground);text-decoration:underline}
+  .frow.git{align-items:center}
+  .frow.git .fp{cursor:pointer}
+  .frow.git .fp:hover{text-decoration:underline}
+  .gacts{margin-left:auto;display:none;gap:1px;flex:none}
+  /* --- VS Code-style source control --- */
+  .scmcommit{padding:10px 10px 6px;display:flex;flex-direction:column;gap:8px}
+  .scmmsgwrap{position:relative}
+  .scmmsg{width:100%;box-sizing:border-box;min-height:60px;max-height:160px;resize:none;
+    background:color-mix(in srgb, var(--input) 30%, var(--background));border:1px solid var(--input);
+    border-radius:8px;padding:8px 10px;font:inherit;font-size:12.5px;line-height:1.5;color:var(--foreground);overflow-y:auto}
+  .scmmsg::placeholder{color:color-mix(in srgb, var(--muted-foreground) 60%, transparent)}
+  .scmmsg:focus{outline:none;border-color:var(--ring);box-shadow:0 0 0 3px color-mix(in srgb, var(--ring) 24%, transparent)}
+  .scmgen{position:absolute;right:6px;bottom:6px;display:inline-flex;align-items:center;gap:4px;height:22px;padding:0 8px;
+    background:color-mix(in srgb, var(--primary) 14%, transparent);color:var(--primary);border:1px solid color-mix(in srgb, var(--primary) 30%, transparent);
+    border-radius:6px;font:inherit;font-size:10.5px;font-weight:600;cursor:pointer;transition:background .12s}
+  .scmgen:hover{background:color-mix(in srgb, var(--primary) 22%, transparent)}
+  .scmgen svg{width:12px;height:12px}
+  .scmgen.busy svg{animation:spin 1s linear infinite}
+  .scmgen:disabled{opacity:.6;cursor:default}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .scmcommitrow{display:flex;gap:1px}
+  .scmcommitbtn{flex:1;border-top-right-radius:0;border-bottom-right-radius:0;height:32px}
+  .scmsplit{width:30px;flex:none;padding:0;border-top-left-radius:0;border-bottom-left-radius:0;
+    border-left:1px solid color-mix(in srgb, var(--primary-foreground) 25%, transparent);height:32px}
+  .scmsplit svg{width:14px;height:14px;transform:rotate(90deg)}
+  .btn.primary:disabled{opacity:.5;cursor:default}
+  .scmmenu{position:fixed;z-index:70;min-width:180px;background:var(--popover,var(--background));
+    border:1px solid var(--border);border-radius:9px;box-shadow:0 12px 34px rgba(0,0,0,.3);padding:4px}
+  .scmmi{display:block;width:100%;text-align:left;padding:7px 10px;border:0;border-radius:6px;background:none;
+    color:var(--foreground);font:inherit;font-size:12.5px;cursor:pointer}
+  .scmmi:hover{background:var(--sidebar-accent)}
+  .scmsec{display:flex;align-items:center;gap:6px;padding:8px 10px 4px;font-size:11px;font-weight:600;
+    letter-spacing:.04em;text-transform:uppercase;color:var(--muted-foreground)}
+  .scmsec .scmn{font-family:var(--font-mono);font-weight:400;opacity:.7}
+  .scmsec .lnk{margin-left:auto;display:inline-flex;color:var(--muted-foreground);cursor:pointer;background:none;border:0;padding:2px;border-radius:4px}
+  .scmsec .lnk:hover{color:var(--foreground);background:var(--sidebar-accent)}
+  .scmsec .lnk svg{width:14px;height:14px}
+  /* the changed-files list: a fixed cap with its own scroll, so a big diff set
+     stays a bounded panel instead of pushing the commit box and history away */
+  .scmlist{display:flex;flex-direction:column;max-height:34vh;overflow-y:auto}
+  .scmrow{display:flex;align-items:center;gap:6px;padding:4px 10px;cursor:default}
+  .scmrow:hover{background:var(--sidebar-accent)}
+  .scmname{flex:1;min-width:0;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;
+    color:var(--foreground)}
+  .scmname:hover{text-decoration:underline}
+  .scmname .scmdir{color:var(--muted-foreground);opacity:.7}
+  .scmacts{display:none;gap:1px;flex:none}
+  .scmrow:hover .scmacts{display:flex}
+  .scmbadge{flex:none;width:16px;text-align:center;font-family:var(--font-mono);font-size:11px;font-weight:700}
+  .scmbadge.mod{color:#e2b341}
+  .scmbadge.add{color:#4aa564}
+  .scmbadge.del{color:#e5674d}
+  .frow.git:hover .gacts{display:flex}
+  .iconbtn.xs{width:20px;height:20px;border-radius:5px}
+  /* A message that matches, in the sidebar under the projects. */
+  .chit{display:flex;gap:7px;padding:5px 10px;cursor:pointer;align-items:baseline;font-size:11px}
+  .chit:hover{background:var(--sidebar-accent)}
+  .chit .cw{flex:none;color:var(--muted-foreground);font-size:10px;max-width:60px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .chit .cs{flex:1;min-width:0;color:var(--foreground);overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap;opacity:.85}
+  .stitle .cnt{margin-left:auto;font-family:var(--font-mono);font-size:10px;opacity:.7}
+  /* ── Search ───────────────────────────────────────────
+     Two modes, one box. Code hits group by file, because twenty hits in one
+     file is one answer rather than twenty. */
+  .smodes{display:flex;align-items:center;gap:4px;padding:0 8px 6px 8px}
+  .smodes .lvl{padding:2px 8px;border-radius:11px;cursor:pointer;font-size:10.5px;
+    color:var(--muted-foreground);border:1px solid transparent}
+  .smodes .lvl:hover{background:var(--sidebar-accent)}
+  .smodes .lvl.on{background:var(--sidebar-accent);border-color:var(--border);color:var(--foreground)}
+  .scount{font-family:var(--font-mono);font-size:10px;color:var(--muted-foreground)}
+  .hitfile{display:flex;align-items:center;gap:6px;padding:6px 10px 2px 10px;
+    font-size:11px;font-weight:600;color:var(--foreground);position:sticky;top:0;
+    background:var(--card);border-top:1px solid var(--border)}
+  .hitfile .fp{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left}
+  .hitfile .hc{margin-left:auto;font-family:var(--font-mono);font-size:10px;color:var(--muted-foreground);flex:none}
+  .hitrow{display:flex;gap:8px;padding:2px 10px 2px 14px;cursor:pointer;align-items:baseline}
+  .hitrow:hover{background:var(--sidebar-accent)}
+  .hitrow .hn{font-family:var(--font-mono);font-size:10px;color:var(--muted-foreground);
+    flex:none;min-width:26px;text-align:right}
+  .hitrow .ht{font-family:var(--font-mono);font-size:10.5px;color:var(--muted-foreground);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+  .hitrow mark,.chit mark{background:color-mix(in srgb,var(--warn) 35%,transparent);
+    color:var(--foreground);border-radius:2px;padding:0 1px}

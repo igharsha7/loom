@@ -1,0 +1,48 @@
+{
+  "measuredAt": "2026-09-28T08:24:36.883Z",
+  "node": "v24.3.0",
+  "hardware": {
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M4",
+    "memoryBytes": 17179869184
+  },
+  "corpus": {
+    "events": 10001,
+    "buriedUserPoints": 20,
+    "attempts": 30,
+    "paidCalls": 0,
+    "git": false
+  },
+  "preparationMs": {
+    "p50": 19.03137499999866,
+    "p95": 25.583166000000347
+  },
+  "retrievalMs": {
+    "p50": 0.29900000000088767,
+    "p95": 0.7585829999989073
+  },
+  "daemonLoopMs": {
+    "p95": 19.464191,
+    "max": 25.772031
+  },
+  "appAddedTokens": {
+    "minimum": 3034,
+    "maximum": 3034,
+    "estimation": "UTF-8 bytes / 3 heuristic"
+  },
+  "exactReplayEstimatedTokens": 258978,
+  "allBuriedUserPointsIncluded": true,
+  "legacyRecent400ContainsFirstPoint": false,
+  "processMemory": {
+    "rss": 119554048,
+    "heapTotal": 48218112,
+    "heapUsed": 22705600,
+    "external": 2129463,
+    "arrayBuffers": 25235
+  },
+  "diskBytes": 4829184,
+  "nativeTokens": null,
+  "helperTokens": 0,
+  "continuationQuality": "native understanding not measured; exact source inclusion checked"
+}

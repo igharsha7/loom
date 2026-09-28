@@ -52,6 +52,8 @@ export interface QueueItem {
   source: "user" | "route";
   at: number;
   editedAt?: number;
+  /** Native continuity freezes its target model and idempotency key at enqueue. */
+  continuity?: { requestId: string; model: string | null };
   /** Hold it back until this is true — see QueueCondition. */
   when?: QueueCondition;
 }
@@ -104,6 +106,7 @@ export interface QueueInput {
   length?: "brief" | "detailed";
   source?: "user" | "route";
   when?: QueueCondition;
+  continuity?: QueueItem["continuity"];
 }
 
 export const MAX_QUEUE = 100;
@@ -157,7 +160,7 @@ export class PromptQueue {
   }
 
   snapshot(): QueueState {
-    return { items: this.state.items.map((i) => ({ ...i, target: { ...i.target } as QueueTarget })), paused: this.state.paused, ...(this.state.reason ? { reason: this.state.reason } : {}) };
+    return { items: this.state.items.map((i) => ({ ...i, target: { ...i.target } as QueueTarget, ...(i.continuity ? { continuity: { ...i.continuity } } : {}) })), paused: this.state.paused, ...(this.state.reason ? { reason: this.state.reason } : {}) };
   }
 
   get paused(): boolean {
@@ -173,10 +176,9 @@ export class PromptQueue {
   }
 
   add(input: QueueInput): QueueItem {
-    const text = input.text.trim();
-    if (!text) throw new Error("nothing to queue — the prompt is empty");
-    if (text.length > MAX_QUEUE_TEXT) throw new Error(`a queued prompt is at most ${MAX_QUEUE_TEXT} characters`);
-    if (this.state.items.length >= MAX_QUEUE) throw new Error(`the queue is full (${MAX_QUEUE} prompts)`);
+    this.assertCanAdd(input);
+    // Captured native requests are immutable evidence, including whitespace.
+    const text = input.continuity ? input.text : input.text.trim();
     const item: QueueItem = {
       id: `q${Date.now().toString(36)}${(this.seq++).toString(36)}`,
       text,
@@ -185,6 +187,7 @@ export class PromptQueue {
       ...(input.plan ? { plan: true } : {}),
       ...(input.length ? { length: input.length } : {}),
       source: input.source ?? "user",
+      ...(input.continuity ? { continuity: { ...input.continuity } } : {}),
       at: Date.now(),
       ...(input.when ? { when: input.when } : {}),
     };
@@ -193,11 +196,17 @@ export class PromptQueue {
     return item;
   }
 
+  assertCanAdd(input: QueueInput): void {
+    if (!input.text.trim()) throw new Error("nothing to queue — the prompt is empty");
+    if (input.text.length > MAX_QUEUE_TEXT) throw new Error(`a queued prompt is at most ${MAX_QUEUE_TEXT} characters`);
+    if (this.state.items.length >= MAX_QUEUE) throw new Error(`the queue is full (${MAX_QUEUE} prompts)`);
+  }
+
   edit(id: string, patch: { text?: string; target?: QueueTarget; plan?: boolean; when?: QueueCondition | null }): QueueItem {
     const item = this.must(id);
     if (patch.text !== undefined) {
-      const text = patch.text.trim();
-      if (!text) throw new Error("a queued prompt can't be empty — remove it instead");
+      const text = item.continuity ? patch.text : patch.text.trim();
+      if (!text.trim()) throw new Error("a queued prompt can't be empty — remove it instead");
       if (text.length > MAX_QUEUE_TEXT) throw new Error(`a queued prompt is at most ${MAX_QUEUE_TEXT} characters`);
       item.text = text;
     }
@@ -293,7 +302,9 @@ export class QueueItemGone extends Error {
 function validItem(x: unknown): x is QueueItem {
   if (!x || typeof x !== "object") return false;
   const i = x as QueueItem;
-  if (typeof i.id !== "string" || typeof i.text !== "string" || !i.text) return false;
+  if (typeof i.id !== "string" || typeof i.text !== "string" || !i.text.trim() || i.text.length > MAX_QUEUE_TEXT) return false;
+  if (i.continuity && (typeof i.continuity.requestId !== "string" || !i.continuity.requestId || i.continuity.requestId.length > 256 ||
+    !(i.continuity.model === null || (typeof i.continuity.model === "string" && i.continuity.model.length > 0 && i.continuity.model.length <= 256)))) return false;
   try {
     i.target = parseTarget(i.target);
   } catch {

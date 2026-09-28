@@ -164,7 +164,15 @@ export function readProjectConfig(projectDir: string): ProjectConfig | null {
 }
 
 export function writeProjectConfig(projectDir: string, cfg: ProjectConfig): void {
-  writeJson(path.join(projectLoomDir(projectDir), "config.json"), cfg);
+  const dir = projectLoomDir(projectDir), file = path.join(dir, "config.json");
+  fs.mkdirSync(dir, { recursive: true });
+  const temporary = path.join(dir, `.config-${crypto.randomUUID()}.tmp`);
+  const fd = fs.openSync(temporary, "wx", fs.existsSync(file) ? fs.statSync(file).mode & 0o777 : 0o600);
+  try {
+    try { fs.writeFileSync(fd, JSON.stringify(cfg, null, 2) + "\n"); fs.fsyncSync(fd); }
+    finally { fs.closeSync(fd); }
+    fs.renameSync(temporary, file);
+  } finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); }
 }
 
 /** Mutable per-project state: baton holder + adapter session state. */

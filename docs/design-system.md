@@ -11,7 +11,7 @@ Canonical token sources:
 
 | Surface | Token file |
 | --- | --- |
-| Web app (daemon-served) + Electron shell | `src/daemon/app-page.ts` (`:root` light / `.dark`) |
+| Web app (daemon-served) + Electron shell | `src/web/styles/base.css` (`:root` light / `.dark`) |
 | Phone app (Expo RN) | `app/src/theme.ts` |
 
 ## Color tokens — web / desktop (from Orca desktop)

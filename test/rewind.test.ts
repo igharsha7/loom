@@ -158,11 +158,11 @@ describe("rewinding through the daemon", () => {
     const { checkpoints } = await api<{ checkpoints: Checkpoint[] }>("GET", "/checkpoints");
     const rt = daemon.runtimes.get(projectId)!;
     // Stand an agent up as busy the way a real turn does.
-    (rt as unknown as { busySince: Map<string, number> }).busySince.set("execbot", Date.now());
+    rt["turns"].busySince.set("execbot", Date.now());
     try {
       await expect(api("POST", `/checkpoints/${checkpoints[0]!.id}/rewind`)).rejects.toThrow(/execbot.*mid-turn/);
     } finally {
-      (rt as unknown as { busySince: Map<string, number> }).busySince.delete("execbot");
+      rt["turns"].busySince.delete("execbot");
     }
     // …and having refused, it changed nothing.
     expect(read("app.ts")).toBeTruthy();

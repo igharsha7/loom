@@ -1,77 +1,42 @@
 /**
- * The Claude Code adapter — the one every turn goes through, and the one that
- * had 0% of its functions covered.
+ * The Claude Code adapter — driven through the Claude Agent SDK against a fake
+ * `claude` that speaks the CLI's stream-json control protocol (see
+ * native-fakes.ts).
  *
- * It is driven with a fake `claude` on disk rather than the real one. That is
- * not a compromise, it's the right instrument: this adapter's entire job is
- * translating another program's stdout into Loom events, so the thing worth
- * testing is what it does with bytes it's given — including the bytes a real
- * claude only produces when something has gone wrong, which you can't summon on
- * demand and shouldn't pay for.
- *
- * The JSONL below is the real `--output-format stream-json` shape (claude
- * 2.1.83): a system/init carrying the session id, assistant messages holding
- * content blocks, and a final result with the cost.
+ * This adapter's job is translating another program's messages into Loom
+ * events, so the thing worth testing is what it does with messages it's given
+ * — including the ones a real claude only produces when something has gone
+ * wrong, which you can't summon on demand and shouldn't pay for.
  */
 
-import fs from "node:fs";
-import path from "node:path";
-import { describe, expect, it } from "vitest";
-import { ClaudeCodeAdapter } from "../src/adapters/claude-code.js";
-import type { AdapterEvent } from "../src/types.js";
-import { makeProjectDir, tmpDir } from "./helpers.js";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { ClaudeCodeAdapter, stopAllProviderSessions } from "../src/providers/agent.js";
+import { setApprovalBroker, type ApprovalRequest } from "../src/core/approvals.js";
+import { NativeSessionMissing } from "../src/core/continuity/contracts.js";
+import type { AdapterEvent, SendInput } from "../src/types.js";
+import { makeProjectDir } from "./helpers.js";
+import { CLAUDE_OK, callsOf, claudeInit, claudeInitOf, claudePromptOf, claudeResult, claudeText, claudeThink, claudeTool,
+  fakeClaude, stdinOf, type FakeClaudeOptions, type Step } from "./native-fakes.js";
 
-/** A stand-in `claude` that prints the given lines and exits with `code`. */
-function fakeClaude(lines: string[], { code = 0, stderr = "", delayMs = 0 } = {}): string {
-  const dir = tmpDir("fake-claude");
-  const bin = path.join(dir, "claude");
-  const body = lines.map((l) => `console.log(${JSON.stringify(l)});`).join("\n");
-  fs.writeFileSync(
-    bin,
-    `#!/usr/bin/env node
-// A fake claude. Prints a recorded stream-json transcript and exits.
-const args = process.argv.slice(2);
-require("node:fs").writeFileSync(${JSON.stringify(path.join(dir, "argv.json"))}, JSON.stringify(args));
-${stderr ? `console.error(${JSON.stringify(stderr)});` : ""}
-setTimeout(() => {
-  ${body}
-  process.exit(${code});
-}, ${delayMs});
-`,
-    { mode: 0o755 },
-  );
-  return bin;
-}
+// Provider sessions stay warm between turns; end them with the file.
+afterAll(async () => { await stopAllProviderSessions(); });
 
-/** Where the fake wrote the argv it was called with. */
-function argvOf(bin: string): string[] {
-  return JSON.parse(fs.readFileSync(path.join(path.dirname(bin), "argv.json"), "utf8")) as string[];
-}
+afterEach(() => setApprovalBroker(null));
 
-const INIT = (session: string) =>
-  JSON.stringify({ type: "system", subtype: "init", session_id: session });
-const TEXT = (text: string) =>
-  JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text }] } });
-const TOOL = (name: string, input: Record<string, unknown>) =>
-  JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name, input }] } });
-const THINK = (thinking: string) =>
-  JSON.stringify({ type: "assistant", message: { content: [{ type: "thinking", thinking }] } });
-const RESULT = (extra: Record<string, unknown> = {}) =>
-  JSON.stringify({ type: "result", total_cost_usd: 0.0421, ...extra });
-
-/** Run a turn against a fake claude and collect what the adapter emitted. */
 async function run(
-  lines: string[],
-  opts: { code?: number; stderr?: string } = {},
+  script: Step[],
+  opts: Omit<FakeClaudeOptions, "script"> = {},
+  input: Partial<SendInput> = {},
+  agentOptions: Record<string, unknown> = {},
   dir = makeProjectDir({ name: "cc" }),
 ): Promise<{ events: AdapterEvent[]; dir: string; bin: string; error?: Error }> {
-  const bin = fakeClaude(lines, opts);
-  const agent = new ClaudeCodeAdapter("claude-code", dir, { bin });
+  const bin = fakeClaude({ script, ...opts });
+  const agent = new ClaudeCodeAdapter("claude-code", dir, { bin, ...agentOptions });
   const events: AdapterEvent[] = [];
   agent.onEvent((e) => events.push(e));
   let error: Error | undefined;
   try {
-    await agent.send({ text: "do the thing" });
+    await agent.send({ text: "do the thing", ...input });
   } catch (err) {
     error = err as Error;
   }
@@ -81,103 +46,83 @@ async function run(
 const kinds = (events: AdapterEvent[]): string[] => events.map((e) => e.kind);
 const of = (events: AdapterEvent[], kind: string): Array<Record<string, unknown>> =>
   events.filter((e) => e.kind === kind).map((e) => e.payload);
+const states = (events: AdapterEvent[]): unknown[] => of(events, "status").map((p) => p.state);
+/** A flag's value, in either `--name value` or `--name=value` form. */
+const flag = (argv: string[], name: string): string | undefined => {
+  const joined = argv.find((a) => a.startsWith(`${name}=`));
+  if (joined) return joined.slice(name.length + 1);
+  return argv.includes(name) ? argv[argv.indexOf(name) + 1] : undefined;
+};
 
 describe("claude-code · a normal turn", () => {
   it("reports the session, the words, and the cost", async () => {
-    const { events } = await run([INIT("sess-1"), TEXT("Done."), RESULT()]);
-    expect(kinds(events)).toEqual(["status", "message", "status", "run_complete"]);
-    expect(of(events, "status")[0]).toMatchObject({ state: "turn_started", session: "sess-1" });
-    expect(of(events, "message")[0]).toMatchObject({ text: "Done." });
-    expect(of(events, "status")[1]).toMatchObject({ state: "turn_cost", costUsd: 0.0421 });
-  });
-
-  it("asks for partial messages, and types the reply out live — its own, not a sub-agent's", async () => {
-    // the real --include-partial-messages shape (claude 2.1.276)
-    const DELTA = (kind: "text_delta" | "thinking_delta", s: string, parent: string | null = null) =>
-      JSON.stringify({
-        type: "stream_event",
-        parent_tool_use_id: parent,
-        event: { type: "content_block_delta", index: 0, delta: kind === "text_delta" ? { type: kind, text: s } : { type: kind, thinking: s } },
-      });
-    const bin = fakeClaude([
-      INIT("sess-live"),
-      DELTA("thinking_delta", "let me see"),
-      DELTA("text_delta", "Hel"),
-      DELTA("text_delta", "sub-agent chatter", "toolu_1"),
-      DELTA("text_delta", "lo."),
-      TEXT("Hello."),
-      RESULT(),
-    ]);
-    const agent = new ClaudeCodeAdapter("claude-code", makeProjectDir({ name: "cc" }), { bin });
-    const live: Array<{ text: string; reasoning?: boolean }> = [];
-    const events: AdapterEvent[] = [];
-    agent.onStream((d) => live.push(d));
-    agent.onEvent((e) => events.push(e));
-    await agent.send({ text: "say hello" });
-    expect(argvOf(bin)).toContain("--include-partial-messages");
-    expect(live).toEqual([{ text: "let me see", reasoning: true }, { text: "Hel" }, { text: "lo." }]);
-    // the finished message is still the record, exactly once
-    expect(of(events, "message")).toEqual([{ text: "Hello." }]);
+    const { events } = await run([claudeInit, claudeText("Done."), claudeResult()]);
+    expect(of(events, "status")[0]).toMatchObject({ state: "turn_started" });
+    expect(of(events, "message")).toEqual([{ text: "Done." }]);
+    expect(of(events, "status").find((p) => p.state === "turn_cost")).toMatchObject({ costUsd: 0.0421 });
+    expect(kinds(events).at(-1)).toBe("run_complete");
   });
 
   it("captures token usage from the result and rides it on run_complete", async () => {
-    const { events } = await run([
-      INIT("sess-t"),
-      TEXT("ok"),
-      RESULT({ usage: { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 20, cache_creation_input_tokens: 5 } }),
-    ]);
+    const { events } = await run([claudeInit, claudeText("ok"),
+      claudeResult({ usage: { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 20, cache_creation_input_tokens: 5 } })]);
     // cache reads + creations count as input tokens (100 + 20 + 5), output = 50
-    expect(of(events, "run_complete")[0]).toMatchObject({ inputTokens: 125, outputTokens: 50 });
+    expect(of(events, "run_complete")[0]).toMatchObject({ inputTokens: 125, outputTokens: 50, model: "claude-test" });
   });
 
   it("remembers the session so the next turn resumes it", async () => {
     const dir = makeProjectDir({ name: "cc" });
-    await run([INIT("sess-abc"), TEXT("hi"), RESULT()], {}, dir);
-
-    // second turn, same project: --resume must carry the id from the first
-    const second = fakeClaude([INIT("sess-abc"), TEXT("again"), RESULT()]);
-    const agent = new ClaudeCodeAdapter("claude-code", dir, { bin: second });
-    await agent.send({ text: "more" });
-    const argv = argvOf(second);
-    expect(argv).toContain("--resume");
-    expect(argv[argv.indexOf("--resume") + 1]).toBe("sess-abc");
+    const first = await run(CLAUDE_OK, {}, {}, {}, dir);
+    const session = of(first.events, "status")[0]!.session as string;
+    const second = await run(CLAUDE_OK, {}, { text: "more" }, {}, dir);
+    expect(flag(callsOf(second.bin)[0]!, "--resume")).toBe(session);
   });
 
-  it("passes a handoff briefing through the system-prompt channel", async () => {
-    const bin = fakeClaude([INIT("s"), TEXT("ok"), RESULT()]);
-    const agent = new ClaudeCodeAdapter("claude-code", makeProjectDir({ name: "cc" }), { bin });
-    await agent.send({ text: "go", briefing: "you are picking up from opencode" });
-    const argv = argvOf(bin);
-    // this is the channel that makes claude's memory injection strong — the
-    // briefing must not silently become part of the user's prompt
-    expect(argv).toContain("--append-system-prompt");
-    expect(argv[argv.indexOf("--append-system-prompt") + 1]).toBe("you are picking up from opencode");
-    expect(argv[argv.indexOf("-p") + 1]).toBe("go");
+  /**
+   * A warm session's system prompt is fixed when it starts, so a handoff
+   * briefing rides in front of the turn's text, framed as authoritative.
+   */
+  it("puts a handoff briefing in front of the prompt, framed", async () => {
+    const { bin } = await run(CLAUDE_OK, {}, { text: "go", briefing: "you are picking up from opencode" });
+    expect(claudeInitOf(bin).appendSystemPrompt).toBeUndefined();
+    expect(claudePromptOf(bin)).toMatch(/LOOM SESSION MEMORY[\s\S]*you are picking up from opencode[\s\S]*\n\ngo$/);
   });
 
-  it("asks for the permission mode it was configured with", async () => {
-    const bin = fakeClaude([INIT("s"), TEXT("ok"), RESULT()]);
-    const agent = new ClaudeCodeAdapter("claude-code", makeProjectDir({ name: "cc" }), {
-      bin,
-      permissionMode: "plan",
-      model: "opus",
-    });
-    await agent.send({ text: "go" });
-    const argv = argvOf(bin);
-    expect(argv[argv.indexOf("--permission-mode") + 1]).toBe("plan");
-    expect(argv[argv.indexOf("--model") + 1]).toBe("opus");
+  it("loads Claude Code's own settings, as an interactive claude would", async () => {
+    const { bin } = await run(CLAUDE_OK);
+    expect(callsOf(bin)[0]).toContain("--setting-sources=user,project,local");
+  });
+
+  it("asks for the permission mode and model it was configured with", async () => {
+    const { bin } = await run(CLAUDE_OK, {}, {}, { permissionMode: "plan", model: "opus" });
+    const argv = callsOf(bin)[0]!;
+    expect(flag(argv, "--permission-mode")).toBe("plan");
+    expect(flag(argv, "--model")).toBe("opus");
+  });
+
+  it("maps Loom's permission modes onto Claude's", async () => {
+    const bypass = await run(CLAUDE_OK, {}, {}, { permissions: "bypass" });
+    expect(flag(callsOf(bypass.bin)[0]!, "--permission-mode")).toBe("bypassPermissions");
+    const auto = await run(CLAUDE_OK, {}, {}, { permissions: "auto" });
+    expect(flag(callsOf(auto.bin)[0]!, "--permission-mode")).toBe("acceptEdits");
+    // "ask" with nobody to ask degrades to plan (read-only), never to allow
+    const ask = await run(CLAUDE_OK, {}, {}, { permissions: "ask" });
+    expect(flag(callsOf(ask.bin)[0]!, "--permission-mode")).toBe("plan");
+  });
+
+  it("passes extra CLI args through", async () => {
+    const { bin } = await run(CLAUDE_OK, {}, {}, { extraArgs: ["--max-turns", "3", "--debug"] });
+    const argv = callsOf(bin)[0]!;
+    expect(argv).toContain("--max-turns");
+    expect(argv).toContain("--debug");
   });
 });
 
 describe("claude-code · what it did, not just what it said", () => {
   it("reports tool calls with a readable summary", async () => {
-    const { events } = await run([
-      INIT("s"),
-      TOOL("Bash", { command: "npm test" }),
-      TEXT("green"),
-      RESULT(),
-    ]);
-    expect(of(events, "tool_call")[0]).toMatchObject({ tool: "Bash" });
+    const { events } = await run([claudeInit, claudeTool("Bash", { command: "npm test" }), claudeText("green"), claudeResult()]);
+    // Commands are one canonical kind across providers.
+    expect(of(events, "tool_call")[0]).toMatchObject({ tool: "shell" });
     expect(String(of(events, "tool_call")[0]?.summary)).toContain("npm test");
   });
 
@@ -186,85 +131,129 @@ describe("claude-code · what it did, not just what it said", () => {
    * must fire for the tools that write and stay quiet for the ones that don't.
    */
   it("raises file_edit for writes, and not for reads", async () => {
-    const { events } = await run([
-      INIT("s"),
-      TOOL("Read", { file_path: "/repo/read-only.ts" }),
-      TOOL("Edit", { file_path: "/repo/changed.ts" }),
-      TOOL("Write", { file_path: "/repo/new.ts" }),
-      RESULT(),
-    ]);
-    const edits = of(events, "file_edit").map((p) => p.path);
-    expect(edits).toEqual(["/repo/changed.ts", "/repo/new.ts"]);
-    expect(edits).not.toContain("/repo/read-only.ts");
+    const { events } = await run([claudeInit, claudeTool("Read", { file_path: "src/read-only.ts" }),
+      claudeTool("Edit", { file_path: "src/changed.ts" }), claudeTool("Write", { file_path: "src/new.ts" }), claudeResult()]);
+    expect(of(events, "file_edit").map((p) => p.path)).toEqual(["src/changed.ts", "src/new.ts"]);
   });
 
-  /**
-   * Extended thinking used to be dropped on the floor: the content loop only
-   * matched text and tool_use. Now it surfaces as a reasoning-tagged message so
-   * the thread can fold it into a "thinking" block — distinct from the reply.
-   */
   it("surfaces extended-thinking blocks as reasoning, kept apart from the reply", async () => {
-    const { events } = await run([
-      INIT("s"),
-      THINK("Let me weigh the two approaches before I answer."),
-      TEXT("Use the second approach."),
-      RESULT(),
-    ]);
+    const { events } = await run([claudeInit, claudeThink("Let me weigh the two approaches before I answer."),
+      claudeText("Use the second approach."), claudeResult()]);
     const msgs = of(events, "message");
-    const reasoning = msgs.filter((p) => p.reasoning);
-    const replies = msgs.filter((p) => !p.reasoning);
-    expect(reasoning).toHaveLength(1);
-    expect(String(reasoning[0]!.text)).toContain("weigh the two approaches");
-    // the reply is the reply — thinking never becomes the assistant's answer
-    expect(replies.map((p) => p.text)).toEqual(["Use the second approach."]);
+    expect(msgs.filter((p) => p.reasoning).map((p) => p.text)).toEqual(["Let me weigh the two approaches before I answer."]);
+    expect(msgs.filter((p) => !p.reasoning).map((p) => p.text)).toEqual(["Use the second approach."]);
   });
 
   it("ignores an empty thinking block", async () => {
-    const { events } = await run([INIT("s"), THINK("   "), TEXT("done"), RESULT()]);
+    const { events } = await run([claudeInit, claudeThink("   "), claudeText("done"), claudeResult()]);
     expect(of(events, "message").filter((p) => p.reasoning)).toHaveLength(0);
   });
 
   it("follows a notebook edit to its notebook", async () => {
-    const { events } = await run([
-      INIT("s"),
-      TOOL("NotebookEdit", { notebook_path: "/repo/nb.ipynb" }),
-      RESULT(),
-    ]);
-    expect(of(events, "file_edit")[0]).toMatchObject({ path: "/repo/nb.ipynb", tool: "NotebookEdit" });
+    const { events } = await run([claudeInit, claudeTool("NotebookEdit", { notebook_path: "nb.ipynb" }), claudeResult()]);
+    expect(of(events, "file_edit")[0]).toMatchObject({ path: "nb.ipynb", tool: "NotebookEdit" });
+  });
+});
+
+describe("claude-code · context, compaction and limits", () => {
+  it("reports tokens in context against the model's window", async () => {
+    const { events } = await run([claudeInit,
+      claudeText("hi", { usage: { input_tokens: 1000, cache_read_input_tokens: 9000, cache_creation_input_tokens: 0, output_tokens: 50 } }),
+      claudeResult({ modelUsage: { "claude-test": { contextWindow: 200000 } } })]);
+    const usage = of(events, "status").filter((p) => p.state === "context_usage");
+    expect(usage[0]).toMatchObject({ usedTokens: 10050, autoCompacts: true });
+    // the window is only known once a result names it
+    expect(usage.at(-1)).toMatchObject({ usedTokens: 10050, maxTokens: 200000 });
+  });
+
+  it("ignores a sub-agent's usage — that is another context", async () => {
+    const { events } = await run([claudeInit,
+      { out: { type: "assistant", message: { content: [], usage: { input_tokens: 99999, output_tokens: 1 } }, parent_tool_use_id: "tu-task", session_id: "$SESSION" } },
+      claudeResult()]);
+    expect(of(events, "status").filter((p) => p.state === "context_usage")).toHaveLength(0);
+  });
+
+  it("shows compaction as it happens, then what the context holds after", async () => {
+    const { events } = await run([claudeInit,
+      { out: { type: "system", subtype: "status", status: "compacting", session_id: "$SESSION" } },
+      { out: { type: "system", subtype: "compact_boundary", compact_metadata: { trigger: "auto", pre_tokens: 180000, post_tokens: 12000 }, session_id: "$SESSION" } },
+      { out: { type: "system", subtype: "status", status: null, compact_result: "success", session_id: "$SESSION" } },
+      claudeText("carrying on"), claudeResult()]);
+    expect(states(events)).toContain("compacting");
+    expect(of(events, "status").find((p) => p.state === "native_compacted")).toMatchObject({ trigger: "auto", preTokens: 180000, postTokens: 12000 });
+    expect(of(events, "status").find((p) => p.state === "context_usage")).toMatchObject({ usedTokens: 12000 });
+    expect(states(events).indexOf("compacting")).toBeLessThan(states(events).indexOf("native_compacted"));
+  });
+
+  it("says when compaction failed", async () => {
+    const { events } = await run([claudeInit,
+      { out: { type: "system", subtype: "status", status: null, compact_result: "failed", compact_error: "too large", session_id: "$SESSION" } },
+      claudeResult()]);
+    expect(of(events, "status").find((p) => p.state === "notice")).toMatchObject({ message: "compaction failed: too large" });
+  });
+
+  it("reports usage-limit windows as percentages", async () => {
+    const { events } = await run([claudeInit,
+      { out: { type: "rate_limit_event", rate_limit_info: { status: "allowed_warning", rateLimitType: "five_hour", utilization: 0.873, resetsAt: 1_800_000_000 }, session_id: "$SESSION" } },
+      claudeResult()]);
+    expect(of(events, "status").find((p) => p.state === "usage_limits")).toEqual({ state: "usage_limits", provider: "claude",
+      windows: [{ id: "five_hour", usedPercent: 87.3, windowMinutes: 300, resetsAt: 1_800_000_000_000 }] });
+    expect(states(events)).not.toContain("notice");
+  });
+
+  it("says why a turn is waiting when a limit is reached", async () => {
+    const { events } = await run([claudeInit,
+      { out: { type: "rate_limit_event", rate_limit_info: { status: "rejected", rateLimitType: "seven_day", utilization: 1 }, session_id: "$SESSION" } },
+      claudeResult()]);
+    expect(of(events, "status").find((p) => p.state === "usage_limits")).toMatchObject({ reached: "seven_day" });
+    expect(String(of(events, "status").find((p) => p.state === "notice")?.message)).toMatch(/usage limit reached/);
+  });
+});
+
+describe("claude-code · always ask", () => {
+  it("puts each permission prompt in front of a person, and relays the answer", async () => {
+    const asked: ApprovalRequest[] = [];
+    setApprovalBroker(async (req) => { asked.push(req); return req.tool === "Bash" ? { behavior: "allow" } : { behavior: "deny", message: "no" }; });
+    const { bin, error } = await run([claudeInit,
+      { ask: { tool_name: "Bash", input: { command: "rm -rf build" } } },
+      { ask: { tool_name: "Write", input: { file_path: "/repo/x" } } },
+      claudeResult()], {}, {}, { permissions: "ask", loomProject: "p1" });
+    expect(error).toBeUndefined();
+    expect(flag(callsOf(bin)[0]!, "--permission-mode")).toBe("default");
+    expect(asked.map((a) => [a.project, a.tool, a.summary])).toEqual([["p1", "Bash", "Bash: rm -rf build"], ["p1", "Write", "Write: /repo/x"]]);
+    const answers = stdinOf(bin).filter((m) => m.type === "control_response")
+      .map((m) => ((m.response as Record<string, unknown>).response as Record<string, unknown>).behavior);
+    expect(answers).toEqual(["allow", "deny"]);
   });
 });
 
 describe("claude-code · when it needs you", () => {
   it("flags a turn that ended on a question", async () => {
-    const { events } = await run([
-      INIT("s"),
-      TEXT("Which database should I use?"),
-      RESULT(),
-    ]);
-    expect(kinds(events)).toContain("needs_input");
+    const { events } = await run([claudeInit, claudeText("Which database should I use?"), claudeResult()]);
     expect(String(of(events, "needs_input")[0]?.question)).toContain("Which database");
   });
 
   it("doesn't flag a turn that merely mentions a question", async () => {
-    const { events } = await run([
-      INIT("s"),
-      TEXT("You asked which database? I picked postgres."),
-      RESULT(),
-    ]);
+    const { events } = await run([claudeInit, claudeText("You asked which database? I picked postgres."), claudeResult()]);
     expect(kinds(events)).not.toContain("needs_input");
   });
 });
 
 describe("claude-code · when it goes wrong", () => {
-  it("surfaces an error result and still finishes the turn", async () => {
-    const { events, error } = await run([
-      INIT("s"),
-      RESULT({ is_error: true, result: "rate limited" }),
-    ]);
+  it("surfaces an error result as the turn's end", async () => {
+    const { events, error } = await run([claudeInit,
+      claudeResult({ subtype: "error_during_execution", is_error: true, errors: ["rate limited"] })]);
     expect(of(events, "error")[0]).toMatchObject({ message: "rate limited" });
-    // a reported error is a completed turn, not a crashed adapter
-    expect(kinds(events)).toContain("run_complete");
+    // a failed turn is an error, not a completion (t3code's rule); the error
+    // event ends it, so send() does not report it a second time
+    expect(kinds(events)).not.toContain("run_complete");
     expect(error).toBeUndefined();
+  });
+
+  it("fails a continuity turn whose result is an error", async () => {
+    const { error } = await run([claudeInit, claudeResult({ subtype: "error_during_execution", is_error: true, errors: ["boom"] })], {},
+      { continuity: { runId: "r", bindingId: "b", sessionEpoch: 1, nativeSessionId: null, context: "ctx" } });
+    expect(error?.message).toMatch(/failed turn/);
   });
 
   /**
@@ -272,33 +261,48 @@ describe("claude-code · when it goes wrong", () => {
    * so the turn genuinely failed and the caller has to hear about it.
    */
   it("throws when the CLI dies without saying anything", async () => {
-    const { events, error } = await run([], { code: 1, stderr: "not logged in" });
-    expect(error).toBeDefined();
+    const { events, error } = await run([{ stderr: "not logged in" }, { exit: 1 }]);
     expect(String(error?.message)).toContain("not logged in");
     expect(of(events, "error")[0]?.stderr).toContain("not logged in");
   });
 
+  it("explains a signed-out account", async () => {
+    const { events } = await run([claudeInit, claudeText("Invalid API key", { usage: { input_tokens: 0, output_tokens: 0 } }),
+      { out: { type: "assistant", error: "authentication_failed", message: { content: [] }, parent_tool_use_id: null, session_id: "$SESSION" } },
+      claudeResult()]);
+    expect(of(events, "error").some((p) => /not signed in/.test(String(p.message)))).toBe(true);
+  });
+
   it("ignores noise on stdout that isn't JSON", async () => {
-    const { events, error } = await run([
-      "Warning: something cosmetic",
-      INIT("s"),
-      "not json either",
-      TEXT("fine"),
-      RESULT(),
-    ]);
+    const { events, error } = await run([{ raw: "Warning: something cosmetic" }, claudeInit, { raw: "not json either" },
+      claudeText("fine"), claudeResult()]);
     expect(error).toBeUndefined();
     expect(of(events, "message")[0]).toMatchObject({ text: "fine" });
   });
 
+  it("starts a new session when the stored one is gone", async () => {
+    const dir = makeProjectDir({ name: "cc" });
+    await run(CLAUDE_OK, {}, {}, {}, dir);
+    const { events, error, bin } = await run(CLAUDE_OK, { missingSession: true }, {}, {}, dir);
+    expect(error).toBeUndefined();
+    expect(callsOf(bin).map((argv) => flag(argv, "--resume") !== undefined)).toEqual([true, false]);
+    expect(kinds(events)).toContain("run_complete");
+  });
+
+  it("reports a lost native session to Brain instead of starting over", async () => {
+    const { error, events } = await run(CLAUDE_OK, { missingSession: true },
+      { continuity: { runId: "r", bindingId: "b", sessionEpoch: 1, nativeSessionId: "6f1c2a4e-0000-4000-8000-000000000000", context: "ctx" } });
+    expect(error).toBeInstanceOf(NativeSessionMissing);
+    expect(states(events)).not.toContain("native_turn_accepted");
+  });
+
   it("reports itself unavailable when the binary isn't there", async () => {
-    const agent = new ClaudeCodeAdapter("claude-code", makeProjectDir({ name: "cc" }), {
-      bin: "/nope/claude",
-    });
+    const agent = new ClaudeCodeAdapter("claude-code", makeProjectDir({ name: "cc" }), { bin: "/nope/claude" });
     expect(await agent.available()).toBe(false);
   });
 
   it("refuses a second turn while one is running", async () => {
-    const bin = fakeClaude([INIT("s"), TEXT("ok"), RESULT()], { delayMs: 400 });
+    const bin = fakeClaude({ script: [{ sleep: 400 }, ...CLAUDE_OK] });
     const agent = new ClaudeCodeAdapter("claude-code", makeProjectDir({ name: "cc" }), { bin });
     const first = agent.send({ text: "one" });
     expect(agent.busy()).toBe(true);
@@ -308,24 +312,45 @@ describe("claude-code · when it goes wrong", () => {
   });
 });
 
+describe("claude-code · continuity", () => {
+  it("sends the context packet in the prompt and marks acceptance", async () => {
+    const { bin, events } = await run(CLAUDE_OK, {}, { text: "go", briefing: "skills",
+      continuity: { runId: "run", bindingId: "b", sessionEpoch: 1, nativeSessionId: null, context: "PACKET" } });
+    expect(claudePromptOf(bin)).toBe("PACKET\n\nskills\n\ngo");
+    expect(claudeInitOf(bin).appendSystemPrompt).toBeUndefined();
+    expect(of(events, "status").find((p) => p.state === "native_turn_accepted")).toMatchObject({ loomRunId: "run" });
+    expect(kinds(events).at(-1)).toBe("run_complete");
+  });
+
+  it("a process exit with no result cannot manufacture run_complete", async () => {
+    const { events, error } = await run([claudeInit, claudeText("partial"), { exit: 0 }], {},
+      { continuity: { runId: "r", bindingId: "b", sessionEpoch: 1, nativeSessionId: null, context: "ctx" } });
+    expect(error?.message).toMatch(/outcome is unknown/);
+    expect(kinds(events)).not.toContain("run_complete");
+  });
+});
+
 describe("claude-code · interrupt", () => {
   it("stops a running turn and says it was interrupted", async () => {
-    const bin = fakeClaude([INIT("s"), TEXT("never gets here"), RESULT()], { delayMs: 10_000 });
+    const bin = fakeClaude({ scripts: [[claudeInit, { sleep: 10_000 }, claudeText("never gets here"), claudeResult()]], script: CLAUDE_OK });
     const agent = new ClaudeCodeAdapter("claude-code", makeProjectDir({ name: "cc" }), { bin });
     const events: AdapterEvent[] = [];
     agent.onEvent((e) => events.push(e));
-
     const turn = agent.send({ text: "long one" });
-    await new Promise((r) => setTimeout(r, 250)); // let it actually start
+    await new Promise((r) => setTimeout(r, 500)); // let it actually start
     await agent.interrupt();
     await turn;
-
-    expect(kinds(events)).toContain("status");
-    expect(of(events, "status").some((p) => p.state === "interrupted")).toBe(true);
-    // interrupted is not completed: the turn didn't finish, and saying it did
-    // would put a lie in the thread
+    expect(states(events)).toContain("interrupted");
+    // interrupted is not completed, and the interrupt's own error result is not an error
     expect(kinds(events)).not.toContain("run_complete");
+    expect(kinds(events)).not.toContain("error");
+    // A hard boundary, as t3code has it: the session's process is gone, and the
+    // next turn resumes the same native session.
     expect(agent.busy()).toBe(false);
+    await agent.send({ text: "again" });
+    const launches = callsOf(bin);
+    expect(launches).toHaveLength(2);
+    expect(flag(launches[1]!, "--resume")).toBe(flag(launches[0]!, "--session-id"));
   }, 20_000);
 
   it("is a no-op when nothing is running", async () => {

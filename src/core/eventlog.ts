@@ -8,271 +8,16 @@
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
-import type { EventKind, LoomEvent, NewEvent } from "../types.js";
-import { MAIN_CHAT } from "../types.js";
+import type { LoomEvent, NewEvent } from "../types.js";
+import type { EventJournal, EventStore, ListOpts } from "./events/contracts.js";
+import { JsonlStore } from "./events/jsonl-store.js";
+import { SqliteStore, type SqliteModule } from "./events/sqlite-store.js";
+import { ContinuityError, type ContinuityRequest } from "./continuity/contracts.js";
+import type { ContinuityStore } from "./continuity/store.js";
+export type { EventReader, EventJournal, EventStore, ListOpts } from "./events/contracts.js";
 
-export interface ListOpts {
-  since?: number; // exclusive event id
-  /** Only events older than this id (exclusive) — paging a thread backwards. */
-  before?: number;
-  limit?: number;
-  kinds?: EventKind[];
-  /**
-   * Only this conversation. Asking for the main chat also returns events
-   * written before chats existed — they have no id and belong to it.
-   * Omit to read the whole project, which is what the brain wants.
-   */
-  chat?: string;
-}
-
-/** The store behind a project's log. Exported so search can take a narrow
- * slice of it (list) rather than the whole EventLog — a searcher has no
- * business being able to append. */
-export interface EventStore {
-  append(
-    e: Required<Omit<NewEvent, "agentId" | "chat">> & { agentId?: string; chat?: string },
-  ): LoomEvent;
-  list(opts?: ListOpts): LoomEvent[];
-  lastId(): number;
-  /** The newest agent message id per chat (a missing chat is main's). */
-  lastReplyIds(): Map<string, number>;
-  /** Bytes on disk and events held. */
-  size(): { bytes: number; events: number };
-  /** Reclaim free space (SQLite VACUUM). Never drops an event. */
-  compact(): void;
-  close(): void;
-}
-
-// ---------------------------------------------------------------------------
-// SQLite store (node:sqlite)
-// ---------------------------------------------------------------------------
-
-type SqliteModule = typeof import("node:sqlite");
-
-class SqliteStore implements EventStore {
-  private db: InstanceType<SqliteModule["DatabaseSync"]>;
-  private file: string;
-
-  constructor(sqlite: SqliteModule, file: string) {
-    this.file = file;
-    this.db = new sqlite.DatabaseSync(file);
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts INTEGER NOT NULL,
-        kind TEXT NOT NULL,
-        agent_id TEXT,
-        chat TEXT,
-        payload TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind, id);
-    `);
-    // Migrate BEFORE indexing chat. A log written before chats existed already
-    // has an `events` table, so CREATE TABLE IF NOT EXISTS is a no-op and the
-    // column is still missing — indexing it here would throw "no such column"
-    // and take the whole log down with it. Add the column, then index.
-    // The log is append-only and those events are history: a NULL chat reads
-    // as the main conversation rather than being rewritten.
-    const cols = this.db.prepare("PRAGMA table_info(events)").all() as { name: string }[];
-    if (!cols.some((c) => c.name === "chat")) {
-      this.db.exec("ALTER TABLE events ADD COLUMN chat TEXT");
-    }
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_events_chat ON events(chat, id)");
-  }
-
-  append(e: Required<Omit<NewEvent, "agentId" | "chat">> & { agentId?: string; chat?: string }): LoomEvent {
-    const stmt = this.db.prepare(
-      "INSERT INTO events (ts, kind, agent_id, chat, payload) VALUES (?, ?, ?, ?, ?)",
-    );
-    const res = stmt.run(
-      e.ts,
-      e.kind,
-      e.agentId ?? null,
-      e.chat ?? null,
-      JSON.stringify(e.payload),
-    );
-    return {
-      id: Number(res.lastInsertRowid),
-      ts: e.ts,
-      kind: e.kind,
-      ...(e.agentId ? { agentId: e.agentId } : {}),
-      ...(e.chat ? { chat: e.chat } : {}),
-      payload: e.payload,
-    };
-  }
-
-  list(opts: ListOpts = {}): LoomEvent[] {
-    const clauses: string[] = [];
-    const params: (string | number)[] = [];
-    if (opts.since !== undefined) {
-      clauses.push("id > ?");
-      params.push(opts.since);
-    }
-    if (opts.before !== undefined) {
-      clauses.push("id < ?");
-      params.push(opts.before);
-    }
-    if (opts.kinds?.length) {
-      clauses.push(`kind IN (${opts.kinds.map(() => "?").join(",")})`);
-      params.push(...opts.kinds);
-    }
-    if (opts.chat !== undefined) {
-      if (opts.chat === MAIN_CHAT) {
-        // pre-chat history has no id and belongs to the main conversation
-        clauses.push("(chat = ? OR chat IS NULL)");
-      } else {
-        clauses.push("chat = ?");
-      }
-      params.push(opts.chat);
-    }
-    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-    // When limiting, we want the *most recent* N in ascending order.
-    const sql = opts.limit
-      ? `SELECT * FROM (SELECT * FROM events ${where} ORDER BY id DESC LIMIT ?) ORDER BY id ASC`
-      : `SELECT * FROM events ${where} ORDER BY id ASC`;
-    if (opts.limit) params.push(opts.limit);
-    const rows = this.db.prepare(sql).all(...params) as Array<{
-      id: number | bigint;
-      ts: number;
-      kind: string;
-      agent_id: string | null;
-      chat: string | null;
-      payload: string;
-    }>;
-    return rows.map((r) => ({
-      id: Number(r.id),
-      ts: r.ts,
-      kind: r.kind as EventKind,
-      ...(r.agent_id ? { agentId: r.agent_id } : {}),
-      ...(r.chat ? { chat: r.chat } : {}),
-      payload: JSON.parse(r.payload) as Record<string, unknown>,
-    }));
-  }
-
-  size(): { bytes: number; events: number } {
-    const n = this.db.prepare("SELECT COUNT(*) AS n FROM events").get() as { n: number | bigint };
-    let bytes = 0;
-    for (const f of [this.file, `${this.file}-wal`]) {
-      try {
-        bytes += fs.statSync(f).size;
-      } catch {
-        /* no wal file is fine */
-      }
-    }
-    return { bytes, events: Number(n.n) };
-  }
-
-  compact(): void {
-    this.db.exec("VACUUM");
-  }
-
-  lastReplyIds(): Map<string, number> {
-    const rows = this.db
-      .prepare(
-        "SELECT COALESCE(chat, ?) AS c, MAX(id) AS m FROM events WHERE kind = 'message' AND agent_id IS NOT NULL GROUP BY COALESCE(chat, ?)",
-      )
-      .all(MAIN_CHAT, MAIN_CHAT) as Array<{ c: string; m: number | bigint }>;
-    return new Map(rows.map((r) => [r.c, Number(r.m)]));
-  }
-
-  lastId(): number {
-    const row = this.db.prepare("SELECT MAX(id) AS m FROM events").get() as
-      | { m: number | bigint | null }
-      | undefined;
-    return row?.m ? Number(row.m) : 0;
-  }
-
-  close(): void {
-    this.db.close();
-  }
-}
-
-// ---------------------------------------------------------------------------
-// JSONL fallback store
-// ---------------------------------------------------------------------------
-
-class JsonlStore implements EventStore {
-  private file: string;
-  private nextId: number;
-  private cache: LoomEvent[];
-
-  constructor(file: string) {
-    this.file = file;
-    this.cache = [];
-    if (fs.existsSync(file)) {
-      for (const line of fs.readFileSync(file, "utf8").split("\n")) {
-        if (!line.trim()) continue;
-        try {
-          this.cache.push(JSON.parse(line) as LoomEvent);
-        } catch {
-          // Skip torn trailing writes; the log stays usable.
-        }
-      }
-    }
-    this.nextId = (this.cache[this.cache.length - 1]?.id ?? 0) + 1;
-  }
-
-  append(e: Required<Omit<NewEvent, "agentId" | "chat">> & { agentId?: string; chat?: string }): LoomEvent {
-    const ev: LoomEvent = {
-      id: this.nextId++,
-      ts: e.ts,
-      kind: e.kind,
-      ...(e.agentId ? { agentId: e.agentId } : {}),
-      ...(e.chat ? { chat: e.chat } : {}),
-      payload: e.payload,
-    };
-    fs.appendFileSync(this.file, JSON.stringify(ev) + "\n");
-    this.cache.push(ev);
-    return ev;
-  }
-
-  list(opts: ListOpts = {}): LoomEvent[] {
-    let out = this.cache;
-    if (opts.since !== undefined) out = out.filter((e) => e.id > opts.since!);
-    if (opts.before !== undefined) out = out.filter((e) => e.id < opts.before!);
-    if (opts.kinds?.length) out = out.filter((e) => opts.kinds!.includes(e.kind));
-    // must match SqliteStore exactly: an event with no chat is main's
-    if (opts.chat !== undefined) {
-      out = out.filter((e) =>
-        opts.chat === MAIN_CHAT ? (e.chat ?? MAIN_CHAT) === MAIN_CHAT : e.chat === opts.chat,
-      );
-    }
-    if (opts.limit && out.length > opts.limit) out = out.slice(-opts.limit);
-    return [...out];
-  }
-
-  lastId(): number {
-    return this.cache[this.cache.length - 1]?.id ?? 0;
-  }
-
-  size(): { bytes: number; events: number } {
-    let bytes = 0;
-    try {
-      bytes = fs.statSync(this.file).size;
-    } catch {
-      /* not written yet */
-    }
-    return { bytes, events: this.cache.length };
-  }
-
-  compact(): void {
-    // an append-only text log has no free pages to reclaim
-  }
-
-  lastReplyIds(): Map<string, number> {
-    const out = new Map<string, number>();
-    for (const e of this.cache) if (e.kind === "message" && e.agentId) out.set(e.chat ?? MAIN_CHAT, e.id);
-    return out;
-  }
-
-  close(): void {}
-}
-
-// ---------------------------------------------------------------------------
-// EventLog facade
-// ---------------------------------------------------------------------------
-
-export class EventLog {
+export class EventLog implements EventJournal {
+  private closed = false;
   private store: EventStore;
   private emitter = new EventEmitter();
 
@@ -307,16 +52,31 @@ export class EventLog {
       // would silently start an EMPTY jsonl log beside a database full of your
       // history, and write new events there. Losing the thread is worse than
       // failing loudly, so this throws.
-      return new EventLog(new SqliteStore(sqlite, path.join(loomDir, "log.db")));
+      const dbFile = path.join(loomDir, "log.db"), jsonlFile = path.join(loomDir, "log.jsonl");
+      if (!fs.existsSync(dbFile) && fs.existsSync(jsonlFile) && fs.statSync(jsonlFile).size)
+        throw new ContinuityError("unsupported", "legacy JSONL history needs explicit migration: stop the daemon and run loom brain:migrate (LOOM_STORE=jsonl still reads the original)");
+      const store = new SqliteStore(sqlite, dbFile);
+      try { store.verifyJsonl(jsonlFile); } catch (error) { store.close(); throw error; }
+      return new EventLog(store);
     }
     return new EventLog(new JsonlStore(path.join(loomDir, "log.jsonl")));
   }
 
+  static async migrateJsonl(loomDir: string): Promise<{ imported: number; known: number; backup: string }> {
+    const sqlite = await import("node:sqlite");
+    const file = path.join(loomDir, "log.jsonl");
+    if (!fs.existsSync(file)) throw new ContinuityError("invalid", "no log.jsonl to import");
+    const store = new SqliteStore(sqlite, path.join(loomDir, "log.db"));
+    try { return store.importJsonl(file); } finally { store.close(); }
+  }
+
   append(e: NewEvent): LoomEvent {
+    if (this.closed) throw new Error("event log is closed");
     const ev = this.store.append({
       ts: e.ts ?? Date.now(),
       kind: e.kind,
-      payload: e.payload,
+      // Match durable JSON semantics and detach from caller-owned objects.
+      payload: JSON.parse(JSON.stringify(e.payload)) as Record<string, unknown>,
       ...(e.agentId ? { agentId: e.agentId } : {}),
       ...(e.chat ? { chat: e.chat } : {}),
     });
@@ -325,14 +85,34 @@ export class EventLog {
   }
 
   list(opts?: ListOpts): LoomEvent[] {
+    if (this.closed) throw new Error("event log is closed");
     return this.store.list(opts);
   }
 
   lastId(): number {
+    if (this.closed) throw new Error("event log is closed");
     return this.store.lastId();
   }
 
+  /** Optional SQLite Brain interface; JSONL remains readable without pretending
+   * to support transactional native continuity. */
+  get continuity(): ContinuityStore | null {
+    if (this.closed) throw new Error("event log is closed");
+    return this.store instanceof SqliteStore ? this.store.continuity : null;
+  }
+
+  captureRequest(request: ContinuityRequest): { event: LoomEvent; created: boolean } {
+    const store = this.continuity;
+    if (!store) throw new ContinuityError("unsupported", "native continuity requires SQLite; legacy JSONL is still readable");
+    const result = store.capture(request, () => this.store.append({ ts: Date.now(), kind: "message",
+      chat: request.conversationId, payload: { text: request.text, author: request.source === "user" ? "user" : "loom", requestId: request.id } }));
+    // Capture and its idempotency row commit together before clients see either.
+    if (result.created) this.emitter.emit("event", result.event);
+    return result;
+  }
+
   lastReplyIds(): Map<string, number> {
+    if (this.closed) throw new Error("event log is closed");
     return this.store.lastReplyIds();
   }
 
@@ -346,11 +126,23 @@ export class EventLog {
 
   /** Live subscription to appended events; returns unsubscribe. */
   onEvent(cb: (e: LoomEvent) => void): () => void {
-    this.emitter.on("event", cb);
-    return () => this.emitter.off("event", cb);
+    if (this.closed) throw new Error("event log is closed");
+    const listener = (event: LoomEvent) => {
+      try {
+        cb(structuredClone(event));
+      } catch (error) {
+        // The event is already durable. A failed observer must not make the
+        // writer retry it or prevent the other observers from receiving it.
+        process.emitWarning(`event subscriber failed: ${String(error)}`, { code: "LOOM_EVENT_SUBSCRIBER" });
+      }
+    };
+    this.emitter.on("event", listener);
+    return () => this.emitter.off("event", listener);
   }
 
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.emitter.removeAllListeners();
     this.store.close();
   }

@@ -43,6 +43,7 @@ import { ensureLoomHome, loomHome } from "../core/registry.js";
 import { VERSION } from "../version.js";
 import { makeBackup } from "../core/backup.js";
 import { threadMarkdown } from "../core/thread-md.js";
+import { EventLog } from "../core/eventlog.js";
 import {
   allModels,
   fetchModels,
@@ -632,6 +633,16 @@ program
       console.error(pc.red(err instanceof Error ? err.message : String(err)));
       process.exitCode = 1;
     }
+  });
+
+program
+  .command("brain:migrate [directory]")
+  .description("offline, backed-up JSONL → SQLite history import; conflicting IDs abort")
+  .action(async (directory?: string) => {
+    if (await daemonRunning()) throw new Error("stop the Loom daemon before migrating history");
+    const dir = path.resolve(directory ?? process.cwd());
+    const result = await EventLog.migrateJsonl(path.join(dir, ".loom"));
+    console.log(`Imported ${result.imported}; already known ${result.known}. Original JSONL retained. Backup: ${result.backup}`);
   });
 
 program

@@ -307,8 +307,10 @@ describe("web app · the prompt queue", () => {
   it("sends a queued prompt to another agent when you change its target", async () => {
     const m = mount();
     await ready(m);
-    await sendPrompt(m, "sleep:2000 working");
-    await sendPrompt(m, "for someone else");
+    // Hold the entry while exercising target selection. A sleeping echo agent
+    // can finish before the browser has rendered the select on a busy runner.
+    await rest("POST", "/queue/pause", { paused: true });
+    await rest("POST", "/queue", { text: "for someone else", target: "echo" });
     await waitUntil(() => all(m, "#cqueue .cqitem").length === 1, { timeoutMs: 15_000 });
 
     const sel = $(m, '#cqueue [data-q="target"]') as HTMLSelectElement;
@@ -318,8 +320,9 @@ describe("web app · the prompt queue", () => {
 
     await waitUntil(async () => {
       const v = await rest<QueueView>("GET", "/queue");
-      return v.queue.length === 0 || v.queue[0]!.target.agentId === "other";
+      return v.queue.length === 1 && v.queue[0]!.target.agentId === "other";
     }, { timeoutMs: 10_000 });
+    click($(m, '#cqueue [data-q="pause"]'));
     // it runs on the agent you moved it to, and the baton goes with it
     await waitUntil(async () => {
       const p = await rest<{ project: { holder: string | null } }>("GET", "");
