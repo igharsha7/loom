@@ -2,7 +2,7 @@
 import { openConnectPhone } from './connect-phone.js';
 import { api } from './connection.js';
 import { clog } from './console.js';
-import { esc,money } from './format.js';
+import { esc,money,pageGone } from './format.js';
 import { ICONS,LOADER } from './icons.js';
 import { announce,toast } from './notifications.js';
 import { openSettingsModal } from './settings.js';
@@ -111,6 +111,8 @@ import { state } from './state.js';
   }
 
   function drawStatusbar(){
+    // a request that settles after the page is gone (a closed tab, a torn-down test window) has nothing to draw
+    if (pageGone()) return;
     var el = document.getElementById("statusbar"); if (!el) return;
     var p = state.project;
     checkBudget(p);
