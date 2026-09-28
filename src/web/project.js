@@ -94,6 +94,7 @@ import { openMenu } from './menus.js';
       get drawStatus() { return drawStatus; }
     });
     var { drawStatus, refresh, loadHistory, connect, drawEmpty, threadScroller, wantScroll, stickOrFlag, toBottom, liveFor, nearBottom, loadEarlier } = createThread({
+      get loadQueue() { return loadQueue; },
       get autosizeBox() { return autosizeBox; },
       get jumpToMessage() { return jumpToMessage; },
       get markDays() { return markDays; },
