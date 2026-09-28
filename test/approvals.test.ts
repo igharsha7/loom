@@ -1,26 +1,19 @@
 /**
- * "Always ask", end to end minus the model: an MCP client (standing in for
- * Claude Code) talks to Loom's approval server over stdio, the server files
- * the request with a real daemon, the request shows up in the project as an
- * `approval` event and in GET /approvals, a human answers over REST, and the
- * answer comes back through MCP as the decision Claude expects.
+ * "Always ask", end to end minus the model: an adapter asks the daemon
+ * (core/approvals.ts `requestApproval`, the same call the Claude adapter's
+ * canUseTool and the Codex adapter's app-server approvals make), the request
+ * shows up in the project as an `approval` event and in GET /approvals, a
+ * human answers over REST, and the answer comes back to the adapter.
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
-import path from "node:path";
-import readline from "node:readline";
-import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { approvalEndpoint } from "../src/core/approvals.js";
+import { requestApproval } from "../src/core/approvals.js";
 import { permissionFor, permissionMenu } from "../src/core/permissions.js";
 import { readDaemonConfig } from "../src/core/registry.js";
 import { DaemonClient } from "../src/daemon/client.js";
 import { LoomDaemon } from "../src/daemon/server.js";
 import { makeProjectDir, tmpDir, waitUntil } from "./helpers.js";
-
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const tsx = path.join(root, "node_modules", ".bin", "tsx");
 
 let daemon: LoomDaemon;
 let base: string;
@@ -48,38 +41,16 @@ const api = (p: string, init: RequestInit = {}) =>
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json", ...(init.headers ?? {}) },
   }).then(async (r) => ({ status: r.status, body: (await r.json()) as Record<string, unknown> }));
 
-/** A tiny MCP client over the approval server's stdio. */
-function mcp(): { call: (method: string, params?: unknown) => Promise<Record<string, unknown>>; child: ChildProcess } {
-  const ep = approvalEndpoint()!;
-  const child = spawn(tsx, [path.join(root, "src", "mcp", "approve.ts")], {
-    env: {
-      ...process.env,
-      LOOM_APPROVAL_URL: ep.url,
-      LOOM_APPROVAL_SECRET: ep.secret,
-      LOOM_APPROVAL_PROJECT: projectId,
-      LOOM_APPROVAL_AGENT: "plannerbot",
-    },
-    stdio: ["pipe", "pipe", "inherit"],
+/** The one pending approval's id, once it appears. */
+async function pendingId(): Promise<string> {
+  let id = "";
+  await waitUntil(async () => {
+    const list = (await api(`/api/projects/${projectId}/approvals`)).body.approvals as Array<{ id: string }>;
+    id = list[0]?.id ?? "";
+    return Boolean(id);
   });
-  const waiting = new Map<number, (v: Record<string, unknown>) => void>();
-  readline.createInterface({ input: child.stdout! }).on("line", (line) => {
-    const msg = JSON.parse(line) as { id: number };
-    waiting.get(msg.id)?.(msg as unknown as Record<string, unknown>);
-  });
-  let next = 1;
-  return {
-    child,
-    call: (method, params) =>
-      new Promise((resolve) => {
-        const id = next++;
-        waiting.set(id, resolve);
-        child.stdin!.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
-      }),
-  };
+  return id;
 }
-
-const decisionOf = (r: Record<string, unknown>) =>
-  JSON.parse(((r.result as { content: Array<{ text: string }> }).content[0]!).text) as { behavior: string; message?: string };
 
 describe("permission modes", () => {
   it("defaults each agent to today's behaviour and offers three modes", () => {
@@ -89,7 +60,7 @@ describe("permission modes", () => {
     expect(permissionFor("codex", { permissions: "nonsense" })).toBe("auto");
     expect(permissionMenu("claude-code")!.map((m) => m.mode)).toEqual(["bypass", "auto", "ask"]);
     expect(permissionMenu("claude-code")![2]!.ask).toBe("approvals");
-    expect(permissionMenu("codex")![2]!.ask).toBe("read-only");
+    expect(permissionMenu("codex")![2]!.ask).toBe("approvals");
     expect(permissionMenu("echo")).toBeNull();
     // measured-broken cells are marked, and never selected
     expect(permissionMenu("opencode")![2]!.unsupported).toBeTruthy();
@@ -116,21 +87,9 @@ describe("permission modes", () => {
   });
 });
 
-describe("approvals over MCP", () => {
-  it("speaks MCP: initialize and list the approve tool", async () => {
-    const c = mcp();
-    const init = await c.call("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t" } });
-    expect((init.result as { serverInfo: { name: string } }).serverInfo.name).toBe("loom");
-    const tools = await c.call("tools/list");
-    expect((tools.result as { tools: Array<{ name: string }> }).tools.map((t) => t.name)).toEqual(["approve"]);
-    c.child.kill();
-  });
-
+describe("approvals from inside the daemon", () => {
   it("a request waits for a human, and allow flows back to the agent", async () => {
-    const c = mcp();
-    await c.call("initialize", {});
-    const pending = c.call("tools/call", { name: "approve", arguments: { tool_name: "Bash", input: { command: "npm test" } } });
-
+    const pending = requestApproval({ project: projectId, agent: "plannerbot", tool: "Bash", input: { command: "npm test" }, summary: "Bash: npm test" });
     let approvalId = "";
     await waitUntil(async () => {
       const r = await api(`/api/projects/${projectId}/approvals`);
@@ -142,35 +101,40 @@ describe("approvals over MCP", () => {
     const requested = (ev.body.events as Array<{ kind: string; payload: { phase: string; input: string } }>).find(
       (e) => e.kind === "approval" && e.payload.phase === "requested",
     );
-    expect(requested!.payload.input).toContain("npm test");
+    expect(requested!.payload.input).toBe("Bash: npm test");
 
     expect((await api(`/api/projects/${projectId}/approvals/${approvalId}`, { method: "POST", body: JSON.stringify({ decision: "allow" }) })).status).toBe(200);
-    expect(decisionOf(await pending)).toEqual({ behavior: "allow", updatedInput: { command: "npm test" } });
+    expect(await pending).toEqual({ behavior: "allow" });
     // answered once is answered
     expect((await api(`/api/projects/${projectId}/approvals/${approvalId}`, { method: "POST", body: JSON.stringify({ decision: "deny" }) })).status).toBe(404);
-    c.child.kill();
   });
 
   it("deny carries the human's reason back", async () => {
-    const c = mcp();
-    const pending = c.call("tools/call", { name: "approve", arguments: { tool_name: "Write", input: { file_path: "x" } } });
-    let id = "";
-    await waitUntil(async () => {
-      const list = (await api(`/api/projects/${projectId}/approvals`)).body.approvals as Array<{ id: string }>;
-      id = list[0]?.id ?? "";
-      return Boolean(id);
-    });
+    const pending = requestApproval({ project: projectId, agent: "plannerbot", tool: "Write", input: { file_path: "x" } });
+    const id = await pendingId();
     await api(`/api/projects/${projectId}/approvals/${id}`, { method: "POST", body: JSON.stringify({ decision: "deny", message: "not that file" }) });
-    expect(decisionOf(await pending)).toEqual({ behavior: "deny", message: "not that file" });
-    c.child.kill();
+    expect(await pending).toEqual({ behavior: "deny", message: "not that file" });
   });
 
-  it("refuses requests without the daemon's approval secret", async () => {
+  it("a turn that ends closes its open cards as denied", async () => {
+    const stop = new AbortController();
+    const pending = requestApproval({ project: projectId, agent: "plannerbot", tool: "Bash", input: {}, signal: stop.signal });
+    await pendingId();
+    stop.abort();
+    expect(await pending).toMatchObject({ behavior: "deny", message: "The agent stopped waiting." });
+    expect(((await api(`/api/projects/${projectId}/approvals`)).body.approvals as unknown[])).toHaveLength(0);
+    // an already-ended turn never opens one
+    expect(await requestApproval({ project: projectId, agent: "plannerbot", tool: "Bash", input: {}, signal: stop.signal })).toMatchObject({ behavior: "deny" });
+    expect(((await api(`/api/projects/${projectId}/approvals`)).body.approvals as unknown[])).toHaveLength(0);
+  });
+
+  it("no longer serves the old MCP approval endpoint", async () => {
     const r = await fetch(`${base}/api/approvals/request`, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-loom-approval": "wrong" },
+      headers: { "content-type": "application/json", "x-loom-approval": "anything" },
       body: JSON.stringify({ project: projectId, tool: "Bash", input: {} }),
     });
-    expect(r.status).toBe(403);
+    expect(r.status).not.toBe(200);
+    expect(r.status).not.toBe(403);
   });
 });

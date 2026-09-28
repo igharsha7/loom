@@ -1,0 +1,123 @@
+# t3code port — TODO
+
+Plan: [t3code-port.md](../proposals/t3code-port.md). Notes and sources:
+[T3-PORT-NOTES.md](T3-PORT-NOTES.md). Scope for now: **Codex and Claude Code only**;
+relay, mobile and other providers are out of scope.
+
+Rules: phase by phase, fakes-only tests at every step, one authorized live check per
+harness per phase, and never modify a provider's own config (`~/.codex/config.toml`,
+Claude settings); override per session through the protocol instead.
+
+## Phase 1 — Provider contract and service ✅ (2026-09-28)
+
+- [x] `src/providers/contracts.ts`: provider kinds, runtime modes, session and turn
+  inputs, capabilities, normalized item data, and the canonical runtime event union
+  (26 types), ported from t3code `packages/contracts/src/provider*.ts`.
+- [x] `src/providers/adapter.ts`: the `ProviderAdapter` interface and `EventHub`.
+- [x] `src/providers/errors.ts`: `ProviderError` (validation, not_found,
+  session_missing, unsupported, request, transport) with `notSubmitted`.
+- [x] `src/providers/directory.ts`: session directory keyed by (chat, agent), in
+  memory and as an atomic JSON file; unreadable files moved aside.
+- [x] `src/providers/service.ts`: `ProviderService` — register/unregister,
+  ensureSession (live / resumed / fresh, shared concurrent start, lost session →
+  `session_missing` or fresh on request), sendTurn, interrupt, respond, compact,
+  rollback, stop, stopAll, event fan-in keeping the directory and active turns.
+- [x] `src/providers/reaper.ts`: idle reaper (30 min / 5 min; skips running turns
+  and caller-reported background work).
+- [x] `src/providers/ingestion.ts`: canonical events → Loom log events; streamed
+  text assembled per item with completed-item fallback; live delta channel; Brain
+  tags per turn; large command output to artifacts.
+- [x] `src/providers/approvals.ts`: `request.opened` → Loom approval cards → answer
+  through the service; cards close when the turn or session ends.
+- [x] Fake adapter and tests (`test/providers/`, 45 tests). Full suite green.
+- [x] Docs: ARCHITECTURE owner rows; notes.
+- [ ] Live check: none this phase — nothing is wired to a real harness yet.
+
+## Phase 2 — Warm sessions for Codex and Claude ✅ (2026-09-28)
+
+- [x] Codex adapter on the contract (`src/providers/codex/`): one `app-server` per
+  chat session in its own process group, thread kept open, turns and interrupts on
+  one connection; notifications, deltas and server requests mapped to canonical
+  events (t3code's `mapToRuntimeEvents`, `toCanonicalItemType`,
+  `normalizeCodexTokenUsage`); approvals wait for `respondToRequest`; manual
+  compaction (`thread/compact/start`).
+- [x] Claude adapter on the contract (`src/providers/claude/`): one streaming-input
+  `query()` per chat session, session id chosen up front, `initializationResult()`
+  proves the session (a lost resume fails here, before any prompt), turns pushed as
+  user messages, `setModel` in-session, `canUseTool` → `request.opened`, partial
+  messages → deltas, interrupt closes the session (t3code's hard boundary).
+- [x] Runtime dispatch: `ProviderAgent` (`src/providers/agent.ts`) is the runtime's
+  Adapter for `codex` and `claude-code`; one `ProviderService` per working
+  directory with the file directory, reaper and approval bridge. `SendInput.chat`
+  added; sessions keyed by (chat, agent). Old per-turn adapters deleted
+  (`adapters/codex.ts`, `adapters/claude-code.ts`); `codex-rpc.ts` moved to
+  `providers/codex/rpc.ts`. The pre-warm per-agent session id migrates to the main
+  chat's binding. A rebuilt agent (model/permission change) takes over its
+  predecessor's sessions. MCP server changes restart and resume the session.
+- [x] Brain: turn-level settlement — a turn is settled when the harness reports it
+  done and no command it started is still running; the session stays warm.
+  (Phase 2 first shipped "a continuity turn ends its session"; corrected in Phase 3
+  to the decided turn-level rule. See notes.)
+- [x] Token streaming: `content.delta` → `LiveDeltaThrottle` (50 ms) → `delta`
+  websocket frames; a minimal streaming bubble in the web thread, replaced by the
+  finished message.
+- [x] Tests: `test/providers/warm.test.ts` (16), throttle test; fakes serve many
+  turns per process (`scripts`, `turnsOf`); existing Codex/Claude/MCP/continuity
+  tests run against the warm agent. Full suite green.
+- [x] Live check per harness (read-only mode, scratch project): Codex
+  (`gpt-6-astra` override; `~/.codex/config.toml` untouched) and Claude each ran one
+  turn; session stayed warm after the turn, the reply streamed as a delta, the
+  process group was gone after stop.
+
+## Phase 3 — Interaction parity ✅ (2026-09-28)
+
+- [x] Tool progress: `item.started/updated/completed` → live `item` websocket frames
+  (a "running" row in the thread), command output as live deltas; the finished tool
+  is still one `tool_call` in the log.
+- [x] Approvals with native options: `request.opened.options` (Allow / Allow for this
+  session / Deny); Loom cards gain "Allow for session" when offered; Codex gets
+  `acceptForSession`, Claude gets its own permission suggestions scoped to the session.
+- [x] Structured user input: Codex `item/tool/requestUserInput` (answers
+  `{id: {answers: []}}`), Codex async questions (answer with the next message),
+  Claude `AskUserQuestion` via `canUseTool` (answers keyed by question text).
+  `needs_input` carries `questions`, `requestId`, `responseMode`; answered via
+  `POST /api/projects/:id/agents/:agent/answers`; question cards in the thread.
+- [x] Plan mode: Codex collaboration mode (t3code's developer instructions, ported
+  in `providers/codex/instructions.ts`), left on the next default turn; Claude
+  `setPermissionMode("plan")` and `ExitPlanMode` captured as the proposed plan.
+  Loom's plan turns on provider agents use native plan mode; the runtime saves the
+  proposed plan to `plans/<day>-<slug>.md` (`status: plan_saved`).
+- [x] Manual compaction: Codex `thread/compact/start`; Claude `/compact` as a turn
+  (t3code's slash-command compaction). `POST /api/projects/:id/agents/:agent/compact`.
+- [x] Reasoning effort: agent option `effort` → Codex `turn/start.effort`, Claude
+  query `effort` at session start.
+- [x] Turn-level settlement (correction of Phase 2), bounded: 60 s for Brain turns
+  (then quiescence unknown), 5 s for ordinary turns.
+- [x] Tests: `test/providers/interaction.test.ts` (13),
+  `test/providers/runtime-interaction.test.ts` (2). Full suite green.
+- [x] Live check (read-only, scratch project): a plan-mode turn on each harness.
+  Codex explored with one command and proposed a plan (captured). Claude wrote its
+  plan to its own `~/.claude/plans/` file and called ExitPlanMode (captured); the
+  project was untouched. Found and fixed: that plan file was logged as a project
+  edit.
+- Moved: model catalogs (`model/list`, `supportedModels()`) to Phase 6 (provider
+  management). Per-turn diffs: Loom's own `turn_diff` (git, per turn) already covers
+  both providers; Codex's `turn.diff.updated` is mapped but not yet shown.
+
+## Phase 4 — Checkpoints and revert
+
+- [ ] Hidden-ref checkpoints per turn; revert coordinated with native rollback;
+  refuse before touching files when rollback is unsupported.
+
+## Phase 5 — Cross-provider switching
+
+- [ ] Park/resume sessions across providers within a chat; Brain packet sized by the
+  target's context window; switch offered at a usage limit; revert across a provider
+  boundary; continuity on by default.
+
+## Phase 6 — Provider management
+
+- [ ] Instances (several accounts per driver), auth status, install/update
+  detection, native session history import.
+
+## Phase 7 — UI overhaul

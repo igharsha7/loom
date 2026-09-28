@@ -7,12 +7,11 @@ import type { AgentConfig, AnyAgent } from "../types.js";
 import { AntigravityCliAdapter } from "./antigravity-cli.js";
 import { AntigravityBridge } from "./bridges/antigravity.js";
 import { KiroBridge } from "./bridges/kiro.js";
-import { ClaudeCodeAdapter } from "./claude-code.js";
-import { CodexAdapter } from "./codex.js";
 import { EchoAdapter } from "./echo.js";
 import { GrokAdapter } from "./grok.js";
 import { ModelAdapter } from "./model.js";
 import { OpenCodeAdapter } from "./opencode.js";
+import { ProviderAgent } from "../providers/agent.js";
 
 export type AgentFactory = (
   cfg: AgentConfig,
@@ -49,8 +48,9 @@ export function tierForKind(kind: string): "adapter" | "bridge" | null {
 }
 
 registerAgentKind("echo", (cfg, dir) => new EchoAdapter(cfg.id, "echo", dir));
-registerAgentKind("claude-code", (cfg, dir) => new ClaudeCodeAdapter(cfg.id, dir, cfg.options));
-registerAgentKind("codex", (cfg, dir) => new CodexAdapter(cfg.id, dir, cfg.options));
+// Codex and Claude Code run as warm provider sessions (src/providers/).
+registerAgentKind("claude-code", (cfg, dir) => new ProviderAgent(cfg.id, "claude-code", dir, cfg.options));
+registerAgentKind("codex", (cfg, dir) => new ProviderAgent(cfg.id, "codex", dir, cfg.options));
 registerAgentKind("opencode", (cfg, dir) => new OpenCodeAdapter(cfg.id, dir, cfg.options));
 registerAgentKind("grok-code", (cfg, dir) => new GrokAdapter(cfg.id, dir, cfg.options));
 // An agent that is a model endpoint rather than a command — see adapters/model.ts.

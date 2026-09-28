@@ -27,7 +27,7 @@
  */
 
 import crypto from "node:crypto";
-import type { EventLog } from "./eventlog.js";
+import type { EventJournal } from "./eventlog.js";
 import type { LoomEvent } from "../types.js";
 
 /**
@@ -350,7 +350,7 @@ export class Brain {
   private cache: Map<string, Memory> | null = null;
   private unsubscribe: (() => void) | null = null;
 
-  constructor(private log: EventLog) {
+  constructor(private log: EventJournal) {
     // The cache is invalidated by the log, not by our own methods, so a write
     // from anywhere — another Brain, a replay, the CLI — is seen too.
     this.unsubscribe = this.log.onEvent((e) => {

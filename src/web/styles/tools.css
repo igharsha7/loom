@@ -1,0 +1,343 @@
+  /* ── Brain ────────────────────────────────────────────
+     The tab used to be the projection dumped as grey lines with one button.
+     It is the whole premise of the product, so it says what it holds, what it
+     read, and exactly what an agent receives — a claim next to its evidence. */
+  .pane-inner.brain{display:flex;flex-direction:column;gap:0;max-width:760px;padding-bottom:40px}
+  .bstats{display:flex;align-items:center;gap:22px;padding:4px 0 16px 0}
+  .bstat{display:flex;flex-direction:column;gap:1px}
+  .bstat .n{font-size:20px;font-weight:600;letter-spacing:-.02em;font-family:var(--font-mono)}
+  .bstat .l{font-size:10.5px;color:var(--muted-foreground);letter-spacing:.02em}
+  .bsec{display:flex;align-items:baseline;gap:8px;font-size:12px;font-weight:600;
+    padding:18px 0 8px 0;border-top:1px solid var(--border);margin-top:8px}
+  .bsec:first-of-type{border-top:0;margin-top:0}
+  .bhint{font-weight:400;font-size:10.5px;color:var(--muted-foreground)}
+  .bempty{font-size:11.5px;color:var(--muted-foreground);line-height:1.65;padding:6px 0 4px 0;max-width:60ch}
+  .bempty.sm{font-size:11px;padding:4px 0}
+  /* --- the learned-memory list --- */
+  .bhead{position:sticky;top:0;background:var(--background);padding:2px 0 10px;z-index:2}
+  .bkinds{display:flex;flex-wrap:wrap;gap:6px}
+  .bkind{display:inline-flex;align-items:center;gap:5px;height:26px;padding:0 9px;border-radius:99px;
+    border:1px solid var(--border);background:transparent;color:var(--muted-foreground);cursor:pointer;
+    font:inherit;font-size:11.5px;text-transform:capitalize;transition:background .12s,color .12s,border-color .12s}
+  .bkind:hover{background:var(--sidebar-accent);color:var(--foreground)}
+  .bkind.on{background:var(--foreground);color:var(--background);border-color:transparent;font-weight:600}
+  .bkind .kn{font-family:var(--font-mono);font-size:10px;opacity:.7}
+  .bconf{border:1px solid color-mix(in srgb, var(--err) 35%, var(--border));border-radius:10px;padding:8px 12px;margin:6px 0;font-size:12px}
+  .bconfsig{font-family:var(--font-mono);font-size:10px;color:var(--err);letter-spacing:.06em;text-transform:uppercase}
+  .bconfpair{margin-top:4px;line-height:1.6;color:var(--muted-foreground)}
+  .bseed{display:flex;gap:6px;padding:0 0 12px}
+  .bseed input{flex:1;min-width:0;height:34px;background:color-mix(in srgb, var(--input) 30%, var(--background));
+    border:1px solid var(--input);border-radius:9px;padding:0 12px;font:inherit;font-size:12.5px;color:var(--foreground)}
+  .bseed input::placeholder{color:color-mix(in srgb, var(--muted-foreground) 65%, transparent)}
+  .bseed input:focus{outline:none;border-color:var(--ring);box-shadow:0 0 0 3px color-mix(in srgb, var(--ring) 26%, transparent)}
+  .bmems{display:flex;flex-direction:column;gap:8px;padding-bottom:14px}
+  .bmem{border:1px solid var(--border);border-radius:11px;padding:10px 11px;background:var(--card);
+    transition:border-color .12s,box-shadow .12s}
+  .bmem:hover{border-color:color-mix(in srgb, var(--muted-foreground) 32%, transparent)}
+  .bmem.low{opacity:.72}
+  .bmrow{display:flex;align-items:flex-start;gap:8px}
+  .bmtext{flex:1;min-width:0;font-size:12.5px;line-height:1.5;color:var(--foreground);word-break:break-word}
+  .bforget{flex:none;opacity:0;transition:opacity .12s;color:var(--muted-foreground)}
+  .bmem:hover .bforget{opacity:.75}
+  .bforget:hover{opacity:1;color:var(--danger,#e5484d)}
+  .bents{display:flex;flex-wrap:wrap;gap:4px;margin:7px 0 2px 0}
+  .bent{font-family:var(--font-mono);font-size:10px;color:var(--muted-foreground);
+    background:var(--sidebar-accent);border-radius:5px;padding:1px 6px;max-width:100%;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .bmmeta{display:flex;align-items:center;gap:5px;margin-top:7px;font-size:10.5px;color:var(--muted-foreground);font-family:var(--font-mono)}
+  .bmmeta svg{width:12px;height:12px;flex:none}
+  .bmmeta .dim{opacity:.75}
+  /* kind badges — each carries a word AND a colour (never colour alone) */
+  .bbadge{flex:none;font-size:9.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+    padding:2px 6px;border-radius:5px;line-height:1.4;height:fit-content}
+  .bk-constraint{color:#e8a13a;background:color-mix(in srgb,#e8a13a 16%,transparent)}
+  .bk-failure{color:#e5674d;background:color-mix(in srgb,#e5674d 16%,transparent)}
+  .bk-decision{color:#5b8cff;background:color-mix(in srgb,#5b8cff 16%,transparent)}
+  .bk-convention{color:#3aa88b;background:color-mix(in srgb,#3aa88b 16%,transparent)}
+  .bk-fact{color:var(--muted-foreground);background:var(--sidebar-accent)}
+  .bk-task{color:#a07ad6;background:color-mix(in srgb,#a07ad6 16%,transparent)}
+  .bkind.bk-failure.on{background:#e5674d;color:#fff}
+  .bkind.bk-constraint.on{background:#e8a13a;color:#1a1200}
+  .badd{display:flex;gap:6px;padding:2px 0 8px 0}
+  .badd input{flex:1;min-width:0;background:var(--input,var(--card));border:1px solid var(--border);
+    border-radius:8px;padding:6px 10px;font-size:12px;color:var(--foreground);font-family:var(--font-sans)}
+  .badd input:focus{outline:none;border-color:var(--ring,var(--muted-foreground))}
+  .bdecs{display:flex;flex-direction:column;gap:1px}
+  .bdec{display:flex;gap:9px;padding:5px 8px;border-radius:7px;font-size:12px;line-height:1.55}
+  .bdec:hover{background:var(--sidebar-accent)}
+  .bdec .dm{color:var(--warn);flex:none}
+  .bdec .dt{white-space:pre-wrap;word-break:break-word}
+  .bsrcs{display:flex;flex-direction:column;gap:2px}
+  .bsrc{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:7px;font-size:12px}
+  .bsrc:hover{background:var(--sidebar-accent)}
+  .bsrc svg{width:14px;height:14px;flex:none}
+  .bsrc .si{font-weight:600}
+  .bsrc .sf{color:var(--muted-foreground);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .bsrc .sc{margin-left:auto;color:var(--muted-foreground);font-family:var(--font-mono);font-size:10.5px;flex:none}
+  .bdoc{border:1px solid var(--border);border-radius:10px;padding:12px 14px;background:var(--card);
+    max-height:420px;overflow:auto}
+  .bl{font-size:11.5px;line-height:1.65;color:var(--muted-foreground);white-space:pre-wrap;word-break:break-word}
+  .bl.sp{height:7px}
+  .bl.h1,.bl.h2,.bl.h3{color:var(--foreground);font-weight:600;margin-top:8px}
+  .bl.h1{font-size:13px}
+  .bl.h2{font-size:12px}
+  .bl.h3{font-size:11.5px;opacity:.9}
+  .bl.li{padding-left:12px;position:relative}
+  .bl.li::before{content:"•";position:absolute;left:2px;opacity:.5}
+  /* --- Mine | Team, and the Team view (Phase 3: one brain) --- */
+  .bview{margin-bottom:10px}
+  .bempty .lnk{background:none;border:0;padding:0;font:inherit;color:var(--foreground);text-decoration:underline;cursor:pointer}
+  .bview button{height:28px;padding:0 14px}
+  .tbtop{display:flex;align-items:center;gap:6px 12px;flex-wrap:wrap;font-size:11.5px;color:var(--muted-foreground);padding:0 0 4px}
+  .tbtop code{font-family:var(--font-mono);font-size:11px;color:var(--foreground)}
+  .tbtop .tbn{font-family:var(--font-mono);font-size:10.5px}
+  .tbtop .tbsp{margin-left:auto;display:flex;gap:6px}
+  .tberr{font-size:11.5px;color:var(--err);line-height:1.5;padding:2px 0 4px;word-break:break-word}
+  .tbpr{display:flex;align-items:center;gap:8px;font-size:12px;padding:8px 11px;margin:6px 0;border-radius:10px;
+    border:1px solid color-mix(in srgb, var(--ok) 40%, var(--border));background:color-mix(in srgb, var(--ok) 7%, transparent)}
+  .tbpr a{color:var(--foreground);word-break:break-all}
+  .tbpr .iconbtn{margin-left:auto;width:22px;height:22px;flex:none}
+  .tbcard{border:1px solid var(--border);border-radius:11px;padding:10px 11px;margin:0 0 8px;background:var(--card)}
+  .tbcard.contradiction{border-color:color-mix(in srgb, var(--err) 35%, var(--border))}
+  .tbih{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--muted-foreground)}
+  .tbside{display:flex;gap:7px;align-items:baseline;margin-top:7px;font-size:12.5px;line-height:1.5;color:var(--foreground);word-break:break-word}
+  .tbside .tbab{font-family:var(--font-mono);font-size:10px;color:var(--muted-foreground);flex:none}
+  .tbside small{color:var(--muted-foreground);font-size:10.5px;font-family:var(--font-mono);white-space:nowrap}
+  .tbacts{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px}
+  .tbacts .btn{height:26px;font-size:11.5px;padding:0 10px}
+  .tbmem.old{opacity:.55}
+  .tbmem.old .bmtext{text-decoration:line-through;text-decoration-color:color-mix(in srgb, var(--muted-foreground) 60%, transparent)}
+  .tbhist{margin-top:5px;font-size:10.5px;color:var(--muted-foreground);font-family:var(--font-mono);word-break:break-word}
+  /* tier and inbox chips: a word AND a colour, like the kind badges */
+  .tbt-canon{color:var(--primary);background:color-mix(in srgb, var(--primary) 14%, transparent)}
+  .tbt-confirmed{color:var(--ok);background:color-mix(in srgb, var(--ok) 15%, transparent)}
+  .tbt-own{color:var(--muted-foreground);background:var(--sidebar-accent)}
+  .tbt-proposed{color:var(--warn);background:color-mix(in srgb, var(--warn) 15%, transparent)}
+  .tbi-contradiction{color:var(--err);background:color-mix(in srgb, var(--err) 14%, transparent)}
+  .tbi-correction,.tbi-untrusted{color:var(--warn);background:color-mix(in srgb, var(--warn) 15%, transparent)}
+  .tbi-duplicate{color:var(--muted-foreground);background:var(--sidebar-accent)}
+  .tbi-promote{color:var(--ok);background:color-mix(in srgb, var(--ok) 15%, transparent)}
+  /* Add-an-agent rows: an ADE you haven't installed is still listed, greyed,
+     with the reason — "Codex isn't in the list" and "Codex isn't installed"
+     send you to very different places. */
+  .addrow{cursor:pointer}
+  .addrow .fp{color:var(--foreground)}
+  .addrow:hover{background:var(--sidebar-accent)}
+  .addrow.off{cursor:default;opacity:.5}
+  .addrow.off:hover{background:none}
+  .frow.agentrow .gacts,.frow.bridge .gacts{margin-left:4px}
+  .iconbtn.xs svg{width:11px;height:11px}
+  .gcommit{display:flex;gap:6px;padding:8px 10px;border-bottom:1px solid var(--border);align-items:center}
+  .gcommit input{flex:1;min-width:0;background:var(--input,var(--card));border:1px solid var(--border);
+    border-radius:7px;padding:5px 8px;font-size:11.5px;color:var(--foreground);font-family:var(--font-sans)}
+  .gcommit input:focus{outline:none;border-color:var(--ring,var(--muted-foreground))}
+  .gcommit .btn{flex:none;white-space:nowrap}
+  /* ── Console ──────────────────────────────────────────
+     Errors live in the terminal's dock: same drawer, same edge. The dot on the
+     toolbar button is the only thing that ever asks for attention, and only
+     for an error you haven't looked at. */
+  .errdot{position:absolute;top:3px;right:3px;width:6px;height:6px;border-radius:50%;
+    background:var(--danger,#e5484d);display:none;box-shadow:0 0 0 1.5px var(--card)}
+  .errdot.on{display:block}
+  #consolebtn{position:relative}
+  /* what the previewed page said */
+  .pglog{display:none;flex-direction:column;border-top:1px solid var(--border);max-height:42%;min-height:120px}
+  .pgtabs{display:inline-flex;gap:1px;margin-left:6px}
+  .pgtabs button{border:0;background:none;color:var(--muted-foreground);font:inherit;font-size:10.5px;
+    text-transform:uppercase;letter-spacing:.06em;padding:2px 6px;border-radius:5px;cursor:pointer}
+  .pgtabs button.on{color:var(--foreground);background:var(--sidebar-accent)}
+  .pgcount{font-size:10.5px;color:var(--muted-foreground);text-transform:none;letter-spacing:0}
+  .pgrow{display:flex;gap:8px;align-items:baseline;padding:3px 4px;border-radius:5px;cursor:pointer}
+  .pgrow:hover{background:var(--sidebar-accent)}
+  .pgrow .lv{flex:none;min-width:44px;font-size:10px;text-transform:uppercase;color:var(--muted-foreground)}
+  .pgrow .ms{margin-left:auto;flex:none;color:var(--muted-foreground);font-size:10.5px}
+  .pgrow.e{color:var(--err)}
+  .pgrow.e .lv{color:var(--err)}
+  .pgrow.w{color:var(--warn)}
+  #pgpick.on{color:var(--accentBlue)}
+  /* is this thread working, finished, or neither */
+  .crow .cstat{width:7px;height:7px;border-radius:99px;flex:none;margin-left:6px;background:var(--muted-foreground)}
+  .crow .cstat.done{background:var(--ok,#3fb950)}
+  .crow .cstat.bad{background:var(--err)}
+  .crow .cstat.wait{background:var(--warn)}
+  .crow .cstat.idle{background:transparent;border:1px solid var(--border)}
+  .crow .cstat.run{background:var(--live);animation:cstatpulse 1.4s ease-in-out infinite}
+  @keyframes cstatpulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.72)}}
+  /* which agent (or model) a thread is pinned to */
+  .crow .cwho{margin-left:auto;flex:none;font-size:10px;color:var(--muted-foreground);
+    max-width:96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.85}
+  .crow.cur .cwho{color:var(--foreground)}
+  /* preview controls: emulated widths, a camera, auto-reload */
+  .browsizes{display:inline-flex;gap:1px;flex:none;margin-left:4px}
+  .browsizes button{border:1px solid var(--border);background:transparent;color:var(--muted-foreground);
+    font:inherit;font-size:10.5px;height:24px;padding:0 7px;cursor:pointer}
+  .browsizes button:first-child{border-radius:6px 0 0 6px}
+  .browsizes button:last-child{border-radius:0 6px 6px 0}
+  .browsizes button.on{color:var(--foreground);background:var(--sidebar-accent);border-color:var(--ring)}
+  .browauto{display:inline-flex;align-items:center;gap:4px;font-size:10.5px;color:var(--muted-foreground);flex:none;cursor:pointer}
+  .browauto input{margin:0;cursor:pointer}
+  .browframe.sized{display:flex;justify-content:center;overflow:auto;background:var(--muted)}
+  .browframe.sized iframe{border:1px solid var(--border);background:#fff;flex:none}
+  /* what a PR would carry, before it carries it */
+  .modal.prplan{max-width:600px;width:92vw}
+  .prpbody{padding:4px 16px 12px;max-height:60vh;overflow:auto}
+  .prpsub{font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted-foreground);margin:10px 0 4px}
+  .prplist{font-family:var(--font-mono);font-size:11.5px;color:var(--foreground);
+    background:var(--muted);border:1px solid var(--border);border-radius:8px;padding:6px 9px}
+  .prplist div{padding:1px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* what happened while you were away */
+  .modal.digest{max-width:620px;width:92vw}
+  .dgsub{padding:0 16px 10px;font-size:12px;color:var(--muted-foreground)}
+  .dgsub .warn{color:var(--warn)}
+  .dglist{max-height:60vh;overflow:auto;padding:0 8px 12px}
+  .dgrow{display:flex;gap:10px;align-items:baseline;padding:7px 8px;border-radius:8px;font-size:12.5px}
+  .dgrow[data-dgchat]{cursor:pointer}
+  .dgrow[data-dgchat]:hover{background:var(--sidebar-accent)}
+  .dgrow .dgt{flex:none;font-family:var(--font-mono);font-size:10.5px;color:var(--muted-foreground)}
+  .dgrow.question{color:var(--warn)}
+  .dgrow.failed,.dgrow.server{color:var(--err)}
+  .dgrow.landed{color:var(--ok)}
+  .dgrow.cost{color:var(--muted-foreground);font-family:var(--font-mono);font-size:11.5px}
+  /* dev servers: the rail rows, and a server's output under the page */
+  .srvlist{display:flex;flex-direction:column;gap:2px;padding:4px}
+  .srvrow{display:flex;align-items:center;gap:7px;padding:5px 7px;border-radius:7px;cursor:pointer;font-size:12px}
+  .srvrow:hover{background:var(--sidebar-accent)}
+  .srvrow .sdot{width:7px;height:7px;border-radius:50%;flex:none;background:var(--muted-foreground)}
+  .srvrow .sdot.ok{background:var(--ok)}
+  .srvrow .sdot.warn{background:var(--warn)}
+  .srvrow .sdot.err{background:var(--err)}
+  .srvrow .sdot.off{background:var(--muted-foreground);opacity:.5}
+  .srvrow .nm{font-weight:600;color:var(--foreground)}
+  .srvrow .st{flex:1;color:var(--muted-foreground);font-size:10.5px;font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .srvrow .acts{display:none;gap:1px;flex:none}
+  .srvrow:hover .acts{display:flex}
+  .linkbtn{border:0;background:none;color:var(--accentBlue);cursor:pointer;font:inherit;padding:0;text-decoration:underline}
+  .srvlog{display:none;flex-direction:column;border-top:1px solid var(--border);max-height:38%;min-height:120px}
+  .srvlogbar{display:flex;align-items:center;gap:8px;height:28px;padding:0 8px;border-bottom:1px solid var(--border);
+    font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted-foreground)}
+  .srvloglines{flex:1;overflow:auto;padding:6px 9px;font-family:var(--font-mono);font-size:11.5px;line-height:1.55;color:var(--foreground)}
+  .srvloglines .e{color:var(--err)}
+  .srvloglines .m{color:var(--muted-foreground)}
+  /* dev servers: the rail rows, and a server's output under the page */
+  .srvlist{display:flex;flex-direction:column;gap:2px;padding:4px}
+  .srvrow{display:flex;align-items:center;gap:7px;padding:5px 7px;border-radius:7px;cursor:pointer;font-size:12px}
+  .srvrow:hover{background:var(--sidebar-accent)}
+  .srvrow .sdot{width:7px;height:7px;border-radius:50%;flex:none;background:var(--muted-foreground)}
+  .srvrow .sdot.ok{background:var(--ok)}
+  .srvrow .sdot.warn{background:var(--warn)}
+  .srvrow .sdot.err{background:var(--err)}
+  .srvrow .sdot.off{background:var(--muted-foreground);opacity:.5}
+  .srvrow .nm{font-weight:600;color:var(--foreground)}
+  .srvrow .st{flex:1;color:var(--muted-foreground);font-size:10.5px;font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .srvrow .acts{display:none;gap:1px;flex:none}
+  .srvrow:hover .acts{display:flex}
+  .linkbtn{border:0;background:none;color:var(--accentBlue);cursor:pointer;font:inherit;padding:0;text-decoration:underline}
+  .srvlog{display:none;flex-direction:column;border-top:1px solid var(--border);max-height:38%;min-height:120px}
+  .srvlogbar{display:flex;align-items:center;gap:8px;height:28px;padding:0 8px;border-bottom:1px solid var(--border);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted-foreground)}
+  .srvloglines{flex:1;overflow:auto;padding:6px 9px;font-family:var(--font-mono);font-size:11.5px;line-height:1.55;color:var(--foreground)}
+  .srvloglines .e{color:var(--err)}
+  .srvloglines .m{color:var(--muted-foreground)}
+  /* the Browser tab — live page + the project's Playwright specs */
+  .browwrap{position:absolute;inset:0;display:none;overflow:hidden;
+    background:var(--editor-background);border-top:1px solid var(--border)}
+  .browwrap.on{display:flex;z-index:5}
+  .browrail{width:290px;flex:none;display:flex;flex-direction:column;min-height:0;border-right:1px solid var(--border)}
+  .browbar{height:34px;flex:none;display:flex;align-items:center;gap:6px;padding:0 8px;border-bottom:1px solid var(--border)}
+  .browbar .lbl{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted-foreground)}
+  .speclist{flex:1;min-height:0;overflow:auto;padding:4px}
+  .specrow{display:flex;align-items:center;gap:7px;padding:5px 8px;border-radius:6px;font-family:var(--font-mono);font-size:11.5px;cursor:pointer;color:var(--muted-foreground)}
+  .specrow:hover{background:color-mix(in srgb, var(--accent) 55%, transparent);color:var(--foreground)}
+  .specrow .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left}
+  .specrow.running .nm{color:var(--live)}
+  .specrow .go{opacity:.6;flex:none}
+  .specrow:hover .go{opacity:1}
+  .specempty{padding:14px 12px;font-size:12px;color:var(--muted-foreground);line-height:1.6}
+  .specout{flex:1;min-height:0;overflow:auto;font-family:var(--font-mono);font-size:11px;line-height:1.55;padding:8px 10px;white-space:pre-wrap;border-top:1px solid var(--border)}
+  .specout .fail{color:var(--err)}
+  .specout .pass{color:var(--live)}
+  .browmain{flex:1;display:flex;flex-direction:column;min-height:0}
+  .browurl{height:34px;flex:none;display:flex;align-items:center;gap:6px;padding:0 8px;border-bottom:1px solid var(--border)}
+  .browurl input{flex:1;height:24px;background:var(--editor-surface);border:1px solid var(--border);border-radius:6px;
+    color:var(--foreground);font-family:var(--font-mono);font-size:11.5px;padding:0 9px;outline:none}
+  .browurl input:focus{border-color:var(--ring)}
+  .browframe{flex:1;min-height:0;background:#fff}
+  .browframe iframe{width:100%;height:100%;border:0;display:block}
+  .browhint{flex:1;display:flex;align-items:center;justify-content:center;text-align:center;
+    color:var(--muted-foreground);font-size:12.5px;line-height:1.7;padding:24px}
+  /* review comments on diff lines */
+  .dl.cmt{cursor:pointer}
+  .dl.cmt:hover .lc{text-decoration:underline dotted}
+  .dl.commented{box-shadow:inset 2.5px 0 0 var(--live)}
+  .cmteditor{display:flex;gap:6px;padding:4px 8px 4px 46px;background:color-mix(in srgb, var(--accent) 40%, transparent)}
+  .cmteditor input{flex:1;height:24px;background:var(--editor-surface);border:1px solid var(--ring);
+    border-radius:6px;color:var(--foreground);font-family:var(--font-mono);font-size:11.5px;padding:0 8px;outline:none}
+  .reviewbar{position:absolute;left:12px;right:12px;bottom:10px;z-index:6;display:flex;align-items:center;gap:10px;
+    padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--editor-background);
+    box-shadow:0 6px 24px rgba(0,0,0,.45);font-size:12px}
+  .reviewbar .btn{margin-left:auto}
+  .conwrap{position:absolute;inset:0;display:none;flex-direction:column;overflow:hidden;
+    background:var(--background)}
+  /* The console is a pseudo-pane: shown when its tab is active, and the terminal
+     panes are deactivated at the same time, so no overlap and no z-index race. */
+  .conwrap.on{display:flex;z-index:5}
+  /* the Console tab in the terminal bar */
+  .termtab.console svg{width:13px;height:13px;flex:none;opacity:.8}
+  .termtab.console .ctt{margin:0 1px}
+  .conbar{display:flex;align-items:center;gap:6px;flex:none;height:28px;padding:0 8px;
+    border-bottom:1px solid var(--border);font-size:11px;color:var(--muted-foreground)}
+  .conbar .lvl{padding:2px 7px;border-radius:11px;cursor:pointer;border:1px solid transparent;
+    font-family:var(--font-mono);font-size:10px;letter-spacing:.02em}
+  .consel{height:20px;max-width:130px;background:var(--editor-surface);border:1px solid var(--border);
+    border-radius:6px;color:var(--muted-foreground);font-family:var(--font-mono);font-size:10px;outline:none}
+  .consearch{height:20px;width:150px;background:var(--editor-surface);border:1px solid var(--border);
+    border-radius:6px;color:var(--foreground);font-family:var(--font-mono);font-size:10.5px;padding:0 7px;outline:none}
+  .consearch:focus{border-color:var(--ring)}
+  .conbar .lvl:hover{background:var(--sidebar-accent)}
+  .conbar .lvl.on{background:var(--sidebar-accent);border-color:var(--border);color:var(--foreground)}
+  .conlist{flex:1;min-height:0;overflow:auto;font-family:var(--font-mono);font-size:11px;line-height:1.55}
+  .conrow{display:flex;gap:8px;padding:3px 10px;border-bottom:1px solid color-mix(in srgb,var(--border) 45%,transparent);
+    align-items:baseline}
+  .conrow:hover{background:color-mix(in srgb,var(--sidebar-accent) 55%,transparent)}
+  .conrow .t{flex:none;color:var(--muted-foreground);opacity:.75}
+  .conrow .sc{flex:none;color:var(--muted-foreground);max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .conrow .ms{flex:1;min-width:0;white-space:pre-wrap;word-break:break-word}
+  .conrow.error .ms{color:var(--danger,#e5484d)}
+  .conrow.warn .ms{color:var(--warn)}
+  .conrow .det{cursor:pointer;color:var(--muted-foreground);flex:none;opacity:.7}
+  .conrow .det:hover{opacity:1}
+  .condetail{padding:6px 10px 8px 10px;white-space:pre-wrap;word-break:break-word;
+    color:var(--muted-foreground);background:color-mix(in srgb,var(--sidebar-accent) 40%,transparent);
+    border-bottom:1px solid var(--border);font-size:10.5px}
+  .conempty{padding:20px 12px;color:var(--muted-foreground);font-family:var(--font-sans);font-size:12px}
+  .termpane{position:absolute;inset:0;display:none}
+  .termpane.active{display:block}
+  .termpane .xterm{height:100%;padding:6px 8px 0 12px}
+  .termpane .xterm-viewport{background:transparent!important}
+  .termpane .xterm-viewport::-webkit-scrollbar{width:12px}
+  .termpane .xterm-viewport::-webkit-scrollbar-thumb{
+    background:color-mix(in srgb, var(--muted-foreground) 28%, transparent);
+    border:3px solid transparent;border-radius:7px;background-clip:padding-box}
+  .termbody{height:100%;overflow-y:auto;padding:8px 12px;font-family:var(--font-mono);font-size:12px;
+    line-height:1.55;white-space:pre-wrap;word-break:break-word;color:var(--foreground);cursor:text}
+  .termbody .pl{color:var(--muted-foreground)}
+  .termbody .pl b{color:var(--ok);font-weight:400}
+  .termbody .cmd{color:var(--foreground)}
+  .termbody .eo{color:var(--err)}
+  .termbody .ex{color:color-mix(in srgb, var(--muted-foreground) 75%, transparent)}
+  .termbody .exbad{color:var(--err);opacity:.9}
+  .termbody .hintl{color:color-mix(in srgb, var(--muted-foreground) 70%, transparent)}
+  .termbody .run{color:var(--muted-foreground);opacity:.8}
+  /* ANSI SGR → tokens (16-colour + bold/dim/underline) */
+  .a-b{font-weight:700}.a-d{opacity:.65}.a-u{text-decoration:underline}.a-i{font-style:italic}
+  .a-30{color:#555}.a-31{color:var(--git-del)}.a-32{color:var(--git-add)}.a-33{color:var(--warn)}
+  .a-34{color:var(--thread-ink)}.a-35{color:var(--shuttle-ink)}.a-36{color:var(--thread-ink)}.a-37{color:var(--foreground)}
+  .a-90{color:var(--muted-foreground)}.a-91{color:var(--err)}.a-92{color:var(--ok)}.a-93{color:var(--warn)}
+  .a-94{color:var(--thread-ink)}.a-95{color:var(--shuttle-ink)}.a-96{color:var(--thread-ink)}.a-97{color:var(--foreground)}
+  .terminput{flex:none;display:flex;align-items:center;gap:8px;padding:7px 12px;border-top:1px solid var(--border)}
+  .terminput .pr{color:var(--ok);font-family:var(--font-mono);font-size:12px;flex:none;
+    max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .terminput .pr b{color:var(--muted-foreground);font-weight:400}
+  .terminput input{flex:1;background:none;border:none;outline:none;box-shadow:none!important;color:var(--foreground);
+    font-family:var(--font-mono);font-size:12px;letter-spacing:0;caret-color:var(--ok)}
+  .terminput.busy input{opacity:.6}
+  .terminput .st{flex:none;font-size:10px;font-family:var(--font-mono);color:var(--muted-foreground)}

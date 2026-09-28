@@ -81,6 +81,14 @@ describe("desktop · localBuildRev", () => {
     expect(extra).not.toBe(bare);
   });
 
+  it("moves when browser styles or the document shell change", () => {
+    for (const asset of ["web/app.css", "web/shell.html"]) {
+      const before = localBuildRev(fakeDist("server", "app", { [asset]: "before" }));
+      const after = localBuildRev(fakeDist("server", "app", { [asset]: "after" }));
+      expect(after).not.toBe(before);
+    }
+  });
+
   it("ignores maps and declarations — only what the daemon actually runs", () => {
     const plain = localBuildRev(fakeDist("server\n", "app\n"));
     const noisy = localBuildRev(

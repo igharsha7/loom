@@ -263,6 +263,8 @@ export type ExtractEngine = (prompt: { system: string; user: string }) => Promis
 
 export interface ExtractFromTurnOpts {
   engine: ExtractEngine;
+  /** Discard an in-flight helper result when its owning project closes. */
+  signal?: AbortSignal;
   /** Who ran the turn — the memories are attributed to them. */
   agentId: string;
   chat?: string;
@@ -288,7 +290,7 @@ export async function extractFromTurn(
   opts: ExtractFromTurnOpts,
 ): Promise<ExtractResult> {
   const empty: ExtractResult = { added: [], updated: [], forgotten: [], dropped: [] };
-  if (!turn.trim()) return empty;
+  if (opts.signal?.aborted || !turn.trim()) return empty;
 
   // Candidates: what a new fact from this turn might collide with. Query is the
   // turn itself plus the files it touched — exactly what phase 1 ranks on.
@@ -310,6 +312,7 @@ export async function extractFromTurn(
     return empty; // extractor unavailable — the turn is unaffected
   }
 
+  if (opts.signal?.aborted) return empty;
   const ops = parseExtraction(reply);
   if (!ops.length) return empty;
   return applyExtraction(brain, ops, turn, candidates, {

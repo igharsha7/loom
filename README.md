@@ -112,10 +112,11 @@ config (`.loom/config.json` → `codex → model: "gpt-5.6-terra"`) at high reas
 > how this got caught.
 
 - **Codex holds the baton like any other agent.** The adapter
-  ([`src/adapters/codex.ts`](src/adapters/codex.ts)) drives `codex exec --json` headless:
-  it opens a thread, streams Codex's JSONL event log (`thread.started`, `item.completed`
-  → `agent_message` / `command_execution` / `file_change`, `run_complete`), and **resumes
-  the same thread across turns** so Codex keeps its own context between handoffs.
+  ([`src/providers/codex/adapter.ts`](src/providers/codex/adapter.ts)) keeps a warm
+  `codex app-server` (JSON-RPC) per chat: it opens a thread, streams Codex's items
+  (`agentMessage` / `commandExecution` / `fileChange`), its context usage and compaction,
+  and **keeps the same thread across turns** (resuming it after a restart) so Codex keeps
+  its own context between handoffs.
 - **Codex reads and writes the shared brain.** Before a Codex turn, Loom projects the
   unified memory (imported ADE memory + decisions + the thread) into its briefing; its
   replies and memory writes land back in the one shared store. So a handoff
@@ -258,6 +259,20 @@ Three moves the fleet learned for when one turn isn't the right shape:
   every dispatch. `loom stale` names what's hung (busy past ten minutes);
   `loom reap <agentId>` interrupts, stops, respawns from config, and releases
   the baton if the corpse held it.
+
+## Native context continuity (opt-in)
+
+The new deterministic Brain path supports sequential switching between checked
+Codex/Claude CLI profiles with scoped native sessions, protected user context,
+SQLite search, source-backed checkpoints and delivery diagnostics. It requires no
+embedding model or inference package. Enable **Native context continuity** in
+Settings → Preferences; the legacy workflow remains the default.
+
+Unknown CLI versions, OpenCode/bridges, attachments and parallel execution are
+gated in this mode. Overflow saves a reviewable request instead of silently dropping
+user intent. See [native continuity](docs/brain-continuity.md),
+[current architecture](ARCHITECTURE.md) and
+[remaining verification gates](docs/refactoring/BRAIN-TODO.md).
 
 ## Several sessions, one brain
 
@@ -593,8 +608,8 @@ detects at least two roles.
 
 | Agent | Tier | Transport | Status |
 |---|---|---|---|
-| Claude Code | adapter (full-duplex) | headless CLI, `stream-json`, `--resume`, briefing via `--append-system-prompt` | ✅ verified against 2.1.83; re-verified 2.1.276 (2026-09-18) |
-| Codex | adapter (full-duplex) | `codex exec --json` (JSONL), `exec resume <thread>`; found on PATH **or inside Codex.app** | ✅ verified against codex-cli 0.142.4; re-verified 0.155.0 (2026-09-18) |
+| Claude Code | adapter (full-duplex) | Claude Agent SDK driving the installed `claude` (stream-json control protocol), resume by session, briefing appended to Claude Code's system prompt | ✅ verified against 2.1.278 with SDK 0.3.283 (2026-09-28) |
+| Codex | adapter (full-duplex) | `codex app-server` JSON-RPC, `thread/resume`; found on PATH **or inside Codex.app** | ✅ verified against codex-cli 0.153.4 (2026-09-28) |
 | OpenCode | adapter (full-duplex) | `opencode serve` HTTP + SSE (`/prompt`, `/interrupt`, `/event`) | ✅ verified against 1.17.20; re-verified 1.18.31 (2026-09-18) |
 | Grok Code | adapter (full-duplex) | `grok -p --output-format json`, `-r <session>` | 🔶 verified against 0.2.54 — **answers only, no tool or edit events** (see below) |
 | Antigravity | adapter (full-duplex) | `agy -p` headless, `--conversation <id>` to resume | ✅ verified against agy 1.1.6; re-verified 1.2.6 (2026-09-18) |
@@ -602,6 +617,16 @@ detects at least two roles.
 | **Model (API)** | adapter (full-duplex) | `POST /v1/chat/completions`, streamed — any OpenAI-compatible provider | ✅ no CLI to install; tools are read-only unless you allow more (see [below](#agents-that-are-models)) |
 | Echo | adapter (demo/tests) | in-process | ✅ |
 | Kiro | **bridge** (driveable) | Chromium debug port — types into the real chat panel and reads the panel back | 🔶 mechanism verified; its selectors are not (see below) |
+
+**Context and limits.** For Claude Code and Codex, the composer shows the chosen
+agent's context in use against its model's window, shows **compacting…** while the
+harness compacts (with a "compacted its context · 180k → 12k tokens" line in the
+thread when it's done), and calls out a usage-limit window once it passes 80%. Hover
+for every window and when it resets.
+
+> The Claude Agent SDK package carries a platform build of Claude Code as an
+> optional dependency (about 215 MB installed on macOS arm64). Loom never runs it: it always points
+> the SDK at your own `claude`. Installing with `--omit=optional` skips it.
 
 Four of those need their asterisks spelled out, because the table row is
 shorter than the truth:
@@ -807,9 +832,9 @@ Getting it into the model's context is a different problem, and it depends on th
 
 | Agent | How the brain arrives | Strength |
 |---|---|---|
-| Claude Code | briefing via `--append-system-prompt` — the model *always* sees a summary (recent decisions + messages) plus a pointer to `.loom/memory/claude-code.md`, which it can Read | **strong** — the summary is guaranteed; the full file is one tool-call away |
+| Claude Code | briefing appended to Claude Code's system prompt — the model *always* sees a summary (recent decisions + messages) plus a pointer to `.loom/memory/claude-code.md`, which it can Read | **strong** — the summary is guaranteed; the full file is one tool-call away |
 | Grok Code | the briefing rides in `--rules`, Grok's real system-prompt channel, so `-p` stays your clean prompt | **strong** — `--rules` is a genuine system channel, not text in the turn |
-| Codex | no `--append-system-prompt` on `codex exec`, so the briefing rides in front of your prompt — **framed** as an unmissable `LOOM SESSION MEMORY — authoritative, read first` block | **reliable** — one prompt either way, but framed so it can't be mistaken for chatter |
+| Codex | no per-turn system channel in `codex app-server`, so the briefing rides in front of your prompt — **framed** as an unmissable `LOOM SESSION MEMORY — authoritative, read first` block | **reliable** — one prompt either way, but framed so it can't be mistaken for chatter |
 | OpenCode | no per-prompt system field on `/prompt`, so the same **framed** block is prepended to your prompt | **reliable** — delivered as an authoritative block, not loose text |
 | Antigravity, Kiro | nothing tells them the file exists — Loom types into their chat box, which is not a system prompt | **none** — a human has to open it |
 
@@ -935,15 +960,16 @@ real CLI with `node scripts/verify-permissions.mjs`, not read off `--help`.
 | | Bypass | Auto | Always ask |
 |---|---|---|---|
 | Claude Code | `bypassPermissions` | `acceptEdits` *(default)* | **real approvals**: each tool call waits for your Allow / Deny in Loom, on desktop or phone |
-| Codex | no sandbox | `workspace-write` *(default)* | `read-only`: proposes, changes nothing |
+| Codex | no sandbox | `workspace-write` *(default)* | **real approvals**: a `read-only` sandbox, and each command or edit waits for your Allow / Deny in Loom |
 | Antigravity | `--dangerously-skip-permissions` *(default)* | ✗ unavailable: agy 1.2.6 headless writes into its own scratch folder, not your project | `--mode plan` |
 | Grok | `bypassPermissions` *(default)* | `auto` | `plan` |
 | OpenCode | allow-all | its defaults *(default)* | ✗ unavailable: opencode 1.18.31 ignores read-only settings on its headless API |
 
 - "Unavailable" cells are shown disabled with the reason, and the API refuses them.
-- **Always ask on Claude Code** runs through a tiny built-in MCP server
-  (`src/mcp/approve.ts`) passed as `--permission-prompt-tool`. The request appears
-  in the thread as an approval card; nothing happens until you answer.
+- **Always ask** is answered inside the daemon: Claude Code's permission prompts
+  arrive through the Agent SDK's `canUseTool`, and Codex's through app-server
+  approval requests. The request appears in the thread as an approval card; nothing
+  happens until you answer, and a card closes by itself if the turn ends first.
 - `node scripts/verify-approvals.mjs` proves it against the real CLI: the file does
   not exist until you press Allow.
 

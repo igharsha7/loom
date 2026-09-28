@@ -6,7 +6,7 @@
  * is interruptible: a confirmed handoff interrupts an in-flight turn.
  */
 
-import type { EventLog } from "./eventlog.js";
+import type { EventJournal } from "./eventlog.js";
 import { readProjectState, writeProjectState } from "./registry.js";
 
 export class NotHolderError extends Error {
@@ -25,9 +25,9 @@ export class NotHolderError extends Error {
 
 export class BatonManager {
   private projectDir: string;
-  private log: EventLog;
+  private log: EventJournal;
 
-  constructor(projectDir: string, log: EventLog) {
+  constructor(projectDir: string, log: EventJournal) {
     this.projectDir = projectDir;
     this.log = log;
   }

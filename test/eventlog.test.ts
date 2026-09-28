@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { EventLog } from "../src/core/eventlog.js";
 import { tmpDir } from "./helpers.js";
 
@@ -52,6 +52,42 @@ for (const store of stores) {
       log.append({ kind: "message", payload: {} });
       expect(seen).toEqual([1, 2]);
       log.close();
+    });
+
+    it("isolates observer failures and mutations from canonical history", async () => {
+      const log = await open();
+      const warning = vi.spyOn(process, "emitWarning").mockImplementation(() => {});
+      try {
+        const payload = { text: "original", nested: { value: 1 } };
+        const seen: string[] = [];
+        log.onEvent((event) => {
+          event.payload.text = "observer mutation";
+          throw new Error("client disconnected");
+        });
+        log.onEvent((event) => seen.push(String(event.payload.text)));
+        const written = log.append({ kind: "message", payload });
+        payload.nested.value = 99;
+        written.payload.text = "returned mutation";
+        const read = log.list();
+        (read[0]!.payload.nested as { value: number }).value = 100;
+        expect(seen).toEqual(["original"]);
+        expect(log.list()[0]!.payload).toEqual({ text: "original", nested: { value: 1 } });
+        expect(log.lastId()).toBe(1);
+        expect(warning).toHaveBeenCalledOnce();
+      } finally {
+        warning.mockRestore();
+        log.close();
+      }
+    });
+
+    it("closes idempotently and refuses all later access", async () => {
+      const log = await open();
+      log.close();
+      expect(() => log.close()).not.toThrow();
+      expect(() => log.append({ kind: "message", payload: {} })).toThrow(/closed/);
+      expect(() => log.list()).toThrow(/closed/);
+      expect(() => log.lastId()).toThrow(/closed/);
+      expect(() => log.onEvent(() => {})).toThrow(/closed/);
     });
 
     it("persists across reopen", async () => {

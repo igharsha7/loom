@@ -32,6 +32,6 @@ export {
 } from "./adapters/base.js";
 export { registerAgentKind, createAgent, knownAgentKinds } from "./adapters/index.js";
 export { EchoAdapter } from "./adapters/echo.js";
-export { ClaudeCodeAdapter } from "./adapters/claude-code.js";
+export { ProviderAgent, ClaudeCodeAdapter, CodexAdapter } from "./providers/agent.js";
 export { OpenCodeAdapter } from "./adapters/opencode.js";
 export { AntigravityBridge } from "./adapters/bridges/antigravity.js";

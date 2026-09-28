@@ -18,10 +18,10 @@
  *      `!!url`. A server that refuses the connection is reported as unreachable,
  *      which is the honest reading.
  *
- * Two CLIs consume this, and they take it differently — see the adapters:
- * `claude --mcp-config <file>` reads the document, `codex -c mcp_servers.<key>=…`
- * takes TOML overrides (verified against claude 2.1.193 and codex-cli 0.144.6 by
- * running both, not by reading docs).
+ * Two adapters consume this, each through its harness's own API: the Claude
+ * adapter passes the servers as the Agent SDK's `mcpServers` option, and the
+ * Codex adapter as `mcp_servers.<key>` config on app-server `thread/start`.
+ * The config file itself is what `claude -p` callers (Insights) read.
  */
 
 import fs from "node:fs";
@@ -141,55 +141,6 @@ export function writeMcpSession(mcps: McpServerConfig[] | undefined): McpSession
       }
     },
   };
-}
-
-// ---------------------------------------------------------------------------
-// codex: TOML config overrides
-// ---------------------------------------------------------------------------
-
-/** TOML basic-string escaping — quotes, backslashes and the control chars. */
-function tomlString(s: string): string {
-  return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t")}"`;
-}
-
-/** One server as a TOML inline table, the value half of a `-c key=value` pair. */
-function tomlInline(entry: McpServerEntry): string {
-  const fields: string[] = [];
-  if (entry.type === "stdio") {
-    fields.push(`command=${tomlString(entry.command)}`);
-    if (entry.args?.length) fields.push(`args=[${entry.args.map(tomlString).join(",")}]`);
-    if (entry.env && Object.keys(entry.env).length) {
-      fields.push(`env={${Object.entries(entry.env).map(([k, v]) => `${tomlString(k)}=${tomlString(v)}`).join(",")}}`);
-    }
-  } else {
-    fields.push(`url=${tomlString(entry.url)}`);
-    // Headers are NOT emitted here, and that is a deliberate gap rather than an
-    // oversight. `url` was verified against codex-cli 0.144.6 by running it;
-    // the key codex wants for per-server HTTP headers was not, and a guessed
-    // TOML key is either ignored (silent) or rejected (turn fails). A server
-    // that needs an Authorization header will fail to authenticate under codex
-    // until this is verified — which is a visible, diagnosable failure, unlike
-    // an invented field name.
-  }
-  return `{${fields.join(",")}}`;
-}
-
-/**
- * The `-c` arguments that put these servers in front of `codex exec`.
- *
- * Codex has no `--mcp-config <file>` flag — its servers live in the
- * `mcp_servers` table of config.toml, and `-c <dotted.path>=<toml>` is the
- * documented per-invocation override for exactly that. Verified against
- * codex-cli 0.144.6: `codex mcp list -c 'mcp_servers.x={url="…"}'` lists the
- * injected server alongside the persisted ones, for both URL and command forms.
- * Nothing is written to the user's config.toml.
- */
-export function codexMcpArgs(servers: ResolvedMcpServer[]): string[] {
-  const args: string[] = [];
-  for (const s of servers) {
-    args.push("-c", `mcp_servers.${s.key}=${tomlInline(s.entry)}`);
-  }
-  return args;
 }
 
 // ---------------------------------------------------------------------------

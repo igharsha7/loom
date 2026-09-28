@@ -75,7 +75,7 @@ describe("detection", () => {
     // Ten real minutes would make the suite unrunnable; move the clock instead
     // of faking the hang. The hang is real, the age is simulated.
     const rt = daemon["runtimes"].get(projectId) as ProjectRuntime;
-    const since = rt["busySince"] as Map<string, number>;
+    const since = rt["turns"].busySince as Map<string, number>;
     since.set("plannerbot", Date.now() - ProjectRuntime.STALE_TURN_MS - 1000);
 
     const rows = await stale();

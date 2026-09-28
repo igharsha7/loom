@@ -1,4 +1,4 @@
-# Dockerfile.runner only needs package*.json, tsconfig and src — keep the build
+# Dockerfile.runner needs package*.json, tsconfig, src and the web build script — keep the build
 # context small (node_modules and videos alone are gigabytes).
 node_modules
 dist

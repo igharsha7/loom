@@ -1,3 +1,4 @@
+import fs from "node:fs";
 /**
  * The served web app is a single HTML string; these tests lock its contract:
  * the pairing/auth markers the daemon test depends on, the premium "weave"
@@ -9,15 +10,16 @@ import { describe, expect, it } from "vitest";
 import { APP_HTML, APP_MANIFEST } from "../src/daemon/app-page.js";
 import type { EventKind } from "../src/types.js";
 
+// Source contracts belong to the feature that owns them. DOM suites exercise
+// the emitted bundle; bundler formatting and local-name renaming aren't contracts.
+const webSource = (file: string) => fs.readFileSync(new URL('../src/web/' + file, import.meta.url), 'utf8');
+
 describe("web app page", () => {
-  // The whole page is one TS template literal, so every backslash bound for
-  // the browser has to be doubled and control bytes written as escapes. Get
-  // that wrong and the app ships a script that dies on parse — silently, since
-  // nothing server-side ever evaluates it. Parse it here instead.
+  // Parse the actual inline bundle: source syntax alone cannot catch assembly errors.
   it("serves a script that actually parses", () => {
-    const block = APP_HTML.match(/<script>\n\(function\(\)\{[\s\S]*?\n\}\)\(\);\n<\/script>/);
+    const block = [...APP_HTML.matchAll(/<script>([\s\S]*?)<\/script>/g)].at(-1);
     expect(block, "main app script block not found").not.toBeNull();
-    const src = block![0].replace(/^<script>/, "").replace(/<\/script>$/, "");
+    const src = block![1]!;
     expect(() => new Function(src)).not.toThrow();
   });
 
@@ -31,7 +33,7 @@ describe("web app page", () => {
     expect(APP_HTML).toContain("state.termRun(cmd)");
     // And says something when there's no terminal to run it in, rather than
     // swallowing it.
-    expect(APP_HTML).toMatch(/if \(!state\.termRun\) \{ toast\(/);
+    expect(APP_HTML).toMatch(/if \(!state\.termRun\) \{\s*toast\(/);
   });
 
   /**
@@ -147,7 +149,7 @@ describe("web app page", () => {
     expect(APP_HTML).not.toContain('id="pane-routes"');
     // issues and PRs are searchable from the board, in GitHub's own language
     expect(APP_HTML).toContain('id="bq"');
-    expect(APP_HTML).toContain('"?search=" + encodeURIComponent(board.q)');
+    expect(webSource("project/board.js")).toContain("\"?search=\" + encodeURIComponent(view.board.q)");
     // and an issue can still be handed to an agent, as the Tasks tab allowed
     expect(APP_HTML).toContain("[data-start]");
     expect(APP_HTML).toContain("Read the issue, then implement it.");
@@ -170,14 +172,14 @@ describe("web app page", () => {
     // where you see it, and the badge keeps saying what is actually so.
     expect(APP_HTML).toContain("if (card.own) {");
     expect(APP_HTML).toContain("c.shown = pins[c.id] || c.column");
-    expect(APP_HTML).toContain("var st = BSTATES[c.state]");
+    expect(webSource("project/board.js")).toContain("var st = view.BSTATES[c.state]");
   });
 
   it("lists a project's chats in the sidebar, and keeps them apart", () => {
     expect(APP_HTML).toContain("data-newchat");
     expect(APP_HTML).toContain('class="crow');
     // the socket carries the whole project; a thread shows one conversation
-    expect(APP_HTML).toContain('if ((frame.event.chat || "main") !== chatId) return;');
+    expect(webSource("project/thread.js")).toContain("if ((frame.event.chat || \"main\") !== view.chatId) return;");
     // and a role is text you type, wherever it's drawn
     expect(APP_HTML).toContain("function wireRoleEditors(");
     expect(APP_HTML).toContain("/role");
@@ -216,8 +218,8 @@ describe("web app page", () => {
     // refresh() fills state.project from a fetch that lands *after* the first
     // paint, so renderProject must seed it synchronously from the already
     // loaded list — otherwise the rail renders the project you just left.
-    expect(APP_HTML).toContain(
-      'state.project = (state.projects || []).filter(function(p){ return p.id === pid; })[0] || null;',
+    expect(webSource("project.js")).toContain(
+      "state.project = (state.projects || []).filter(function(p){ return p.id === pid; })[0] || null;",
     );
   });
 
@@ -369,13 +371,13 @@ describe("web app · picking models in Orchestrate", () => {
    * agent's list would be worse than no chip.
    */
   it("opens the list for the agent whose chip was clicked", () => {
-    expect(APP_HTML).toContain("function openModelMenu(who){");
+    expect(webSource("project/composer.js")).toContain("function openModelMenu(who){");
     expect(APP_HTML).toContain("var agentId = who || state.selected;");
     expect(APP_HTML).toContain("openModelMenu(id);");
     // Clicking the same chip twice closes it, which needs the menu to
     // remember whose it is.
     expect(APP_HTML).toContain('menuState = { kind: "modelmenu", agent: agentId');
-    expect(APP_HTML).toMatch(/menuState\.kind === "modelmenu" && menuState\.agent === id/);
+    expect(APP_HTML).toMatch(/view\.menuState\.kind === "modelmenu" && view\.menuState\.agent === id/);
   });
 
   /**
@@ -389,10 +391,10 @@ describe("web app · picking models in Orchestrate", () => {
     expect(APP_HTML).toContain("function addModelWorker(");
     expect(APP_HTML).toContain('JSON.stringify({ kind: "model" })');
     // Added, then asked which model — not left as a chip that fails on send.
-    expect(APP_HTML).toContain("if (a && a.id) openModelMenu(a.id);");
+    expect(webSource("project/orchestra.js")).toContain("if (a && a.id) view.openModelMenu(a.id);");
     // The roster is re-read before anything is drawn off it.
-    expect(APP_HTML).toContain("return refresh().then(function(){ return a; });");
-    expect(APP_HTML).toContain('return api("/api/projects/" + pid).then(function(j){');
+    expect(webSource("project/orchestra.js")).toContain("return view.refresh().then(function(){ return a; });");
+    expect(webSource("project/thread.js")).toContain("return api(\"/api/projects/\" + view.pid).then(function(j){");
     // And the send guard covers the orchestrator as well as the workers.
     expect(APP_HTML).toContain('return a.kind === "model" && !a.model;');
     expect(APP_HTML).toContain("cast.concat(lead ? [lead] : [])");
@@ -431,15 +433,15 @@ describe("web app · what the model list says about itself", () => {
  */
 describe("web app · orchestrating where you asked", () => {
   it("tells the run which thread the goal was given in", () => {
-    expect(APP_HTML).toContain("chat: chatId,");
+    expect(webSource("project/composer.js")).toContain("chat: view.chatId,");
     // Queued goals already carried it; both paths now agree.
-    expect(APP_HTML).toContain("var body = { text: text, target: queueTarget(), chat: chatId };");
+    expect(webSource("project/queue.js")).toContain("var body = { text: text, target: queueTarget(), chat: view.chatId };");
   });
 
   it("stays on the thread when the run is this thread", () => {
     // The old code always jumped: to the run's new chat, then to the board.
-    expect(APP_HTML).toContain("else if (run.chat === chatId) showTab(\"thread\");");
-    expect(APP_HTML).toContain('if (desktop && state.setChat && run.chat && run.chat !== chatId)');
+    expect(webSource("project/orchestra.js")).toContain("else if (run.chat === view.chatId) view.showTab(\"thread\");");
+    expect(webSource("project/orchestra.js")).toContain("if (view.desktop && state.setChat && run.chat && run.chat !== view.chatId)");
   });
 
   /**
@@ -449,8 +451,8 @@ describe("web app · orchestrating where you asked", () => {
    * dead run instead of your agent.
    */
   it("gives a borrowed thread back when the run ends", () => {
-    expect(APP_HTML).toContain("function owns(r){ return r && r.chat === chatId && (!r.inPlace || !orchTerminal(r.status)); }");
-    expect(APP_HTML).toContain("var hit = (orch.runs || []).filter(owns)[0];");
+    expect(webSource("project/orchestra.js")).toContain("function owns(r){ return r && r.chat === view.chatId && (!r.inPlace || !orchTerminal(r.status)); }");
+    expect(webSource("project/orchestra.js")).toContain("var hit = (view.orch.runs || []).filter(owns)[0];");
     expect(APP_HTML).toContain("return owns(s) ?");
   });
 
@@ -505,8 +507,8 @@ describe("web app · rewind", () => {
 
   it("lists every checkpoint from More, and offers to undo a rewind", () => {
     expect(APP_HTML).toContain("function openRewindMenu(");
-    expect(APP_HTML).toContain('{ label: "Rewind\u2026", icon: ICONS.rewind');
-    expect(APP_HTML).toContain('"/api/projects/" + pid + "/checkpoints"');
+    expect(webSource("project/composer.js")).toContain("{ label: \"Rewind…\", icon: ICONS.rewind");
+    expect(webSource("project/orchestra.js")).toContain("\"/api/projects/\" + view.pid + \"/checkpoints\"");
     // An empty list says why it is empty rather than sitting blank.
     expect(APP_HTML).toContain("no checkpoints yet \\u2014 one is taken before every turn");
     // A rewind that happened is a line in the thread, with the way back on it.
@@ -516,35 +518,17 @@ describe("web app · rewind", () => {
 });
 
 /**
- * The whole page is one TS template literal, so a backtick anywhere inside it
- * — including in a comment — ends the literal and the file stops being valid
- * TypeScript. It has happened three times: `loom projects --forget` in a
- * JSDoc, then twice more while fixing other things. The failure is loud (the
- * file won't compile) but the cause reads as unrelated, so this names it.
+ * The document, styles and browser modules are built separately and assembled
+ * into an offline page. Check the shipped artifacts, not template escaping.
  */
-describe("web app · the template literal itself", () => {
-  it("has no stray backtick in the served page", async () => {
-    const src = await import("node:fs/promises").then((fs) =>
-      fs.readFile(new URL("../src/daemon/app-page.ts", import.meta.url), "utf8"),
-    );
-    // The literal runs from the first backtick after APP_HTML's `=` to the
-    // one that closes it; anything inside must be an escaped \` or ${…}.
-    const start = src.indexOf("`", src.indexOf("APP_HTML"));
-    expect(start).toBeGreaterThan(-1);
-    const offenders: string[] = [];
-    for (let i = start + 1; i < src.length; i++) {
-      if (src[i] === "\\") { i++; continue; }
-      if (src[i] !== "`") continue;
-      // The first unescaped backtick after the opening one closes the literal.
-      // Everything after it is ordinary code, so we only care that the page
-      // content itself reached the end — if it closed early, the line it
-      // closed on is the offender.
-      const line = src.slice(0, i).split("\n").length;
-      const rest = src.slice(i + 1, i + 80).replace(/\n/g, " ");
-      if (i < src.length - 200) offenders.push(`line ${line}: …${rest}`);
-      break;
+describe("web app · packaged assets", () => {
+  it("assembles the packaged shell, styles and browser bundle", () => {
+    expect(webSource("shell.html")).toContain("%%APP_JS%%");
+    expect(APP_HTML).not.toMatch(/%%(?:APP_JS|APP_CSS|BRAND_SPRITE)%%/);
+    expect(APP_HTML).toContain("</html>");
+    for (const name of ["app.js", "app.css", "shell.html"]) {
+      expect(fs.existsSync(new URL("../dist/web/" + name, import.meta.url))).toBe(true);
     }
-    expect(offenders, "a backtick closed the page literal early").toEqual([]);
   });
 
   /** An icon with no size fills its container (#105). */
@@ -578,8 +562,8 @@ describe("web app · answering an agent in the thread", () => {
    */
   it("sends to the agent that asked, not to whoever the composer aims at", () => {
     expect(APP_HTML).toContain("function answerAgent(");
-    expect(APP_HTML).toContain('var who = card.getAttribute("data-niask") || undefined;');
-    expect(APP_HTML).toContain('var where = card.getAttribute("data-nichat") || chatId;');
+    expect(webSource("project/orchestra.js")).toContain("var who = card.getAttribute(\"data-niask\") || undefined;");
+    expect(webSource("project/orchestra.js")).toContain("var where = card.getAttribute(\"data-nichat\") || view.chatId;");
     expect(APP_HTML).toContain("JSON.stringify({ text: answer, agentId: who, chat: where })");
     // The body reads the card and nothing else — no composer state in it.
     const body = APP_HTML.slice(APP_HTML.indexOf("function answerAgent("));
@@ -604,7 +588,7 @@ describe("web app · answering an agent in the thread", () => {
 
   /** Offered choices become buttons; anything ambiguous falls back to typing. */
   it("turns a plain either/or into buttons and guesses at nothing else", () => {
-    const src = APP_HTML.match(/function questionChoices\(q\)\{[\s\S]*?\n {2}\}/);
+    const src = webSource("transcript.js").match(/function questionChoices\(q\)\{[\s\S]*?\n {2}\}/);
     expect(src, "questionChoices not found").not.toBeNull();
     const choices = new Function(`return ${src![0]}`)() as (q: string) => string[];
 

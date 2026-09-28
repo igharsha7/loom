@@ -3,7 +3,7 @@
  * persistence, and small process/http helpers used by concrete adapters.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import net from "node:net";
 import type {
   Adapter,
@@ -14,18 +14,23 @@ import type {
 } from "../types.js";
 import { writeMemoryFile } from "../core/registry.js";
 
+import { NativeQuiescenceUnknown } from "../core/continuity/contracts.js";
+import { AgentStateStore } from "../core/agent-state.js";
+
 type EventCb = (e: AdapterEvent) => void;
 
 export abstract class AgentBase {
   readonly id: string;
   readonly kind: string;
   protected projectDir: string;
+  protected readonly nativeState: AgentStateStore;
   private listeners = new Set<EventCb>();
 
   constructor(id: string, kind: string, projectDir: string) {
     this.id = id;
     this.kind = kind;
     this.projectDir = projectDir;
+    this.nativeState = new AgentStateStore(projectDir, id);
   }
 
   onEvent(cb: EventCb): () => void {
@@ -62,6 +67,17 @@ export const ADAPTER_CAPABILITIES: AgentCapabilities = {
 export abstract class AdapterBase extends AgentBase implements Adapter {
   readonly capabilities: AgentCapabilities = { ...ADAPTER_CAPABILITIES };
   protected _busy = false;
+  protected continuityTurn: SendInput["continuity"];
+
+  protected beginContinuity(input: SendInput): void {
+    this.continuityTurn = input.continuity ? { ...input.continuity } : undefined;
+  }
+  protected endContinuity(): void { this.continuityTurn = undefined; }
+  protected override emit(event: AdapterEvent): void {
+    const turn = this.continuityTurn;
+    super.emit(turn ? { ...event, payload: { ...event.payload, loomRunId: turn.runId,
+      loomBindingId: turn.bindingId, loomSessionEpoch: turn.sessionEpoch } } : event);
+  }
 
   busy(): boolean {
     return this._busy;
@@ -82,6 +98,86 @@ export abstract class AdapterBase extends AgentBase implements Adapter {
       child.on("close", () => resolve(out.trim()));
       child.on("error", () => resolve(""));
     });
+  }
+}
+
+/** Bound a native JSONL record before readline accumulates an arbitrary tool
+ * output. The guard stores only a byte count, never a second copy of the data. */
+export function guardNativeOutput(child: ChildProcess, fail: (error: Error) => void): void {
+  let bytes = 0, failed = false;
+  const guard = (chunk: Buffer | string) => {
+    if (failed) return;
+    const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    let start = 0;
+    while (start < data.length) {
+      const newline = data.indexOf(10, start), end = newline < 0 ? data.length : newline;
+      bytes += end - start;
+      if (bytes > 32_000_000) {
+        failed = true; fail(new Error("native JSONL record exceeds 32 MB; oversized partial output was not imported")); return;
+      }
+      if (newline < 0) break;
+      bytes = 0; start = newline + 1;
+    }
+  };
+  child.stdout?.prependListener("data", guard);
+  child.once("close", () => child.stdout?.off("data", guard));
+}
+
+/** Starts inherited-child cleanup at parent exit and bounds inherited pipe drain.
+ * The returned close command must settle before emitting terminal native events. */
+export function trackNativeExit(child: ChildProcess, fail: (error: Error) => void): () => Promise<void> {
+  let group: Promise<void> | undefined, deadline: NodeJS.Timeout | undefined;
+  child.once("exit", () => {
+    if (!child.pid) return;
+    group = quiesceProcessGroup(child.pid);
+    void group.catch(() => {});
+    deadline = setTimeout(() => fail(new NativeQuiescenceUnknown("native parent exited but tool streams did not close; inspect descendants")), 6500);
+  });
+  return async () => {
+    clearTimeout(deadline);
+    if (child.pid) await (group ?? quiesceProcessGroup(child.pid));
+  };
+}
+
+/** SIGKILL submission is not proof of quiescence. Wait for process close and
+ * propagate a timeout so a successor cannot acquire the same working tree. */
+export async function interruptProcess(child: ChildProcess, processGroup = false): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    if (processGroup && child.pid) await quiesceProcessGroup(child.pid);
+    return;
+  }
+  await new Promise<void>((resolve, reject) => {
+    let force: NodeJS.Timeout, deadline: NodeJS.Timeout;
+    const cleanup = () => { clearTimeout(force); clearTimeout(deadline); child.off("close", closed); };
+    const closed = () => { cleanup(); if (processGroup && child.pid) void quiesceProcessGroup(child.pid).then(resolve, reject); else resolve(); };
+    child.once("close", closed);
+    const signal = (value: NodeJS.Signals) => { if (processGroup && child.pid) { try { process.kill(-child.pid, value); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; } } else child.kill(value); };
+    force = setTimeout(() => { try { signal("SIGKILL"); } catch (error) { cleanup(); reject(error); } }, 3000);
+    deadline = setTimeout(() => { cleanup(); reject(new NativeQuiescenceUnknown("native process did not close after interruption; quiescence unknown")); }, 6000);
+    try { signal("SIGINT"); } catch (error) { cleanup(); reject(error); }
+  });
+}
+
+/** Native POSIX launches own a process group so inherited tool children cannot
+ * keep editing after their parent reports completion. Escaped/detached children
+ * are outside this guarantee; Windows needs a Job Object before native mode. */
+export async function quiesceProcessGroup(pid: number): Promise<void> {
+  if (process.platform === "win32") throw new NativeQuiescenceUnknown("native process containment is unavailable on Windows");
+  const alive = () => {
+    try { process.kill(-pid, 0); return true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw new NativeQuiescenceUnknown(`cannot inspect native process group ${pid}; quiescence unknown`); }
+  };
+  if (!alive()) return;
+  const signal = (value: NodeJS.Signals) => {
+    try { process.kill(-pid, value); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw new NativeQuiescenceUnknown(`cannot terminate native process group ${pid}; quiescence unknown`); }
+  };
+  signal("SIGINT");
+  const began = Date.now(); let forced = false;
+  while (alive()) {
+    if (Date.now() - began >= 6000) throw new NativeQuiescenceUnknown(`native process group ${pid} did not terminate; inspect descendants before reconciliation`);
+    if (!forced && Date.now() - began >= 3000) { signal("SIGKILL"); forced = true; }
+    await new Promise(resolve => setTimeout(resolve, 25));
   }
 }
 

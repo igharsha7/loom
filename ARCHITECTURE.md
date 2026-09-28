@@ -1,4 +1,75 @@
-# Loom — Architecture & v1 Design
+# Loom — Architecture
+
+## Current implementation (2026-09-28)
+
+Loom remains a TypeScript/Node daemon with CLI, web, desktop-shell and phone
+clients. The Electron redesign is future work. The daemon owns history, context
+assembly and execution coordination. Native harnesses own authentication, tools,
+execution and their private sessions.
+
+**Native continuity is opt-in** (`brain.continuity: true`). Its checked sequential
+Codex/Claude path uses Zod, the existing SQLite database, lexical search and immutable
+local evidence JSON. No embeddings or inference packages are loaded by this mode.
+Unknown CLI versions, OpenCode/bridges, parallel execution and upload protocols are
+explicitly unsupported until their gates pass. Legacy behavior remains available
+when the mode is off. See [native continuity](docs/brain-continuity.md).
+
+```mermaid
+flowchart TD
+  UI[CLI / web / desktop / phone] --> Runtime[ProjectRuntime]
+  Runtime --> Turns[RuntimeTurns: frozen target and queue]
+  Turns --> Brain[ContinuityEngine: protected intent and budgets]
+  Brain --> Store[ContinuityStore on EventLog's SQLite connection]
+  Store --> Evidence[Canonical events, requests and item revisions]
+  Store --> Delivery[Bindings, packets and delivery receipts]
+  Brain --> Files[Immutable local evidence JSON]
+  Turns --> Native[Native Codex / Claude harness]
+  Native --> Ingest[Events correlated by run, binding and epoch]
+  Ingest --> Store
+  Store --> Clients[Persisted history and diagnostics]
+```
+
+| Owner | Responsibility |
+| --- | --- |
+| `core/eventlog.ts`, `core/events/` | Existing synchronous journal; request/original message commit together before publication; explicit backed-up JSONL migration. |
+| `core/continuity/contracts.ts` | Strict bounded versioned Zod wire shapes and inferred types; separate semantic validation. |
+| `core/continuity/store.ts` | Existing database connection, transactions, project fencing, workspace writer leases, item revisions and FTS projections. |
+| `core/continuity/engine.ts` | Exact unprocessed user intent, reviewed checkpoints, scoped evidence, render hashes, frozen workspace/instruction observations and budget checks. |
+| `core/continuity/capabilities.ts` | Bounded binary/version probe, protocol profiles and the 20 s `HarnessMonitor` reachability poll. |
+| `core/continuity/artifacts.ts` | Flush and atomically finalize content-addressed source JSON before packets reference it. |
+| `daemon/runtime/turns.ts` | Captured targets/models, sequential dispatch, queueing, preparation cancellation and cleanup. |
+| `providers/` | t3code's provider core, ported ([the port](docs/proposals/t3code-port.md)): the adapter contract and canonical runtime events, `ProviderService` routing (chat, agent) to warm sessions, the session directory (`.loom/providers/sessions.json`) and idle reaper, ingestion into Loom's log, the approval bridge, and coalesced live deltas. |
+| `providers/codex/` | Codex on the contract: one warm `codex app-server` per chat session (JSON-RPC, own process group); thread start/resume, turns and interrupts on one connection, items and deltas, token usage and context window, compaction, rate limits, approval requests. |
+| `providers/claude/` | Claude Code on the contract: one warm Agent SDK streaming-input query per chat session, pointed at the installed `claude` and spawned in its own process group; session id chosen up front, `setModel` in-session, `canUseTool` approvals, compaction, context window, rate limits. |
+| `providers/agent.ts` | `ProviderAgent`: the runtime's Adapter over a warm session per chat. One `ProviderService` per working directory. Sessions stay warm; a turn settles when the harness reports it done and no command it started is running. Questions, plan mode, compaction. |
+| `daemon/runtime/native-usage.ts` | Latest context-in-use, compaction state and provider usage-limit readings per native agent, for status and the composer meter. |
+| `daemon/runtime/agents.ts` | Instance lifecycle; a failed stop remains a rejected successor barrier. |
+| Native adapters | Explicit scoped session IDs, ordinary turn context, correlated events and POSIX process-group/parent-exit containment and bounded output-drain evidence. |
+| HTTP/UI | Project-authenticated diagnostics, explicit checkpoint review and resumable overflow; delivery follows persistence. |
+
+Bindings are scoped to chat, configured agent instance, workspace and compatibility
+fingerprint, with a native ID and epoch. Switching providers reconstructs context;
+returning resumes the explicit native session when compatible. Protected user intent
+is included again because native retention is unknown. Optional agent observations
+do not become accepted user decisions or verified tests automatically.
+
+Receipts distinguish `prepared`, `submitting`, `accepted`, `failed` and
+`outcome_unknown`, with separate execution outcomes. Durable submission intent precedes
+the native call. Spawn/init alone is not acceptance. Restarted uncertain runs keep
+their writer lease until explicit reconciliation and are never automatically replayed.
+Acceptance does not prove understanding or retention.
+
+The turn-input budget uses a labelled UTF-8 heuristic and includes the current
+request, which is passed once. Native history/tools/output remain outside that estimate.
+Protected overflow saves a reviewable packet and starts no coding turn. Reviewed
+checkpoints retain original evidence in SQLite and immutable local JSON. Helpers
+remain disabled pending isolation/account verification. See [BRAIN-TODO](docs/refactoring/BRAIN-TODO.md)
+and [BRAIN-NOTES](docs/refactoring/BRAIN-NOTES.md) for remaining release gates.
+
+The historical design below explains earlier choices; it is not the capability
+contract for native continuity.
+
+## Historical v1 design
 
 > **The name stuck: Loom.** A loom weaves many threads into one fabric — the agents are
 > threads, shared memory is the weave, the tailnet is a literal mesh. It ships on npm as
@@ -114,8 +185,8 @@ An Adapter MUST implement all of:
 5. `diff()` — current working-tree changes attributable to this agent
 6. `interrupt()` — stop/pause the active agent
 
-v1 Adapters: **OpenCode** (`serve` HTTP + event API), **Claude Code** (headless / SDK,
-streaming JSON, memory files).
+v1 Adapters: **OpenCode** (`serve` HTTP + event API), **Claude Code** (Claude Agent
+SDK over the installed CLI), **Codex** (`codex app-server` JSON-RPC).
 
 ## Bridge contract (read-mostly — for GUI agents)
 
@@ -220,3 +291,6 @@ Switchboard if it stays a router. Loom is the safe, brandable default.
 
 **[shipped]** Loom it is — the shared-context feel won, which is why the tagline settled on
 *the shared-memory layer*. The npm package is `@loompad/cli`; the command stayed `loom`.
+
+Current cleanup and edge-case implementation evidence:
+[BRAIN-AUDIT](docs/refactoring/BRAIN-AUDIT.md).

@@ -13,7 +13,6 @@
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import type { SendInput } from "../types.js";
-import { readProjectState, writeProjectState } from "../core/registry.js";
 import { AdapterBase, agentEnv, cliAvailable, fetchJson, frameBriefing, freePort, waitFor } from "./base.js";
 import { permissionFor } from "../core/permissions.js";
 
@@ -92,13 +91,11 @@ export class OpenCodeAdapter extends AdapterBase {
   }
 
   private get sessionId(): string | undefined {
-    return readProjectState(this.projectDir).agents[this.id]?.sessionId as string | undefined;
+    return this.nativeState.read().sessionId as string | undefined;
   }
 
   private set sessionId(value: string | undefined) {
-    const state = readProjectState(this.projectDir);
-    state.agents[this.id] = { ...state.agents[this.id], sessionId: value };
-    writeProjectState(this.projectDir, state);
+    this.nativeState.patch({ sessionId: value });
   }
 
   async available(): Promise<boolean> {
@@ -108,8 +105,7 @@ export class OpenCodeAdapter extends AdapterBase {
 
   /** Kill a serve child left behind by a previous daemon (verified by cmdline). */
   private async reapOrphanServe(): Promise<void> {
-    const state = readProjectState(this.projectDir);
-    const pid = Number(state.agents[this.id]?.servePid ?? 0);
+    const pid = Number(this.nativeState.read().servePid ?? 0);
     if (!pid) return;
     const cmd = await new Promise<string>((resolve) => {
       execFile("ps", ["-p", String(pid), "-o", "command="], (err, stdout) =>
@@ -124,14 +120,11 @@ export class OpenCodeAdapter extends AdapterBase {
         // already gone
       }
     }
-    delete state.agents[this.id]?.servePid;
-    writeProjectState(this.projectDir, state);
+    if (this.nativeState.read().servePid === pid) this.nativeState.patch({ servePid: undefined });
   }
 
   private recordServePid(pid: number | undefined): void {
-    const state = readProjectState(this.projectDir);
-    state.agents[this.id] = { ...state.agents[this.id], servePid: pid };
-    writeProjectState(this.projectDir, state);
+    this.nativeState.patch({ servePid: pid });
   }
 
   async start(): Promise<void> {
@@ -171,13 +164,11 @@ export class OpenCodeAdapter extends AdapterBase {
   }
 
   private get sessionModel(): string | undefined {
-    return readProjectState(this.projectDir).agents[this.id]?.sessionModel as string | undefined;
+    return this.nativeState.read().sessionModel as string | undefined;
   }
 
   private set sessionModel(value: string | undefined) {
-    const state = readProjectState(this.projectDir);
-    state.agents[this.id] = { ...state.agents[this.id], sessionModel: value };
-    writeProjectState(this.projectDir, state);
+    this.nativeState.patch({ sessionModel: value });
   }
 
   /**

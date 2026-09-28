@@ -28,9 +28,39 @@ Useful development commands:
 
 ```bash
 npm run dev -- status
-npm test -- test/codex.test.ts
+npx vitest run test/codex.test.ts
 npm run test:watch
 ```
+
+The browser sources live in [`src/web/`](src/web/README.md). `npm run build`
+bundles them before compiling the daemon; `npm run build:web` rebuilds only the
+browser. Build before tests that import the served page. `npm test` runs all
+browser DOM suites sequentially after the remaining suites. For daemon
+boundaries, see [HTTP routes](src/daemon/routes/README.md) and
+[runtime modules](src/daemon/runtime/README.md).
+
+Before changing conversation, adapter or Brain ownership, read the
+[boundary notes](docs/refactoring/BOUNDARIES.md). Add lifecycle regressions to
+`test/boundaries.test.ts`; event-store changes must pass the SQLite and JSONL
+cases in `test/eventlog.test.ts`. Keep UI delivery downstream of persistence.
+
+For native Brain continuity, read [the implementation guide](docs/brain-continuity.md)
+and the current map in [ARCHITECTURE.md](ARCHITECTURE.md). Keep Zod shape checks
+separate from source/scope/authority/coverage validation. Never infer acceptance
+from process spawn, release a writer after an unproven stop, or automatically replay
+uncertain action prompts. A CLI version requires a checked protocol fixture before
+it enters `VERIFIED_PROTOCOLS`; ordinary tests must not use authenticated model calls.
+
+Focused checks for this mode:
+
+```sh
+npx vitest run test/continuity.test.ts test/continuity-storage.test.ts
+npm run typecheck
+```
+
+The approved plan, case matrix and remaining release gates live in
+`docs/proposals/brain-continuity-implementation.md`, `docs/refactoring/BRAIN-NOTES.md`
+and `docs/refactoring/BRAIN-TODO.md`. Keep incomplete gates unchecked.
 
 `npm run verify:adapters` drives installed, authenticated agent CLIs against
 real tasks. It may spend provider credits, so run it manually after changing a

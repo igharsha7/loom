@@ -13,61 +13,19 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { ClaudeCodeAdapter } from "../src/adapters/claude-code.js";
-import { CodexAdapter } from "../src/adapters/codex.js";
-import { codexMcpArgs, mcpKey, probeMcpServer, resolveMcpServers, writeMcpSession } from "../src/core/mcp.js";
+import { ClaudeCodeAdapter, CodexAdapter, stopAllProviderSessions } from "../src/providers/agent.js";
+import { mcpKey, probeMcpServer, resolveMcpServers, writeMcpSession } from "../src/core/mcp.js";
 import { ProjectRuntime } from "../src/daemon/runtime.js";
 import type { McpServerConfig, McpTurnConfig } from "../src/types.js";
-import { makeProjectDir, tmpDir, waitUntil } from "./helpers.js";
+import { makeProjectDir, waitUntil } from "./helpers.js";
+import { callsOf, fakeClaude, fakeCodex, rpcOf } from "./native-fakes.js";
 
-/**
- * A stand-in CLI that records its argv, snapshots any --mcp-config file it was
- * handed, and exits cleanly.
- *
- * The snapshot is the point: the config lives for exactly one turn and is
- * deleted afterwards, so the only honest place to read it is from inside the
- * process that was given it — which is also the only place that proves the file
- * was really there when the CLI ran.
- */
-function fakeBin(name: string, stdout: string[] = []): string {
-  const dir = tmpDir(`fake-${name}`);
-  const bin = path.join(dir, name);
-  fs.writeFileSync(
-    bin,
-    `#!/usr/bin/env node
-const fs = require("node:fs");
-const argv = process.argv.slice(2);
-fs.writeFileSync(${JSON.stringify(path.join(dir, "argv.json"))}, JSON.stringify(argv));
-const i = argv.indexOf("--mcp-config");
-if (i >= 0 && argv[i + 1]) fs.copyFileSync(argv[i + 1], ${JSON.stringify(path.join(dir, "mcp-seen.json"))});
-${stdout.map((l) => `console.log(${JSON.stringify(l)});`).join("\n")}
-`,
-    { mode: 0o755 },
-  );
-  return bin;
-}
-
-const argvOf = (bin: string): string[] =>
-  JSON.parse(fs.readFileSync(path.join(path.dirname(bin), "argv.json"), "utf8")) as string[];
-
-/** The MCP document the fake CLI actually received, as it saw it. */
-const mcpSeenBy = (bin: string): { mcpServers: Record<string, unknown> } =>
-  JSON.parse(fs.readFileSync(path.join(path.dirname(bin), "mcp-seen.json"), "utf8")) as {
-    mcpServers: Record<string, unknown>;
-  };
-
-/** The stream-json a fake `claude` needs to print for a turn to complete. */
-const CLAUDE_STREAM = [
-  JSON.stringify({ type: "system", subtype: "init", session_id: "s" }),
-  JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "ok" }] } }),
-  JSON.stringify({ type: "result", total_cost_usd: 0 }),
-];
-/** …and the JSONL a fake `codex` needs. */
-const CODEX_STREAM = [
-  JSON.stringify({ type: "thread.started", thread_id: "t" }),
-  JSON.stringify({ type: "item.completed", item: { id: "i", type: "agent_message", text: "ok" } }),
-  JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } }),
-];
+/** The MCP servers a fake claude was handed (the SDK passes them as `--mcp-config <json>`). */
+const claudeMcpOf = (bin: string): Record<string, unknown> | null => {
+  const argv = callsOf(bin).at(-1)!;
+  const i = argv.indexOf("--mcp-config");
+  return i < 0 ? null : (JSON.parse(argv[i + 1]!) as { mcpServers: Record<string, unknown> }).mcpServers;
+};
 
 const CONFIGURED: McpServerConfig[] = [
   { name: "SigNoz", url: "http://127.0.0.1:8080/mcp", description: "traces" },
@@ -78,6 +36,8 @@ const CONFIGURED: McpServerConfig[] = [
 
 const sessions: Array<{ cleanup: () => void }> = [];
 afterAll(() => sessions.forEach((s) => s.cleanup()));
+// Provider sessions stay warm between turns; end them with the file.
+afterAll(async () => { await stopAllProviderSessions(); });
 
 describe("selecting servers", () => {
   it("takes the ones with somewhere to connect to, and leaves the placeholders out", () => {
@@ -145,60 +105,41 @@ describe("the generated config file", () => {
   });
 });
 
-describe("codex config overrides", () => {
-  it("renders one -c mcp_servers.<key>=<toml> per server", () => {
-    const args = codexMcpArgs(resolveMcpServers(CONFIGURED));
-    expect(args).toEqual([
-      "-c", 'mcp_servers.signoz={url="http://127.0.0.1:8080/mcp"}',
-      "-c", 'mcp_servers.local_files={command="npx",args=["-y","@modelcontextprotocol/server-filesystem","/tmp"]}',
-    ]);
-  });
-
-  it("escapes quotes and backslashes so a URL can't break out of the TOML", () => {
-    const args = codexMcpArgs(resolveMcpServers([{ name: "x", url: 'https://e.example/a"b\\c' }]));
-    expect(args[1]).toBe('mcp_servers.x={url="https://e.example/a\\"b\\\\c"}');
-  });
-});
-
-describe("what the adapters put on the command line", () => {
+describe("what the adapters hand their harness", () => {
   const mcpFor = (mcps: McpServerConfig[]): McpTurnConfig => {
     const session = writeMcpSession(mcps)!;
     sessions.push(session);
     return { configPath: session.configPath, servers: session.servers };
   };
 
-  it("claude-code passes --mcp-config when there are servers", async () => {
-    const bin = fakeBin("claude", CLAUDE_STREAM);
-    const agent = new ClaudeCodeAdapter("claude-code", makeProjectDir({ name: "mcp" }), { bin });
-    const mcp = mcpFor(CONFIGURED);
-    await agent.send({ text: "go", mcp });
-    const argv = argvOf(bin);
-    expect(argv).toContain("--mcp-config");
-    expect(argv[argv.indexOf("--mcp-config") + 1]).toBe(mcp.configPath);
+  it("claude-code passes the servers to the Agent SDK", async () => {
+    const bin = fakeClaude();
+    await new ClaudeCodeAdapter("claude-code", makeProjectDir({ name: "mcp" }), { bin }).send({ text: "go", mcp: mcpFor(CONFIGURED) });
+    expect(claudeMcpOf(bin)).toEqual({
+      signoz: { type: "http", url: "http://127.0.0.1:8080/mcp" },
+      local_files: { type: "stdio", command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"] },
+    });
   });
 
-  it("claude-code passes no MCP flag when the project has none", async () => {
-    const bin = fakeBin("claude", CLAUDE_STREAM);
-    const agent = new ClaudeCodeAdapter("claude-code", makeProjectDir({ name: "mcp" }), { bin });
-    await agent.send({ text: "go" });
-    expect(argvOf(bin)).not.toContain("--mcp-config");
+  it("claude-code passes no MCP config when the project has none", async () => {
+    const bin = fakeClaude();
+    await new ClaudeCodeAdapter("claude-code", makeProjectDir({ name: "mcp" }), { bin }).send({ text: "go" });
+    expect(claudeMcpOf(bin)).toBeNull();
   });
 
-  it("codex passes -c mcp_servers overrides when there are servers", async () => {
-    const bin = fakeBin("codex", CODEX_STREAM);
-    const agent = new CodexAdapter("codex", makeProjectDir({ name: "mcp" }), { bin });
-    await agent.send({ text: "go", mcp: mcpFor(CONFIGURED) });
-    const argv = argvOf(bin);
-    expect(argv).toContain('mcp_servers.signoz={url="http://127.0.0.1:8080/mcp"}');
-    // and the prompt is still the last argument, where codex exec wants it
-    expect(argv[argv.length - 1]).toBe("go");
+  it("codex puts the servers in the thread's config", async () => {
+    const bin = fakeCodex();
+    await new CodexAdapter("codex", makeProjectDir({ name: "mcp" }), { bin }).send({ text: "go", mcp: mcpFor(CONFIGURED) });
+    expect(rpcOf(bin, "thread/start")[0]!.config).toEqual({
+      "mcp_servers.signoz": { url: "http://127.0.0.1:8080/mcp" },
+      "mcp_servers.local_files": { command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"] },
+    });
   });
 
-  it("codex passes no overrides when the project has none", async () => {
-    const bin = fakeBin("codex", CODEX_STREAM);
-    const agent = new CodexAdapter("codex", makeProjectDir({ name: "mcp" }), { bin });
-    await agent.send({ text: "go" });
-    expect(argvOf(bin).some((a) => a.startsWith("mcp_servers."))).toBe(false);
+  it("codex passes no MCP config when the project has none", async () => {
+    const bin = fakeCodex();
+    await new CodexAdapter("codex", makeProjectDir({ name: "mcp" }), { bin }).send({ text: "go" });
+    expect(rpcOf(bin, "thread/start")[0]!.config).toBeUndefined();
   });
 });
 
@@ -209,7 +150,7 @@ describe("through the runtime", () => {
    * fake `claude` standing in for the one that costs money.
    */
   it("hands a configured server to an adapter whose CLI takes one", async () => {
-    const bin = fakeBin("claude", CLAUDE_STREAM);
+    const bin = fakeClaude();
     const dir = makeProjectDir({
       name: "wired",
       agents: [{ id: "cc", kind: "claude-code", role: "builder", options: { bin } }],
@@ -218,13 +159,8 @@ describe("through the runtime", () => {
     const rt = await ProjectRuntime.open({ id: "wired", name: "wired", dir });
     try {
       await rt.sendMessage("go", "cc");
-      await waitUntil(() => fs.existsSync(path.join(path.dirname(bin), "argv.json")));
       await waitUntil(() => rt.log.list({ kinds: ["run_complete"] }).length > 0);
-      expect(argvOf(bin)).toContain("--mcp-config");
-      expect(mcpSeenBy(bin).mcpServers.signoz).toEqual({ type: "http", url: "http://127.0.0.1:8080/mcp" });
-      // The config was a temp file for that turn and nothing else: it's gone.
-      const argv = argvOf(bin);
-      expect(fs.existsSync(argv[argv.indexOf("--mcp-config") + 1]!)).toBe(false);
+      expect(claudeMcpOf(bin)!.signoz).toEqual({ type: "http", url: "http://127.0.0.1:8080/mcp" });
       // …and it's announced in the thread, so "which servers did that turn get"
       // is answerable after the fact rather than a claim on a settings screen.
       const attached = rt.log.list({ kinds: ["status"] }).find((e) => e.payload.state === "mcp_attached");

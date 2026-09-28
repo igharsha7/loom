@@ -26,7 +26,7 @@ import type {
   RouteStepSpec,
   RouterKind,
 } from "../types.js";
-import type { EventLog } from "./eventlog.js";
+import type { EventJournal } from "./eventlog.js";
 import { notify } from "./notify.js";
 import { newId, readProjectState, writeProjectState } from "./registry.js";
 import { llmRouter, rulesRouter, type HopDecision, type RouterContext } from "./router.js";
@@ -63,7 +63,7 @@ export interface RouteHost {
   projectName: string;
   projectDir: string;
   config: ProjectConfig;
-  log: EventLog;
+  log: EventJournal;
   handoff(to: string): Promise<HandoffOutcome>;
   send(text: string, agentId: string): Promise<unknown>;
   interrupt(): Promise<unknown>;

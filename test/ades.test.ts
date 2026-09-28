@@ -11,7 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { ADES, adapterKinds, buildDefaultRoutes, defaultAgentConfigs } from "../src/core/ades.js";
-import { codexBin } from "../src/adapters/codex.js";
+import { codexBin } from "../src/providers/codex/adapter.js";
 import { grokBin } from "../src/adapters/grok.js";
 import { parseGrokJson } from "../src/adapters/grok.js";
 import { createAgent, isWithdrawnKind, knownAgentKinds, tierForKind } from "../src/adapters/index.js";
@@ -252,7 +252,7 @@ describe("tier for kinds the ADES catalog omits", () => {
  */
 describe("ades · finding claude when it isn't on PATH", () => {
   it("looks where the installer actually puts it", async () => {
-    const { claudeBin } = await import("../src/adapters/claude-code.js");
+    const { claudeBin } = await import("../src/providers/claude/adapter.js");
     const fakeHome = tmpDir("home-claude");
     fs.mkdirSync(path.join(fakeHome, ".local", "bin"), { recursive: true });
     const installed = path.join(fakeHome, ".local", "bin", "claude");
@@ -277,7 +277,7 @@ describe("ades · finding claude when it isn't on PATH", () => {
   });
 
   it("honours an explicit bin, and refuses one that isn't there", async () => {
-    const { claudeBin } = await import("../src/adapters/claude-code.js");
+    const { claudeBin } = await import("../src/providers/claude/adapter.js");
     const dir = tmpDir("claude-override");
     const real = path.join(dir, "claude");
     fs.writeFileSync(real, "", { mode: 0o755 });
