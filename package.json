@@ -28,6 +28,7 @@
   "files": [
     "dist",
     "docs/**/*.md",
+    "docs/refactoring/brain-benchmark*.json",
     "CHANGELOG.md",
     "ARCHITECTURE.md",
     "THIRD_PARTY_NOTICES.md"
@@ -72,7 +73,8 @@
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
     "react": "^19.2.7",
-    "ws": "^8.21.1"
+    "ws": "^8.21.1",
+    "zod": "4.6.5"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

@@ -20,7 +20,7 @@ export class RuntimeAgents {
 
   install(agent: AnyAgent, onEvent: (event: AdapterEvent) => void): void {
     if (this.closed) throw new Error("agent runtime is closed");
-    void this.retire(agent.id);
+    void this.retire(agent.id).catch(() => {}); // failure stays on the startup barrier
     const entry: Entry = { agent, off: () => {} };
     this.entries.set(agent.id, entry);
     this.live.set(agent.id, agent);
@@ -58,18 +58,18 @@ export class RuntimeAgents {
       // A pending start must settle before stop, otherwise it can resurrect a
       // child process after shutdown has already returned.
       await entry.starting?.catch(() => {});
-      await Promise.resolve().then(() => entry.agent.stop()).catch(() => {});
+      await entry.agent.stop();
     })();
     this.stopping.set(id, stopped);
     void stopped.then(() => {
       if (this.stopping.get(id) === stopped) this.stopping.delete(id);
-    });
+    }).catch(() => {}); // retain rejected barrier: no successor may start
     return stopped;
   }
 
   async close(): Promise<void> {
     this.closed = true;
-    for (const id of this.entries.keys()) void this.retire(id);
+    for (const id of this.entries.keys()) void this.retire(id).catch(() => {});
     await Promise.all(this.stopping.values());
   }
 }

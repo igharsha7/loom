@@ -120,4 +120,10 @@ The next phase separates event storage, conversation metadata, native adapter
 state/lifecycle, Brain preparation and client delivery. See
 [BOUNDARIES.md](BOUNDARIES.md) for ownership, fixes and remaining Brain work.
 Verification: build/typecheck passed; full test suite passed 1,482 tests with
-17 skipped, including all 125 browser DOM tests. This phase is uncommitted.
+17 skipped, including all 125 browser DOM tests. It is now committed at
+`584a3b6a86bfa9af2a0a8ecbeac57e6aa4578e7a`. Brain continuity implementation remains
+pending review of [the plan](../proposals/brain-continuity-implementation.md).
+
+Brain cleanup and final validation are recorded in [BRAIN-AUDIT](BRAIN-AUDIT.md)
+and [BRAIN-NOTES](BRAIN-NOTES.md). Native execution no longer uses legacy decision
+mining/injection/extraction; supported compatibility workflows remain available.

@@ -34,8 +34,10 @@ import fs from "node:fs";
 import readline from "node:readline";
 import type { AgentCapabilities, SendInput } from "../types.js";
 import { codexMcpArgs } from "../core/mcp.js";
-import { AdapterBase, ADAPTER_CAPABILITIES, agentEnv, cliAvailable, frameBriefing } from "./base.js";
+import { AdapterBase, ADAPTER_CAPABILITIES, agentEnv, interruptProcess, trackNativeExit, guardNativeOutput, cliAvailable, frameBriefing } from "./base.js";
 import { permissionFor } from "../core/permissions.js";
+import { ContextArtifacts } from "../core/continuity/artifacts.js";
+import { NativeDispatchRejected } from "../core/continuity/contracts.js";
 
 interface CodexOptions {
   /** Sandbox policy for model-run commands; default "workspace-write". */
@@ -93,10 +95,12 @@ export class CodexAdapter extends AdapterBase {
 
   /** Codex calls it a thread; loom stores it in the same slot as any session. */
   private get threadId(): string | undefined {
+    if (this.continuityTurn) return this.continuityTurn.nativeSessionId ?? undefined;
     return this.nativeState.read().sessionId as string | undefined;
   }
 
   private set threadId(value: string | undefined) {
+    if (this.continuityTurn) { this.continuityTurn.nativeSessionId = value ?? null; return; }
     this.nativeState.patch({ sessionId: value });
   }
 
@@ -117,72 +121,86 @@ export class CodexAdapter extends AdapterBase {
   async send(input: SendInput): Promise<void> {
     if (this._busy) throw new Error(`codex agent "${this.id}" is busy`);
     const bin = codexBin(this.options.bin);
-    if (!bin) throw new Error("codex CLI not found — install it or open Codex.app once");
+    if (!bin) throw new NativeDispatchRejected("codex CLI not found — install it or open Codex.app once");
     this._busy = true;
+    this.beginContinuity(input);
     const started = Date.now();
-
-    // Codex exec has no --append-system-prompt, so the briefing rides in front
-    // of the text — but framed as an unmissable authoritative block (see
-    // frameBriefing), not a loose preamble the model skims past.
-    const text = input.briefing ? `${frameBriefing(input.briefing)}\n\n${input.text}` : input.text;
-
-    // `codex exec` takes -C (working root) and -s (sandbox); `codex exec resume`
-    // takes NEITHER — a resumed session keeps the original turn's root + sandbox,
-    // and passing them is a hard "unexpected argument" error that fails every
-    // follow-up turn. So only the fresh turn sets them; resume inherits (and the
-    // spawn's cwd is projectDir regardless).
-    //
-    // Permissions (core/permissions.ts): bypass drops the sandbox entirely;
-    // auto/ask pick workspace-write/read-only. A resumed session can't take
-    // -s, but it does take `-c sandbox_mode=…` and the bypass flag, so a mode
-    // changed mid-conversation still applies to the next turn.
-    const mode = permissionFor("codex", this.options as Record<string, unknown>);
-    const sandbox = this.options.sandbox ?? (mode === "ask" ? "read-only" : "workspace-write");
-    const bypass = mode === "bypass" && !this.options.sandbox;
-    const args = this.threadId
-      ? [
-          "exec",
-          "resume",
-          this.threadId,
-          "--json",
-          "--skip-git-repo-check",
-          ...(bypass ? ["--dangerously-bypass-approvals-and-sandbox"] : ["-c", `sandbox_mode="${sandbox}"`]),
-        ]
-      : [
-          "exec",
-          "--json",
-          "--skip-git-repo-check",
-          "-C",
-          this.projectDir,
-          ...(bypass ? ["--dangerously-bypass-approvals-and-sandbox"] : ["-s", sandbox]),
-        ];
-    if (this.options.model) args.push("-m", this.options.model);
-    // The project's MCP servers, for this turn only. Codex has no
-    // `--mcp-config <file>` flag — its servers live in the `mcp_servers` table
-    // of config.toml, and `-c <dotted.path>=<toml>` is its documented
-    // per-invocation override for exactly that, so that's what we use rather
-    // than inventing a flag or writing to the user's config file. See
-    // core/mcp.ts#codexMcpArgs for how it was verified.
-    if (input.mcp?.servers.length) args.push(...codexMcpArgs(input.mcp.servers));
-    if (this.options.extraArgs) args.push(...this.options.extraArgs);
-    args.push(text);
-
+    let launched = false;
     try {
+
+      // Codex exec has no --append-system-prompt, so the briefing rides in front
+      // of the text — but framed as an unmissable authoritative block (see
+      // frameBriefing), not a loose preamble the model skims past.
+      const text = input.continuity
+        ? [input.continuity.context, input.briefing, input.text].filter(Boolean).join("\n\n")
+        : input.briefing ? `${frameBriefing(input.briefing)}\n\n${input.text}` : input.text;
+
+      // `codex exec` takes -C (working root) and -s (sandbox); `codex exec resume`
+      // takes NEITHER — a resumed session keeps the original turn's root + sandbox,
+      // and passing them is a hard "unexpected argument" error that fails every
+      // follow-up turn. So only the fresh turn sets them; resume inherits (and the
+      // spawn's cwd is projectDir regardless).
+      //
+      // Permissions (core/permissions.ts): bypass drops the sandbox entirely;
+      // auto/ask pick workspace-write/read-only. A resumed session can't take
+      // -s, but it does take `-c sandbox_mode=…` and the bypass flag, so a mode
+      // changed mid-conversation still applies to the next turn.
+      const mode = permissionFor("codex", this.options as Record<string, unknown>);
+      const sandbox = this.options.sandbox ?? (mode === "ask" ? "read-only" : "workspace-write");
+      const bypass = mode === "bypass" && !this.options.sandbox;
+      const args = this.threadId
+        ? [
+            "exec",
+            "resume",
+            this.threadId,
+            "--json",
+            "--skip-git-repo-check",
+            ...(bypass ? ["--dangerously-bypass-approvals-and-sandbox"] : ["-c", `sandbox_mode="${sandbox}"`]),
+          ]
+        : [
+            "exec",
+            "--json",
+            "--skip-git-repo-check",
+            "-C",
+            this.projectDir,
+            ...(bypass ? ["--dangerously-bypass-approvals-and-sandbox"] : ["-s", sandbox]),
+          ];
+      if (input.model ?? this.options.model) args.push("-m", (input.model ?? this.options.model)!);
+      // The project's MCP servers, for this turn only. Codex has no
+      // `--mcp-config <file>` flag — its servers live in the `mcp_servers` table
+      // of config.toml, and `-c <dotted.path>=<toml>` is its documented
+      // per-invocation override for exactly that, so that's what we use rather
+      // than inventing a flag or writing to the user's config file. See
+      // core/mcp.ts#codexMcpArgs for how it was verified.
+      if (input.mcp?.servers.length) args.push(...codexMcpArgs(input.mcp.servers));
+      if (this.options.extraArgs) args.push(...this.options.extraArgs);
+      args.push(text);
+
       await new Promise<void>((resolve, reject) => {
         const child = spawn(bin, args, {
           cwd: this.projectDir,
+          detached: Boolean(input.continuity) && process.platform !== "win32",
           // stdin closed: with a pipe open, `codex exec` waits on stdin for
           // additional input and the turn never starts.
           stdio: ["ignore", "pipe", "pipe"],
           env: agentEnv(),
         });
         this.child = child;
+        launched = Boolean(child.pid);
         let lastMessage = "";
         let sawTurn = false;
+        let failedTurn = false;
+        let streamFailure: unknown;
+        const quiesceOnClose = input.continuity ? trackNativeExit(child, error => { streamFailure = error; reject(error); }) : undefined;
         let stderrTail = "";
 
         const rl = readline.createInterface({ input: child.stdout! });
+        if (input.continuity) guardNativeOutput(child, error => {
+          streamFailure = error; rl.close(); child.stdout?.destroy();
+          try { child.kill("SIGKILL"); } catch { /* Busy/lease remains until verified settlement. */ }
+        });
         rl.on("line", (line) => {
+          if (streamFailure) return;
           const trimmed = line.trim();
           if (!trimmed.startsWith("{")) return;
           let evt: Record<string, unknown>;
@@ -191,20 +209,25 @@ export class CodexAdapter extends AdapterBase {
           } catch {
             return;
           }
-          this.handleEvent(evt, (t) => (lastMessage = t));
+          try { this.handleEvent(evt, (t) => (lastMessage = t)); }
+          catch (error) { streamFailure = error; try { child.kill("SIGKILL"); } catch { /* Preserve the foreground barrier. */ } }
           if (evt.type === "turn.completed") sawTurn = true;
+          if (evt.type === "turn.failed" || evt.type === "error") failedTurn = true;
         });
 
         child.stderr!.on("data", (d: Buffer) => {
           stderrTail = (stderrTail + d.toString()).slice(-2000);
         });
 
-        child.on("error", (err) => reject(err));
-        child.on("close", (code, signal) => {
-          this.child = null;
+        child.on("error", (err) => reject(!child.pid ? new NativeDispatchRejected(err.message) : err));
+        child.on("close", async (code, signal) => {
+          try { await quiesceOnClose?.(); }
+          catch (error) { reject(error); return; }
+          if (streamFailure) { reject(streamFailure); return; }
+          if (this.child === child) this.child = null;
           if (signal) {
             this.emit({ kind: "status", payload: { state: "interrupted", signal } });
-            resolve();
+            if (streamFailure) reject(streamFailure); else resolve();
             return;
           }
           if (code !== 0 && !sawTurn) {
@@ -216,6 +239,9 @@ export class CodexAdapter extends AdapterBase {
             reject(new Error(`${message}: ${stderrTail.slice(0, 200)}`));
             return;
           }
+          if (input.continuity && !sawTurn) { reject(new Error("codex closed without turn.completed; native outcome is unknown")); return; }
+          if (streamFailure) { reject(streamFailure); return; }
+          if (input.continuity && (failedTurn || code !== 0)) { reject(new Error("codex reported a failed turn")); return; }
           // Same blocked-on-human heuristic the other adapters use: the turn
           // ended on a question, so the baton is really with you.
           if (/\?\s*$/.test(lastMessage.trim())) {
@@ -236,9 +262,14 @@ export class CodexAdapter extends AdapterBase {
           resolve();
         });
       });
+    } catch (error) {
+      if (input.continuity && !launched && !(error instanceof NativeDispatchRejected))
+        throw new NativeDispatchRejected("native argument/config preparation failed before process launch");
+      throw error;
     } finally {
       this._busy = false;
       this.child = null;
+      this.endContinuity();
     }
   }
 
@@ -255,6 +286,10 @@ export class CodexAdapter extends AdapterBase {
       const id = evt.thread_id as string | undefined;
       if (id) this.threadId = id;
       this.emit({ kind: "status", payload: { state: "turn_started", session: id ?? null } });
+      return;
+    }
+    if (type === "turn.started") {
+      if (this.continuityTurn) this.emit({ kind: "status", payload: { state: "native_turn_accepted" } });
       return;
     }
 
@@ -309,12 +344,18 @@ export class CodexAdapter extends AdapterBase {
       case "command_execution": {
         const command = String(item.command ?? "");
         const exit = item.exit_code;
+        const outputArtifact = this.continuityTurn && typeof item.aggregated_output === "string" && item.aggregated_output.length > 100_000
+          ? new ContextArtifacts(this.projectDir).put(JSON.stringify({ version: 1, output: item.aggregated_output })) : undefined;
         this.emit({
           kind: "tool_call",
           payload: {
             tool: "shell",
             summary: `shell: ${command.replace(/\s+/g, " ").slice(0, 160)}`,
             exitCode: typeof exit === "number" ? exit : null,
+            ...(this.continuityTurn ? { outcome: typeof exit === "number" ? exit === 0 ? "success" : "failure" : "unknown",
+              output: typeof item.aggregated_output === "string" ? item.aggregated_output.slice(0, 100_000) : null,
+              ...(outputArtifact ? { outputArtifact } : {}),
+              outputTruncated: typeof item.aggregated_output === "string" && item.aggregated_output.length > 100_000 } : {}),
           },
         });
         return;
@@ -365,21 +406,10 @@ export class CodexAdapter extends AdapterBase {
 
   async interrupt(): Promise<void> {
     const child = this.child;
-    if (!child) return;
-    child.kill("SIGINT");
-    await new Promise<void>((resolve) => {
-      const t = setTimeout(() => {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          // already gone
-        }
-        resolve();
-      }, 3000);
-      child.on("close", () => {
-        clearTimeout(t);
-        resolve();
-      });
-    });
+    if (!child) {
+      if (this._busy) throw new Error("native turn is still preparing; quiescence is not established");
+      return;
+    }
+    await interruptProcess(child, Boolean(this.continuityTurn));
   }
 }

@@ -44,6 +44,24 @@ Before changing conversation, adapter or Brain ownership, read the
 `test/boundaries.test.ts`; event-store changes must pass the SQLite and JSONL
 cases in `test/eventlog.test.ts`. Keep UI delivery downstream of persistence.
 
+For native Brain continuity, read [the implementation guide](docs/brain-continuity.md)
+and the current map in [ARCHITECTURE.md](ARCHITECTURE.md). Keep Zod shape checks
+separate from source/scope/authority/coverage validation. Never infer acceptance
+from process spawn, release a writer after an unproven stop, or automatically replay
+uncertain action prompts. A CLI version requires a checked protocol fixture before
+it enters `VERIFIED_PROTOCOLS`; ordinary tests must not use authenticated model calls.
+
+Focused checks for this mode:
+
+```sh
+npx vitest run test/continuity.test.ts test/continuity-storage.test.ts
+npm run typecheck
+```
+
+The approved plan, case matrix and remaining release gates live in
+`docs/proposals/brain-continuity-implementation.md`, `docs/refactoring/BRAIN-NOTES.md`
+and `docs/refactoring/BRAIN-TODO.md`. Keep incomplete gates unchecked.
+
 `npm run verify:adapters` drives installed, authenticated agent CLIs against
 real tasks. It may spend provider credits, so run it manually after changing a
 real adapter rather than treating it as a normal test-suite step.

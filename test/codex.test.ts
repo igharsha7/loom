@@ -28,7 +28,7 @@ require("node:fs").writeFileSync(${JSON.stringify(path.join(dir, "argv.json"))},
 ${stderr ? `console.error(${JSON.stringify(stderr)});` : ""}
 setTimeout(() => {
 ${lines.map((l) => `  console.log(${JSON.stringify(l)});`).join("\n")}
-  process.exit(${code});
+  process.exitCode = ${code}; // let stdout drain before exiting (large JSONL fixtures)
 }, ${delayMs});
 `,
     { mode: 0o755 },
@@ -77,6 +77,29 @@ async function run(
 const kinds = (e: AdapterEvent[]): string[] => e.map((x) => x.kind);
 const of = (e: AdapterEvent[], kind: string): Array<Record<string, unknown>> =>
   e.filter((x) => x.kind === kind).map((x) => x.payload);
+
+describe("codex · scoped continuity observations", () => {
+  it("stores complete large tool output as an immutable artifact with an honest preview", async () => {
+    const dir = makeProjectDir(), output = "command output\n".repeat(9000);
+    const bin = fakeCodex([THREAD("scoped"), TURN_STARTED,
+      JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "npm test", aggregated_output: output, exit_code: 1 } }), TURN_DONE]);
+    const agent = new CodexAdapter("codex", dir, { bin }), events: AdapterEvent[] = [];
+    agent.onEvent(e => events.push(e));
+    await agent.send({ text: "test", continuity: { runId: "run", bindingId: "binding", sessionEpoch: 1, nativeSessionId: null, context: "scoped evidence" } });
+    const observation = of(events, "tool_call")[0]!;
+    expect(observation).toMatchObject({ outcome: "failure", exitCode: 1, outputTruncated: true, loomRunId: "run" });
+    const artifact = observation.outputArtifact as { relativePath: string };
+    expect(JSON.parse(fs.readFileSync(path.join(dir, artifact.relativePath), "utf8")).output).toBe(output);
+    expect(argvOf(bin).at(-1)).toBe("scoped evidence\n\ntest");
+  });
+  it("a successful process exit without native completion cannot manufacture run_complete", async () => {
+    const agent = new CodexAdapter("codex", makeProjectDir(), { bin: fakeCodex([THREAD("created")]) }), events: AdapterEvent[] = [];
+    agent.onEvent(e => events.push(e));
+    await expect(agent.send({ text: "work", continuity: { runId: "r", bindingId: "b", sessionEpoch: 1, nativeSessionId: null, context: "context" } })).rejects.toThrow(/outcome is unknown/);
+    expect(events.some(e => e.kind === "run_complete")).toBe(false);
+    expect(agent.busy()).toBe(false);
+  });
+});
 
 describe("codex · a normal turn", () => {
   it("reports the thread, the words, and the tokens", async () => {

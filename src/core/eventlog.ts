@@ -12,6 +12,8 @@ import type { LoomEvent, NewEvent } from "../types.js";
 import type { EventJournal, EventStore, ListOpts } from "./events/contracts.js";
 import { JsonlStore } from "./events/jsonl-store.js";
 import { SqliteStore, type SqliteModule } from "./events/sqlite-store.js";
+import { ContinuityError, type ContinuityRequest } from "./continuity/contracts.js";
+import type { ContinuityStore } from "./continuity/store.js";
 export type { EventReader, EventJournal, EventStore, ListOpts } from "./events/contracts.js";
 
 export class EventLog implements EventJournal {
@@ -41,9 +43,22 @@ export class EventLog implements EventJournal {
       // would silently start an EMPTY jsonl log beside a database full of your
       // history, and write new events there. Losing the thread is worse than
       // failing loudly, so this throws.
-      return new EventLog(new SqliteStore(sqlite, path.join(loomDir, "log.db")));
+      const dbFile = path.join(loomDir, "log.db"), jsonlFile = path.join(loomDir, "log.jsonl");
+      if (!fs.existsSync(dbFile) && fs.existsSync(jsonlFile) && fs.statSync(jsonlFile).size)
+        throw new ContinuityError("unsupported", "legacy JSONL history needs explicit migration: stop the daemon and run loom brain:migrate (LOOM_STORE=jsonl still reads the original)");
+      const store = new SqliteStore(sqlite, dbFile);
+      try { store.verifyJsonl(jsonlFile); } catch (error) { store.close(); throw error; }
+      return new EventLog(store);
     }
     return new EventLog(new JsonlStore(path.join(loomDir, "log.jsonl")));
+  }
+
+  static async migrateJsonl(loomDir: string): Promise<{ imported: number; known: number; backup: string }> {
+    const sqlite = await import("node:sqlite");
+    const file = path.join(loomDir, "log.jsonl");
+    if (!fs.existsSync(file)) throw new ContinuityError("invalid", "no log.jsonl to import");
+    const store = new SqliteStore(sqlite, path.join(loomDir, "log.db"));
+    try { return store.importJsonl(file); } finally { store.close(); }
   }
 
   append(e: NewEvent): LoomEvent {
@@ -68,6 +83,23 @@ export class EventLog implements EventJournal {
   lastId(): number {
     if (this.closed) throw new Error("event log is closed");
     return this.store.lastId();
+  }
+
+  /** Optional SQLite Brain interface; JSONL remains readable without pretending
+   * to support transactional native continuity. */
+  get continuity(): ContinuityStore | null {
+    if (this.closed) throw new Error("event log is closed");
+    return this.store instanceof SqliteStore ? this.store.continuity : null;
+  }
+
+  captureRequest(request: ContinuityRequest): { event: LoomEvent; created: boolean } {
+    const store = this.continuity;
+    if (!store) throw new ContinuityError("unsupported", "native continuity requires SQLite; legacy JSONL is still readable");
+    const result = store.capture(request, () => this.store.append({ ts: Date.now(), kind: "message",
+      chat: request.conversationId, payload: { text: request.text, author: request.source === "user" ? "user" : "loom", requestId: request.id } }));
+    // Capture and its idempotency row commit together before clients see either.
+    if (result.created) this.emitter.emit("event", result.event);
+    return result;
   }
 
   /** Live subscription to appended events; returns unsubscribe. */

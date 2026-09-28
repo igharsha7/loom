@@ -40,3 +40,7 @@ See NOTES.md for verification results and deliberately retained boundaries.
 The next authorized phase is tracked in [BOUNDARIES.md](BOUNDARIES.md): separating
 storage, native adapters, Brain preparation and client delivery before building
 Brain continuity. The completed checklist above describes the earlier extraction.
+
+Brain continuity implementation is tracked separately in [BRAIN-TODO.md](BRAIN-TODO.md),
+with source research and edge-case IDs in [BRAIN-NOTES.md](BRAIN-NOTES.md).
+The plan is awaiting user review; the checklist does not authorize implementation.

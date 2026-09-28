@@ -90,7 +90,9 @@ import { RuntimeAccounting } from './runtime/accounting.js';
 import { RuntimeAgents } from './runtime/agents.js';
 import { RuntimeBriefings } from './runtime/briefings.js';
 import { RuntimeQueue } from './runtime/queue.js';
-import { RuntimeTurns } from './runtime/turns.js';
+import { RuntimeTurns, type TurnOptions, type TurnResult } from './runtime/turns.js';
+import { ContinuityEngine } from "../core/continuity/engine.js";
+import { ContinuityError } from "../core/continuity/contracts.js";
 export { BudgetExceededError, CLOCK_TICK_MS, LOOM_ASK_TIMEOUT_MESSAGE, LOOM_ASK_TIMEOUT_MS, LoomAskTimeoutError, QuarantinedError, type ServerFrame, type TeamBrainHook, activityLine, planModeBriefing, relativeToProject, withLoomAskTimeout } from './runtime-support.js';
 
 export class ProjectRuntime {
@@ -111,9 +113,11 @@ export class ProjectRuntime {
   private installedKinds: string[] = [];
   /** Memory as units — see core/brain.ts. Reads and writes through `log`. */
   readonly brain: Brain;
+  continuity: ContinuityEngine | null = null;
   private readonly agentLifecycle = new RuntimeAgents();
   private get agents(): ReadonlyMap<string, AnyAgent> { return this.agentLifecycle.agents; }
   private configMtime = 0;
+  private journalFailure: Error | null = null;
   /** What you've lined up, run one at a time — see core/prompt-queue.ts. */
   readonly queue: PromptQueue;
   /** This project's dev servers — see core/servers.ts. */
@@ -126,6 +130,7 @@ export class ProjectRuntime {
     this.info = info;
     this.config = config;
     this.log = log;
+    if (config.brain?.continuity === true) this.continuity = new ContinuityEngine(log, info.id);
     this.conversations = new ConversationStore(info.dir);
     const runtime = this;
     this.accounting = new RuntimeAccounting({
@@ -160,6 +165,10 @@ export class ProjectRuntime {
       sendMessage: (...args) => this.sendMessage(...args),
     });
     this.turns = new RuntimeTurns({
+      get continuity() { return runtime.continuity; },
+      kickQueue: () => this.kickQueue(),
+      nativeOptions: (id) => this.policyOptions(this.config.agents.find(a => a.id === id)!),
+      chatExists: (chat) => this.chats().some(c => c.id === chat),
       staleTurnMs: ProjectRuntime.STALE_TURN_MS,
       get closed() { return runtime.closed; },
       agentDir: (...args) => this.agentDir(...args),
@@ -171,7 +180,10 @@ export class ProjectRuntime {
       validHolder: (...args) => this.validHolder(...args),
       defaultAdapterId: (...args) => this.defaultAdapterId(...args),
       agent: (...args) => this.agent(...args),
-      enforceQuarantine: (...args) => this.enforceQuarantine(...args),
+      enforceQuarantine: (...args) => {
+        if (this.journalFailure) throw this.journalFailure;
+        this.enforceQuarantine(...args);
+      },
       enforceBudget: (...args) => this.enforceBudget(...args),
       get teamPolicy() { return runtime.teamPolicy; },
       get baton() { return runtime.baton; },
@@ -182,7 +194,7 @@ export class ProjectRuntime {
       isCurrentAgent: (agent) => !this.closed && this.agents.get(agent.id) === agent,
       dispatchFailed: (agent, chat, error) => {
         if (this.closed || this.agents.get(agent.id) !== agent) return;
-        this.turns.busySince.delete(agent.id);
+        if (!this.continuity || !isAdapter(agent) || !agent.busy()) this.turns.busySince.delete(agent.id);
         const event = this.log.append({ kind: "error", agentId: agent.id, chat,
           payload: { message: error instanceof Error ? error.message : String(error) } });
         this.afterAgentEvent(event);
@@ -199,7 +211,7 @@ export class ProjectRuntime {
 
     this.baton = new BatonManager(info.dir, log);
     this.brain = new Brain(log);
-    void this.briefings.configureSemantic(config.brain?.semantic === true);
+    void this.briefings.configureSemantic(!this.continuity && config.brain?.semantic === true);
 
     // Same path as addAgent: an agent added at runtime must behave exactly like
     // one that was here at open, and two copies of this loop would drift.
@@ -234,6 +246,7 @@ export class ProjectRuntime {
         ),
       installedKinds: () => this.installedKinds,
       makeAgent: (cfg, dir) => {
+        if (this.continuity) throw new ContinuityError("unsupported", "parallel orchestra execution is outside sequential native continuity");
         const agent = createAgent({ ...cfg, options: { ...this.policyOptions(cfg), loomProject: info.id } }, dir);
         if (!isAdapter(agent)) throw new Error(`"${cfg.id}" is a bridge — it cannot run orchestra work`);
         return agent;
@@ -252,6 +265,7 @@ export class ProjectRuntime {
           .filter(Boolean)
           .join("\n\n"),
       gate: (agentId) => {
+        if (this.continuity) throw new ContinuityError("unsupported", "parallel orchestra execution is outside sequential native continuity");
         this.enforceQuarantine(agentId);
         this.enforceBudget(agentId);
       },
@@ -296,7 +310,9 @@ export class ProjectRuntime {
     const config = readProjectConfig(info.dir);
     if (!config) throw new Error(`project at ${info.dir} has no .loom/config.json — run loom init`);
     const log = await EventLog.open(projectLoomDir(info.dir));
-    const rt = new ProjectRuntime(info, config, log);
+    let rt: ProjectRuntime;
+    try { rt = new ProjectRuntime(info, config, log); }
+    catch (error) { log.close(); throw error; }
     rt.configMtime = configMtimeOf(info.dir);
     rt.rehydrateCosts();
     // Pull each connected ADE's native memory into the shared brain on open.
@@ -388,7 +404,7 @@ export class ProjectRuntime {
    * with no restart. Only the known keys are honoured; unknown ones are ignored.
    */
   patchConfig(patch: {
-    brain?: { extractor?: "auto" | "off"; model?: string; semantic?: boolean };
+    brain?: { extractor?: "auto" | "off"; model?: string; semantic?: boolean; continuity?: boolean };
     projection?: { mode?: "template" | "llm"; model?: string; timeoutMs?: number };
     defaultAgent?: string;
     git?: {
@@ -408,60 +424,85 @@ export class ProjectRuntime {
     if (wantsDefault && defaultId && !this.config.agents.some((a) => a.id === defaultId)) {
       throw new Error(`no agent "${defaultId}" in this project`);
     }
-    if (patch.brain) {
-      const b = { ...(this.config.brain ?? {}) };
-      if (patch.brain.extractor === "auto" || patch.brain.extractor === "off") b.extractor = patch.brain.extractor;
-      if (typeof patch.brain.semantic === "boolean") {
-        if (patch.brain.semantic) b.semantic = true;
-        else delete b.semantic;
+    if (patch.git?.delivery !== undefined && !GIT_DELIVERIES.includes(patch.git.delivery as GitDelivery))
+      throw new Error(`git.delivery must be one of ${GIT_DELIVERIES.join(", ")}`);
+    const previousConfig = { ...this.config }, previousContinuity = this.continuity;
+    const changingContinuity = typeof patch.brain?.continuity === "boolean" && patch.brain.continuity !== Boolean(this.config.brain?.continuity);
+    try {
+      if (patch.brain) {
+        if (changingContinuity) {
+          if (this.anyBusy() || this.continuity?.store.activeReceipts().length || this.queue.length)
+            throw new ContinuityError("conflict", "finish or reconcile native turns before changing continuity mode; also clear queued prompts");
+          if (patch.brain.continuity) this.continuity = new ContinuityEngine(this.log, this.info.id);
+          else { this.continuity?.store.releaseOwner(); this.continuity = null; }
+
+        }
+        const b = { ...(this.config.brain ?? {}) };
+        if (typeof patch.brain.continuity === "boolean") b.continuity = patch.brain.continuity;
+        if (patch.brain.extractor === "auto" || patch.brain.extractor === "off") b.extractor = patch.brain.extractor;
+        if (typeof patch.brain.semantic === "boolean") {
+          if (patch.brain.semantic) b.semantic = true;
+          else delete b.semantic;
+        }
+        if (typeof patch.brain.model === "string") b.model = patch.brain.model.trim() || undefined;
+        this.config.brain = b;
+
       }
-      if (typeof patch.brain.model === "string") b.model = patch.brain.model.trim() || undefined;
-      this.config.brain = b;
-      if (typeof patch.brain.semantic === "boolean") void this.briefings.configureSemantic(patch.brain.semantic);
-    }
-    if (patch.projection) {
-      const pr = { ...(this.config.projection ?? {}) };
-      if (patch.projection.mode === "template" || patch.projection.mode === "llm") pr.mode = patch.projection.mode;
-      if (typeof patch.projection.model === "string") pr.model = patch.projection.model.trim() || undefined;
-      this.config.projection = pr;
-    }
-    if (wantsDefault) {
-      // empty clears it; a real value was checked against the roster above
-      if (!defaultId) delete this.config.defaultAgent;
-      else this.config.defaultAgent = defaultId;
-    }
-    if (patch.git) {
-      const g = { ...(this.config.git ?? {}) };
-      for (const k of [
-        "commitPerTurn",
-        "branchPerTask",
-        "worktreePerAgent",
-        "mergeOnHandoff",
-      ] as const) {
-        if (typeof patch.git[k] === "boolean") {
-          if (patch.git[k]) g[k] = true;
-          else delete g[k];
+      if (patch.projection) {
+        const pr = { ...(this.config.projection ?? {}) };
+        if (patch.projection.mode === "template" || patch.projection.mode === "llm") pr.mode = patch.projection.mode;
+        if (typeof patch.projection.model === "string") pr.model = patch.projection.model.trim() || undefined;
+        this.config.projection = pr;
+      }
+      if (wantsDefault) {
+        // empty clears it; a real value was checked against the roster above
+        if (!defaultId) delete this.config.defaultAgent;
+        else this.config.defaultAgent = defaultId;
+      }
+      if (patch.git) {
+        const g = { ...(this.config.git ?? {}) };
+        for (const k of [
+          "commitPerTurn",
+          "branchPerTask",
+          "worktreePerAgent",
+          "mergeOnHandoff",
+        ] as const) {
+          if (typeof patch.git[k] === "boolean") {
+            if (patch.git[k]) g[k] = true;
+            else delete g[k];
+          }
+        }
+        if (patch.git.delivery !== undefined) {
+          if (patch.git.delivery === "none") delete g.delivery;
+          else g.delivery = patch.git.delivery as GitDelivery;
+        }
+        if (Object.keys(g).length) this.config.git = g;
+        else delete this.config.git;
+        // worktreePerAgent takes effect for agents spawned from here on; the
+        // Settings screen says so rather than pretending it's instant.
+      }
+      if (patch.safety) {
+        if (typeof patch.safety.snapshotBeforeRoutes === "boolean") {
+          if (patch.safety.snapshotBeforeRoutes) this.config.safety = { snapshotBeforeRoutes: true };
+          else delete this.config.safety;
         }
       }
-      if (patch.git.delivery !== undefined) {
-        if (!GIT_DELIVERIES.includes(patch.git.delivery as GitDelivery)) {
-          throw new Error(`git.delivery must be one of ${GIT_DELIVERIES.join(", ")}`);
-        }
-        if (patch.git.delivery === "none") delete g.delivery;
-        else g.delivery = patch.git.delivery as GitDelivery;
+      this.saveConfig();
+    } catch (error) {
+      if (this.continuity !== previousContinuity) {
+        this.continuity?.store.releaseOwner();
+        this.continuity = previousContinuity;
+        previousContinuity?.store.claimOwner();
       }
-      if (Object.keys(g).length) this.config.git = g;
-      else delete this.config.git;
-      // worktreePerAgent takes effect for agents spawned from here on; the
-      // Settings screen says so rather than pretending it's instant.
+      for (const key of Object.keys(this.config)) delete (this.config as unknown as Record<string, unknown>)[key];
+      Object.assign(this.config, previousConfig);
+      throw error;
     }
-    if (patch.safety) {
-      if (typeof patch.safety.snapshotBeforeRoutes === "boolean") {
-        if (patch.safety.snapshotBeforeRoutes) this.config.safety = { snapshotBeforeRoutes: true };
-        else delete this.config.safety;
-      }
+    if (changingContinuity) {
+      this.briefings.cancelExtraction(); this.turns.turnText.clear(); this.briefings.pendingBriefings.clear();
     }
-    this.saveConfig();
+    if (changingContinuity || typeof patch.brain?.semantic === "boolean")
+      void this.briefings.configureSemantic(!this.continuity && this.config.brain?.semantic === true);
     return this.config;
   }
 
@@ -473,7 +514,7 @@ export class ProjectRuntime {
    * a blank that hides what's actually running.
    */
   settings(): {
-    brain: { extractor: "auto" | "off"; model: string; semantic: boolean };
+    brain: { extractor: "auto" | "off"; model: string; semantic: boolean; continuity: boolean };
     projection: { mode: "template" | "llm"; model: string };
     defaultAgent: string;
     git: {
@@ -488,6 +529,7 @@ export class ProjectRuntime {
   } {
     return {
       brain: {
+        continuity: Boolean(this.config.brain?.continuity),
         extractor: this.config.brain?.extractor === "off" ? "off" : "auto",
         model: this.config.brain?.model ?? "",
         semantic: Boolean(this.config.brain?.semantic),
@@ -657,17 +699,20 @@ export class ProjectRuntime {
       this.agentDir(cfg.id),
     );
     this.agentLifecycle.install(agent, (e) => {
-      const chat = this.turns.turnChat.get(agent.id);
+      try {
+      const runId = typeof e.payload.loomRunId === "string" ? e.payload.loomRunId : undefined;
+      const liveRun = runId ? this.continuity?.isLiveRun(runId) : true;
+      const chat = (runId ? this.continuity?.eventChat(runId) : undefined) ?? this.turns.turnChat.get(agent.id);
       let payload = e.payload;
       // Enrich the completed turn so its gen_ai span carries system + model +
       // cost (adapters only put tokens on run_complete). The kind is known
       // here; the model prefers what the adapter actually used, else the
       // configured override; the cost is the turn_cost stashed a moment ago.
       const p = e.payload as Record<string, unknown>;
-      if (e.kind === "status" && p.state === "turn_cost") {
+      if (liveRun && e.kind === "status" && p.state === "turn_cost") {
         const usd = Number(p.costUsd ?? 0);
         if (usd > 0) this.turns.pendingCost.set(agent.id, usd);
-      } else if (e.kind === "run_complete") {
+      } else if (liveRun && e.kind === "run_complete") {
         const model =
           (typeof p.model === "string" && p.model) ||
           (typeof cfg.options?.model === "string" ? cfg.options.model : undefined);
@@ -684,14 +729,12 @@ export class ProjectRuntime {
       // exists: the next queued prompt would answer a question you never saw,
       // so the queue waits for you instead. Answering goes out immediately —
       // a paused queue holds what's lined up, not what you type now.
-      if (e.kind === "needs_input") this.holdQueueFor(agent.id);
+      if (liveRun && e.kind === "needs_input") this.holdQueueFor(agent.id);
       // Any terminal event stops the stale-session clock — a turn that ended in
       // an error is over, not hung.
       const turnOver = e.kind === "run_complete" || e.kind === "error" || (e.kind === "status" && p.state === "interrupted");
-      if (turnOver) {
+      if (turnOver && !this.continuity) {
         this.turns.busySince.delete(agent.id);
-        // the next queued prompt may go (a Stop paused the queue first — see interrupt)
-        this.kickQueue();
       }
       const event = this.log.append({
         kind: e.kind,
@@ -699,7 +742,15 @@ export class ProjectRuntime {
         ...(chat ? { chat } : {}),
         payload,
       });
-      this.afterAgentEvent(event);
+      this.continuity?.ingest(event);
+      if (liveRun) this.afterAgentEvent(event);
+      if (turnOver && !this.continuity) this.kickQueue();
+      } catch {
+        // A failed durable ingest is a project fault, not a disposable UI
+        // observer. Stop foreground work and keep its receipt uncertain.
+        this.journalFailure = new ContinuityError("recovery_required", "project journal ingest failed; native execution was interrupted; reopen and reconcile before continuing");
+        if (isAdapter(agent) && agent.busy()) void agent.interrupt().catch(() => {});
+      }
     });
     return agent;
   }
@@ -1123,7 +1174,8 @@ export class ProjectRuntime {
 
   /** Can this agent be handed a different model for one turn? */
   private switchesModelPerTurn(agentId: string): boolean {
-    return this.config.agents.find((a) => a.id === agentId)?.kind === "model";
+    const kind = this.config.agents.find((a) => a.id === agentId)?.kind;
+    return kind === "model" || Boolean(this.continuity && (kind === "codex" || kind === "claude-code"));
   }
 
   /** Bind (or unbind) who answers in a thread. */
@@ -1210,7 +1262,12 @@ export class ProjectRuntime {
 
   renameChat(id: string, title: string): ChatInfo | null { return this.conversations.renameChat(id, title); }
 
-  deleteChat(id: string): boolean { return this.conversations.deleteChat(id); }
+  deleteChat(id: string): boolean {
+    if (this.continuity && ([...this.turns.busySince.keys()].some(agent => this.turns.turnChat.get(agent) === id) ||
+      this.queue.snapshot().items.some(item => item.chat === id)))
+      throw new ContinuityError("conflict", "finish or remove queued/native turns before deleting their chat");
+    return this.conversations.deleteChat(id);
+  }
 
   // -------------------------------------------------------------------------
   // Board tasks — the cards you write yourself
@@ -1408,7 +1465,7 @@ export class ProjectRuntime {
   anyBusy(): boolean {
     // A live orchestra run counts: reloading the project would close it, and
     // closing aborts the run — a config edit must not kill a fleet mid-flight.
-    if (this.orchestra.active() || this.turns.busySince.size > 0) return true;
+    if (this.orchestra.active() || this.routes.isActive() || this.turns.busySince.size > 0) return true;
     return [...this.agents.values()].some((a) => isAdapter(a) && a.busy());
   }
 
@@ -1422,7 +1479,6 @@ export class ProjectRuntime {
     this.agent(agentId); // preserve the public unknown-agent error
     return this.agentLifecycle.start(agentId);
   }
-  private async checkpointBefore(agentId: string, prompt: string): Promise<void> { return this.turns.checkpointBefore(agentId, prompt); }
 
   checkpoints(): Promise<checkpoints.Checkpoint[]> { return this.turns.checkpoints(); }
 
@@ -1434,7 +1490,9 @@ export class ProjectRuntime {
 
   private async commitTurn(agentId: string, files: string[]): Promise<void> { return this.turns.commitTurn(agentId, files); }
 
-  private extractMemory(agentId: string, files: string[]): void { return this.briefings.extractMemory(agentId, files); }
+  private extractMemory(agentId: string, files: string[]): void {
+    if (!this.continuity) this.briefings.extractMemory(agentId, files);
+  }
 
   workingTree(): Promise<WorkingTree> {
     return workingTree(this.info.dir);
@@ -1458,11 +1516,11 @@ export class ProjectRuntime {
     // read the turn before this one.
     if (event.kind === "run_complete" && event.agentId) {
       this.captureTurnDiff(event.agentId);
-      void this.captureAgentDecisions(event.agentId).catch(() => { });
+      if (!this.continuity) void this.captureAgentDecisions(event.agentId).catch(() => { });
     }
     this.routes.handleAgentEvent(event);
     // Accumulate the turn's prose so decisions can be mined when it completes.
-    if (event.kind === "message" && event.agentId && !event.payload.reasoning) {
+    if (!this.continuity && event.kind === "message" && event.agentId && !event.payload.reasoning) {
       const prev = this.turns.turnText.get(event.agentId) ?? "";
       this.turns.turnText.set(event.agentId, `${prev}\n${String(event.payload.text ?? "")}`.slice(-8000));
     }
@@ -1477,7 +1535,7 @@ export class ProjectRuntime {
         body: `${event.agentId} finished its turn`,
       });
     } else if (event.kind === "message") {
-      if (event.agentId) this.captureDecisions(event);
+      if (event.agentId && !this.continuity) this.captureDecisions(event);
       if (!this.routes.isActive()) {
         // A route drives its own handoffs — suggestions would be noise.
         const suggestion = suggestHandoff(event, this.config, this.baton.holder());
@@ -1710,15 +1768,31 @@ export class ProjectRuntime {
   }
   onQueueChange(cb: (q: QueueState) => void): () => void { return this.queueCoordinator.onQueueChange(cb); }
 
-  enqueue(input: QueueInput): QueueItem { return this.queueCoordinator.enqueue(input); }
+  enqueue(input: QueueInput): QueueItem {
+    if (this.continuity) {
+      this.queue.assertCanAdd(input);
+      if (!this.chats().some(c => c.id === (input.chat ?? MAIN_CHAT)))
+        throw new ContinuityError("invalid", "conversation is missing or deleted");
+      const bound = this.chatBinding(input.chat);
+      if (input.target?.kind === "orchestra") throw new ContinuityError("unsupported", "parallel orchestra is outside sequential native continuity");
+      const target = input.target?.kind === "agent" ? input.target.agentId : bound.agentId ?? this.validHolder() ?? this.defaultAdapterId();
+      const cfg = this.config.agents.find(a => a.id === target);
+      if (!cfg || !["codex", "claude-code"].includes(cfg.kind)) throw new ContinuityError("unsupported", "queued native continuity needs a supported harness");
+      const captured = this.continuity.capture({ id: newId(16), text: input.text, conversationId: input.chat ?? MAIN_CHAT,
+        agentInstanceId: target, source: input.source ?? "user", model: bound.agentId === target ? bound.model ?? null : null,
+        plan: Boolean(input.plan), targetAddedTokens: 6000 });
+      input = { ...input, target: { kind: "agent", agentId: target }, continuity: { requestId: captured.request.id, model: captured.request.model } };
+    }
+    return this.queueCoordinator.enqueue(input);
+  }
 
-  editQueued(itemId: string, patch: { text?: string; target?: QueueTarget; plan?: boolean }): QueueItem { return this.queueCoordinator.editQueued(itemId, patch); }
-
-  private mustTakeTurns(agentId: string): void { return this.queueCoordinator.mustTakeTurns(agentId); }
+  editQueued(itemId: string, patch: { text?: string; target?: QueueTarget; plan?: boolean; when?: QueueCondition | null }): QueueItem {
+    if (this.continuity && (patch.text !== undefined || patch.target !== undefined || patch.plan !== undefined))
+      throw new ContinuityError("unsupported", "native queued request revisions require durable supersession; remove the unsent entry and submit a new request instead");
+    return this.queueCoordinator.editQueued(itemId, patch);
+  }
 
   queueBlocker(item: QueueItem): string | null { return this.queueCoordinator.queueBlocker(item); }
-
-  private conditionUnmet(when: QueueCondition): string | null { return this.queueCoordinator.conditionUnmet(when); }
 
   private watchClockConditions(q: QueueState): void { return this.queueCoordinator.watchClockConditions(q); }
 
@@ -1730,13 +1804,12 @@ export class ProjectRuntime {
 
   async drainPromptQueue(): Promise<void> { return this.queueCoordinator.drainPromptQueue(); }
 
-  private async dispatchQueued(item: QueueItem): Promise<void> { return this.queueCoordinator.dispatchQueued(item); }
 
   async sendMessage(
     text: string,
     agentId?: string,
-    opts: { source?: "user" | "route"; chat?: string; plan?: boolean; fromQueue?: boolean } = {},
-  ): Promise<{ agentId: string; queued?: number; queueId?: string }> { return this.turns.sendMessage(text, agentId, opts); }
+    opts: TurnOptions = {},
+  ): Promise<TurnResult> { return this.turns.sendMessage(text, agentId, opts); }
 
   // -------------------------------------------------------------------------
   // Named routes
@@ -1932,6 +2005,7 @@ export class ProjectRuntime {
     parentAgentId: string,
     opts: { agentId: string; task: string; chat?: string },
   ): Promise<{ id: string; agentId: string }> {
+    if (this.continuity) throw new ContinuityError("unsupported", "parallel subagents are outside sequential native continuity; finish this turn or use legacy mode");
     const task = opts.task?.trim();
     if (!task) throw new Error("a subtask needs a task");
     // A child's briefing is deliberately narrow; a 100KB "task" is the parent
@@ -2057,6 +2131,8 @@ export class ProjectRuntime {
     to: string,
     opts: { source?: "user" | "route" } = {},
   ): Promise<{ from: string | null; merge?: MergeOutcome }> {
+    if (this.continuity?.store.activeReceipts().some(r => r.execution === "unknown"))
+      throw new ContinuityError("recovery_required", "reconcile uncertain native writers before handoff or merge");
     const target = this.agent(to);
     if (!isAdapter(target)) {
       throw new Error(`cannot hand the baton to "${to}" — bridges are read-only by design`);
@@ -2077,6 +2153,8 @@ export class ProjectRuntime {
     if (holder && holder !== to) {
       const current = this.agent(holder);
       if (isAdapter(current)) {
+        if (this.continuity && this.turns.busySince.has(holder) && !current.busy())
+          throw new ContinuityError("conflict", "outgoing turn is still preparing or finalizing; wait or stop before interrupt-switching");
         if (current.busy()) await current.interrupt();
         const diff = await current.diff().catch(() => "");
         if (diff) handoffMeta = { ...handoffMeta, dirty: true, diff: diff.slice(0, 2000) };
@@ -2092,6 +2170,14 @@ export class ProjectRuntime {
       return agent && !isAdapter(agent) && id !== to;
     });
     const mergeNote = merge ? describeMerge(merge, holder ?? "the previous agent", to) : "";
+    if (this.continuity) {
+      // New context is assembled from the selected chat at dispatch, never
+      // from global history or private bridge memory on a picker click.
+      this.briefings.pendingBriefings.delete(to);
+      const { from } = this.baton.handoff(to, { ...handoffMeta, projected: false, continuity: 1 });
+      await this.ensureStarted(to);
+      return { from, ...(merge ? { merge } : {}) };
+    }
     const prepared = await this.briefings.prepareHandoff(to, holder, mergeNote, bridgeIds);
     if (this.closed || this.agents.get(to) !== target) throw new Error("handoff target is no longer active");
     await target.injectMemory(prepared.memory);
@@ -2160,6 +2246,7 @@ export class ProjectRuntime {
     router?: RouterKind;
     maxHops?: number;
   }): Promise<RouteState> {
+    if (this.continuity) throw new ContinuityError("unsupported", "autonomous route continuity is not verified; select a native agent directly");
     this.snapshotBeforeRoute();
     if (typeof opts.spec === "string" && opts.spec.trim() === "auto") {
       return this.routes.startDynamic(opts.task, {
@@ -2249,7 +2336,7 @@ export class ProjectRuntime {
           role: cfg.role,
           tier: live.capabilities.tier,
           available: await live.available().catch(() => false),
-          busy: isAdapter(live) ? live.busy() : false,
+          busy: isAdapter(live) ? live.busy() || Boolean(this.continuity && this.turns.busySince.has(cfg.id)) : false,
           holdsBaton: holder === cfg.id,
           model,
           permissions: permissionFor(cfg.kind, cfg.options),
@@ -2270,6 +2357,7 @@ export class ProjectRuntime {
       id: this.info.id,
       name: this.info.name,
       dir: this.info.dir,
+      ...(this.continuity ? { continuity: true } : {}),
       holder,
       agents,
       lastEvent,

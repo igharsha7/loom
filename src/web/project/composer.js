@@ -7,6 +7,7 @@ import { openMenu } from '../menus.js';
 import { toast } from '../notifications.js';
 import { KMOD,PERM_MODES,PERM_NAMES,PERM_SHORT,loadPermProfiles,permOf,permProfile,permSplit } from '../permissions.js';
 import { state } from '../state.js';
+import { showContinuityOverflow } from './continuity.js';
 import { openTaskModal } from '../tasks.js';
 import { setTView,tview } from '../transcript.js';
 
@@ -15,6 +16,7 @@ import { setTView,tview } from '../transcript.js';
  * Creating this module only binds functions; startup and cleanup belong to project.js.
  */
 export function createComposer(view) {
+    var pendingSubmission;
 
 
     function send(){
@@ -92,15 +94,27 @@ export function createComposer(view) {
       }
 
       var chain = Promise.resolve();
-      if (!state.auto && state.selected && state.selected !== p.holder) {
+      if (!p.continuity && !state.auto && state.selected && state.selected !== p.holder) {
         chain = api("/api/projects/" + view.pid + "/handoff", { method: "POST", body: JSON.stringify({ to: state.selected }) });
       }
       chain.then(function(){
         // into the chat you're looking at — the agent's reply comes back here
-        return api("/api/projects/" + view.pid + "/messages", { method: "POST",
-          body: JSON.stringify({ text: full, agentId: (state.auto ? undefined : state.selected) || undefined, chat: view.chatId, plan: plan || undefined }) });
-      }).then(view.refresh).catch(function(err){ toast(err.message); });
+        var body = { text: full, agentId: (state.auto ? undefined : state.selected) || undefined, chat: view.chatId, plan: plan || undefined };
+        if(p.continuity) {
+          var key = JSON.stringify(body);
+          if(!pendingSubmission || pendingSubmission.key !== key) pendingSubmission = { key: key, id: crypto.randomUUID() };
+          body.requestId = pendingSubmission.id;
+        }
+        return api("/api/projects/" + view.pid + "/messages", { method: "POST", body: JSON.stringify(body) });
+      }).then(function(result){
+        pendingSubmission = null;
+        view.refresh();
+        if (result && result.continuityStatus === "overflow") showContinuityOverflow(view, result);
+        else if (result && result.continuityStatus === "outcome_unknown") toast("Native delivery outcome is uncertain. Review Brain continuity diagnostics before retrying.");
+      }).catch(function(err){ toast(err.message); if(p.continuity && !box.value) { box.value = full; autosizeBox(); } });
     }
+
+
 
 
     // ---- composer plumbing -------------------------------------------------

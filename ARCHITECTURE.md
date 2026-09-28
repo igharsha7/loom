@@ -1,4 +1,70 @@
-# Loom — Architecture & v1 Design
+# Loom — Architecture
+
+## Current implementation (2026-09-28)
+
+Loom remains a TypeScript/Node daemon with CLI, web, desktop-shell and phone
+clients. The Electron redesign is future work. The daemon owns history, context
+assembly and execution coordination. Native harnesses own authentication, tools,
+execution and their private sessions.
+
+**Native continuity is opt-in** (`brain.continuity: true`). Its checked sequential
+Codex/Claude path uses Zod, the existing SQLite database, lexical search and immutable
+local evidence JSON. No embeddings or inference packages are loaded by this mode.
+Unknown CLI versions, OpenCode/bridges, parallel execution and upload protocols are
+explicitly unsupported until their gates pass. Legacy behavior remains available
+when the mode is off. See [native continuity](docs/brain-continuity.md).
+
+```mermaid
+flowchart TD
+  UI[CLI / web / desktop / phone] --> Runtime[ProjectRuntime]
+  Runtime --> Turns[RuntimeTurns: frozen target and queue]
+  Turns --> Brain[ContinuityEngine: protected intent and budgets]
+  Brain --> Store[ContinuityStore on EventLog's SQLite connection]
+  Store --> Evidence[Canonical events, requests and item revisions]
+  Store --> Delivery[Bindings, packets and delivery receipts]
+  Brain --> Files[Immutable local evidence JSON]
+  Turns --> Native[Native Codex / Claude harness]
+  Native --> Ingest[Events correlated by run, binding and epoch]
+  Ingest --> Store
+  Store --> Clients[Persisted history and diagnostics]
+```
+
+| Owner | Responsibility |
+| --- | --- |
+| `core/eventlog.ts`, `core/events/` | Existing synchronous journal; request/original message commit together before publication; explicit backed-up JSONL migration. |
+| `core/continuity/contracts.ts` | Strict bounded versioned Zod wire shapes and inferred types; separate semantic validation. |
+| `core/continuity/store.ts` | Existing database connection, transactions, project fencing, workspace writer leases, item revisions and FTS projections. |
+| `core/continuity/engine.ts` | Exact unprocessed user intent, reviewed checkpoints, scoped evidence, render hashes, frozen workspace/instruction observations and budget checks. |
+| `core/continuity/capabilities.ts` | Bounded binary/version probe and conservative fixture-backed protocol profiles. |
+| `core/continuity/artifacts.ts` | Flush and atomically finalize content-addressed source JSON before packets reference it. |
+| `daemon/runtime/turns.ts` | Captured targets/models, sequential dispatch, queueing, preparation cancellation and cleanup. |
+| `daemon/runtime/agents.ts` | Instance lifecycle; a failed stop remains a rejected successor barrier. |
+| Native adapters | Explicit scoped session IDs, ordinary turn context, correlated events and POSIX process-group/parent-exit containment and bounded output-drain evidence. |
+| HTTP/UI | Project-authenticated diagnostics, explicit checkpoint review and resumable overflow; delivery follows persistence. |
+
+Bindings are scoped to chat, configured agent instance, workspace and compatibility
+fingerprint, with a native ID and epoch. Switching providers reconstructs context;
+returning resumes the explicit native session when compatible. Protected user intent
+is included again because native retention is unknown. Optional agent observations
+do not become accepted user decisions or verified tests automatically.
+
+Receipts distinguish `prepared`, `submitting`, `accepted`, `failed` and
+`outcome_unknown`, with separate execution outcomes. Durable submission intent precedes
+the native call. Spawn/init alone is not acceptance. Restarted uncertain runs keep
+their writer lease until explicit reconciliation and are never automatically replayed.
+Acceptance does not prove understanding or retention.
+
+The turn-input budget uses a labelled UTF-8 heuristic and includes the current
+request, which is passed once. Native history/tools/output remain outside that estimate.
+Protected overflow saves a reviewable packet and starts no coding turn. Reviewed
+checkpoints retain original evidence in SQLite and immutable local JSON. Helpers
+remain disabled pending isolation/account verification. See [BRAIN-TODO](docs/refactoring/BRAIN-TODO.md)
+and [BRAIN-NOTES](docs/refactoring/BRAIN-NOTES.md) for remaining release gates.
+
+The historical design below explains earlier choices; it is not the capability
+contract for native continuity.
+
+## Historical v1 design
 
 > **The name stuck: Loom.** A loom weaves many threads into one fabric — the agents are
 > threads, shared memory is the weave, the tailnet is a literal mesh. It ships on npm as
@@ -220,3 +286,6 @@ Switchboard if it stays a router. Loom is the safe, brandable default.
 
 **[shipped]** Loom it is — the shared-context feel won, which is why the tagline settled on
 *the shared-memory layer*. The npm package is `@loompad/cli`; the command stayed `loom`.
+
+Current cleanup and edge-case implementation evidence:
+[BRAIN-AUDIT](docs/refactoring/BRAIN-AUDIT.md).

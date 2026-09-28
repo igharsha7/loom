@@ -1,5 +1,15 @@
 # Brain-ready module boundaries
 
+## Native continuity implementation
+
+The prerequisite refactor below is complete. The opt-in native path now lives in
+`src/core/continuity/` and is integrated through RuntimeTurns. See
+[current architecture](../../ARCHITECTURE.md), [native continuity](../brain-continuity.md)
+and [remaining gates](BRAIN-TODO.md). SQLite mutations stay on EventLog's existing
+connection. Packet assembly and dispatch do not create another database writer;
+client diagnostics remain downstream of persistence. Legacy behavior is available
+when continuity is disabled.
+
 ## Objective
 
 Prepare Loom for the Brain continuity rewrite without changing its framework,
@@ -104,4 +114,7 @@ work is the sequential Brain continuity flow described in the proposal.
 - No Electron migration, UI batching/virtualization change, model download,
   benchmark, paid agent verification, or removal of existing integrations.
 - The T3 Code checkout is unchanged. No source was copied from it.
-- No commit or push in this phase unless requested separately.
+- The boundary work is now committed at
+  `584a3b6a86bfa9af2a0a8ecbeac57e6aa4578e7a`. The next Brain plan is in
+  [brain-continuity-implementation.md](../proposals/brain-continuity-implementation.md);
+  implementation awaits user review. Planning work does not publish changes.

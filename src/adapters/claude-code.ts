@@ -15,10 +15,11 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import readline from "node:readline";
 import type { AgentCapabilities, SendInput } from "../types.js";
-import { AdapterBase, ADAPTER_CAPABILITIES, agentEnv, cliAvailable } from "./base.js";
+import { AdapterBase, ADAPTER_CAPABILITIES, agentEnv, interruptProcess, trackNativeExit, guardNativeOutput, cliAvailable } from "./base.js";
 import { writeApprovalMcpConfig } from "../core/approvals.js";
 import { permissionFor } from "../core/permissions.js";
 import fs from "node:fs";
+import { NativeDispatchRejected } from "../core/continuity/contracts.js";
 
 interface ClaudeOptions {
   /** claude permission mode for baton turns; default "acceptEdits". */
@@ -85,10 +86,12 @@ export class ClaudeCodeAdapter extends AdapterBase {
   }
 
   private get sessionId(): string | undefined {
+    if (this.continuityTurn) return this.continuityTurn.nativeSessionId ?? undefined;
     return this.nativeState.read().sessionId as string | undefined;
   }
 
   private set sessionId(value: string | undefined) {
+    if (this.continuityTurn) { this.continuityTurn.nativeSessionId = value ?? null; return; }
     this.nativeState.patch({ sessionId: value });
   }
 
@@ -111,57 +114,69 @@ export class ClaudeCodeAdapter extends AdapterBase {
   async send(input: SendInput): Promise<void> {
     if (this._busy) throw new Error(`claude-code agent "${this.id}" is busy`);
     this._busy = true;
+    this.beginContinuity(input);
     const started = Date.now();
-
-    // Permissions: an explicit legacy permissionMode wins; otherwise the
-    // Loom mode (bypass/auto/ask) maps to Claude's own — see core/permissions.
-    // "ask" routes every prompt to Loom's approval tool, so it needs a daemon
-    // to ask; without one it degrades to plan (read-only), never to "allow".
-    const mode = permissionFor("claude-code", this.options as Record<string, unknown>);
     let approvalConfig: string | null = null;
-    if (mode === "ask" && !this.options.permissionMode) {
-      approvalConfig = writeApprovalMcpConfig({
-        project: String((this.options as Record<string, unknown>).loomProject ?? ""),
-        agent: this.id,
-      });
-    }
-    const claudeMode =
-      this.options.permissionMode ??
-      (mode === "bypass" ? "bypassPermissions" : mode === "ask" ? (approvalConfig ? "manual" : "plan") : "acceptEdits");
-    const args = [
-      "-p",
-      input.text,
-      "--output-format",
-      "stream-json",
-      "--verbose",
-      "--permission-mode",
-      claudeMode,
-    ];
-    if (approvalConfig) args.push("--permission-prompt-tool", "mcp__loom__approve", "--mcp-config", approvalConfig);
-    if (this.sessionId) args.push("--resume", this.sessionId);
-    if (input.briefing) args.push("--append-system-prompt", input.briefing);
-    // The project's MCP servers, for this turn only. The flag is passed ONLY
-    // when the runtime actually produced servers — an empty config file is not
-    // the same as no config file, and handing one over would be a claim that
-    // this project has MCP configured when it hasn't.
-    if (input.mcp?.servers.length) args.push("--mcp-config", input.mcp.configPath);
-    if (this.options.model) args.push("--model", this.options.model);
-    if (this.options.extraArgs) args.push(...this.options.extraArgs);
-
+    let launched = false;
     try {
+
+      // Permissions: an explicit legacy permissionMode wins; otherwise the
+      // Loom mode (bypass/auto/ask) maps to Claude's own — see core/permissions.
+      // "ask" routes every prompt to Loom's approval tool, so it needs a daemon
+      // to ask; without one it degrades to plan (read-only), never to "allow".
+      const mode = permissionFor("claude-code", this.options as Record<string, unknown>);
+      if (mode === "ask" && !this.options.permissionMode) {
+        approvalConfig = writeApprovalMcpConfig({
+          project: String((this.options as Record<string, unknown>).loomProject ?? ""),
+          agent: this.id,
+        });
+      }
+      const claudeMode =
+        this.options.permissionMode ??
+        (mode === "bypass" ? "bypassPermissions" : mode === "ask" ? (approvalConfig ? "manual" : "plan") : "acceptEdits");
+      const args = [
+        "-p",
+        input.continuity ? [input.continuity.context, input.briefing, input.text].filter(Boolean).join("\n\n") : input.text,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--permission-mode",
+        claudeMode,
+      ];
+      if (approvalConfig) args.push("--permission-prompt-tool", "mcp__loom__approve", "--mcp-config", approvalConfig);
+      if (this.sessionId) args.push("--resume", this.sessionId);
+      if (input.briefing && !input.continuity) args.push("--append-system-prompt", input.briefing);
+      // The project's MCP servers, for this turn only. The flag is passed ONLY
+      // when the runtime actually produced servers — an empty config file is not
+      // the same as no config file, and handing one over would be a claim that
+      // this project has MCP configured when it hasn't.
+      if (input.mcp?.servers.length) args.push("--mcp-config", input.mcp.configPath);
+      if (input.model ?? this.options.model) args.push("--model", (input.model ?? this.options.model)!);
+      if (this.options.extraArgs) args.push(...this.options.extraArgs);
+
       await new Promise<void>((resolve, reject) => {
         const child = spawn(this.bin, args, {
           cwd: this.projectDir,
+          detached: Boolean(input.continuity) && process.platform !== "win32",
           stdio: ["ignore", "pipe", "pipe"],
           env: agentEnv(),
         });
         this.child = child;
+        launched = Boolean(child.pid);
         let lastAssistantText = "";
         let sawResult = false;
+        let failedTurn = false;
+        let streamFailure: unknown;
+        const quiesceOnClose = input.continuity ? trackNativeExit(child, error => { streamFailure = error; reject(error); }) : undefined;
         let stderrTail = "";
 
         const rl = readline.createInterface({ input: child.stdout! });
+        if (input.continuity) guardNativeOutput(child, error => {
+          streamFailure = error; rl.close(); child.stdout?.destroy();
+          try { child.kill("SIGKILL"); } catch { /* Busy/lease remains until verified settlement. */ }
+        });
         rl.on("line", (line) => {
+          if (streamFailure) return;
           const trimmed = line.trim();
           if (!trimmed.startsWith("{")) return;
           let evt: Record<string, unknown>;
@@ -170,20 +185,25 @@ export class ClaudeCodeAdapter extends AdapterBase {
           } catch {
             return;
           }
-          this.handleStreamEvent(evt, (t) => (lastAssistantText = t));
+          try { this.handleStreamEvent(evt, (t) => (lastAssistantText = t)); }
+          catch (error) { streamFailure = error; try { child.kill("SIGKILL"); } catch { /* Preserve the foreground barrier. */ } }
           if (evt.type === "result") sawResult = true;
+          if (evt.type === "result" && evt.is_error === true) failedTurn = true;
         });
 
         child.stderr!.on("data", (d: Buffer) => {
           stderrTail = (stderrTail + d.toString()).slice(-2000);
         });
 
-        child.on("error", (err) => reject(err));
-        child.on("close", (code, signal) => {
-          this.child = null;
+        child.on("error", (err) => reject(!child.pid ? new NativeDispatchRejected(err.message) : err));
+        child.on("close", async (code, signal) => {
+          try { await quiesceOnClose?.(); }
+          catch (error) { reject(error); return; }
+          if (streamFailure) { reject(streamFailure); return; }
+          if (this.child === child) this.child = null;
           if (signal) {
             this.emit({ kind: "status", payload: { state: "interrupted", signal } });
-            resolve();
+            if (streamFailure) reject(streamFailure); else resolve();
             return;
           }
           if (code !== 0 && !sawResult) {
@@ -194,6 +214,9 @@ export class ClaudeCodeAdapter extends AdapterBase {
             reject(new Error(`${this.bin} exited ${code}: ${stderrTail.slice(0, 200)}`));
             return;
           }
+          if (input.continuity && !sawResult) { reject(new Error("claude closed without a result; native outcome is unknown")); return; }
+          if (streamFailure) { reject(streamFailure); return; }
+          if (input.continuity && (failedTurn || code !== 0)) { reject(new Error("claude reported a failed turn")); return; }
           // Blocked-on-human heuristic: the turn ended on a question.
           if (/\?\s*$/.test(lastAssistantText.trim())) {
             this.emit({
@@ -216,9 +239,14 @@ export class ClaudeCodeAdapter extends AdapterBase {
           resolve();
         });
       });
+    } catch (error) {
+      if (input.continuity && !launched && !(error instanceof NativeDispatchRejected))
+        throw new NativeDispatchRejected("native argument/config preparation failed before process launch");
+      throw error;
     } finally {
       this._busy = false;
       this.child = null;
+      this.endContinuity();
       if (approvalConfig) fs.rmSync(approvalConfig, { force: true });
     }
   }
@@ -251,7 +279,8 @@ export class ClaudeCodeAdapter extends AdapterBase {
           const input = (block.input ?? {}) as Record<string, unknown>;
           this.emit({
             kind: "tool_call",
-            payload: { tool: name, summary: summarizeToolInput(name, input) },
+            payload: { tool: name, summary: summarizeToolInput(name, input),
+              ...(this.continuityTurn ? { outcome: "pending" } : {}) },
           });
           const path = input.file_path ?? input.notebook_path;
           if (["Edit", "Write", "NotebookEdit", "MultiEdit"].includes(name) && path) {
@@ -285,22 +314,11 @@ export class ClaudeCodeAdapter extends AdapterBase {
 
   async interrupt(): Promise<void> {
     const child = this.child;
-    if (!child) return;
-    child.kill("SIGINT");
-    await new Promise<void>((resolve) => {
-      const t = setTimeout(() => {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          // already gone
-        }
-        resolve();
-      }, 3000);
-      child.on("close", () => {
-        clearTimeout(t);
-        resolve();
-      });
-    });
+    if (!child) {
+      if (this._busy) throw new Error("native turn is still preparing; quiescence is not established");
+      return;
+    }
+    await interruptProcess(child, Boolean(this.continuityTurn));
   }
 }
 

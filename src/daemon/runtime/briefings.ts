@@ -51,9 +51,12 @@ export class RuntimeBriefings {
    */
   private semantic: Pick<SemanticIndex, "start" | "sync" | "query" | "byId"> | null = null;
   private readonly lifetime = new AbortController();
+  private extractionScope = new AbortController();
+  cancelExtraction(): void { this.extractionScope.abort(); this.extractionScope = new AbortController(); }
   private semanticGeneration = 0;
 
   close(): void {
+    this.extractionScope.abort();
     this.lifetime.abort();
     this.semanticGeneration++;
     this.semantic = null;
@@ -288,7 +291,7 @@ export class RuntimeBriefings {
    * Off entirely when config says so; a no-op when Claude isn't available.
    */
   extractMemory(agentId: string, files: string[]): void {
-    if (this.lifetime.signal.aborted || this.host.config.brain?.extractor === "off") return;
+    if (this.lifetime.signal.aborted || this.host.config.brain?.continuity || this.host.config.brain?.extractor === "off") return;
     const chat = this.host.turnChat.get(agentId) ?? MAIN_CHAT;
     const turn = this.gatherTurnText(chat);
     if (turn.length < 40) return; // nothing substantial to learn from
@@ -297,7 +300,7 @@ export class RuntimeBriefings {
     const recent = this.host.log.list({ limit: 80 }).filter((e) => (e.chat ?? MAIN_CHAT) === chat);
     void extractFromTurn(this.host.brain, turn, {
       engine,
-      signal: this.lifetime.signal,
+      signal: this.extractionScope.signal,
       agentId,
       chat,
       ...(files.length ? { files } : {}),

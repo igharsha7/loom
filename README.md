@@ -259,6 +259,20 @@ Three moves the fleet learned for when one turn isn't the right shape:
   `loom reap <agentId>` interrupts, stops, respawns from config, and releases
   the baton if the corpse held it.
 
+## Native context continuity (opt-in)
+
+The new deterministic Brain path supports sequential switching between checked
+Codex/Claude CLI profiles with scoped native sessions, protected user context,
+SQLite search, source-backed checkpoints and delivery diagnostics. It requires no
+embedding model or inference package. Enable **Native context continuity** in
+Settings → Preferences; the legacy workflow remains the default.
+
+Unknown CLI versions, OpenCode/bridges, attachments and parallel execution are
+gated in this mode. Overflow saves a reviewable request instead of silently dropping
+user intent. See [native continuity](docs/brain-continuity.md),
+[current architecture](ARCHITECTURE.md) and
+[remaining verification gates](docs/refactoring/BRAIN-TODO.md).
+
 ## Several sessions, one brain
 
 `loom agents:add claude-code` a second time doesn't error — it adds

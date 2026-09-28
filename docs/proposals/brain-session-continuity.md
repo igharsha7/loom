@@ -1,7 +1,19 @@
 # Brain rewrite: one conversation across multiple native harnesses
 
-Status: revised proposal; runtime implementation has not started.
-Updated: 2026-09-27. Branch: `dev/Harsha`.
+Status: design reference; Brain continuity implementation has not started.
+Updated: 2026-09-28. Branch: `dev/Harsha`.
+
+For the next approved scope, use the
+[implementation plan](brain-continuity-implementation.md),
+[research/edge-case notes](../refactoring/BRAIN-NOTES.md), and
+[implementation TODO](../refactoring/BRAIN-TODO.md). The implementation plan takes
+precedence over earlier optional model/parallel research below. User review is
+pending; current work changes documentation only.
+
+Default for the first milestone: **no embedding model, no vector store and no
+local inference download**. Zod contracts, structured user/discussion state,
+SQLite FTS/entity search and source-backed context packets come first. Cheap
+harness helpers are optional after deterministic continuity passes.
 
 ## 1. Product contract and limits
 
@@ -311,7 +323,7 @@ contracts. Avoid introducing a second authoritative event store.
 | Instructions, task state, memories, summaries | SQLite tables referencing source events | Provenance, revisions, scope and atomic updates |
 | Native session bindings and handoff delivery state | SQLite tables | Survive crashes, retries and app restarts |
 | Searchable chunks | SQLite tables + FTS5 index | Exact strings and lexical retrieval without a model |
-| Embeddings | SQLite BLOBs with model/version metadata | Rebuildable index; no JSON vector-file rewrite on each update |
+| Embeddings (future option, outside first milestone) | SQLite BLOBs with model/version metadata | Rebuildable index if a later evaluation justifies it |
 | Large tool output, diffs, images and attachments | Content-addressed files under `.loom/artifacts/` | Keep oversized binary/text payloads out of hot database rows |
 | Export/import and diagnostics | Versioned JSONL + artifact manifest | Portable and inspectable, not a live mirror that can diverge |
 | Optional handoff Markdown | Derived export | Compatibility with harness file reads; not the source of truth |
@@ -365,7 +377,12 @@ Default retention preserves captured history. User deletion/retention must also
 invalidate summaries and remove derived indexes; artifact GC follows references.
 Capture normal harness output, not credentials or provider-internal state.
 
-## 8. Models and helper policy and recommendation
+## 8. Historical model research and optional helper policy
+
+The candidates below are retained as earlier research, **not scheduled work or
+required downloads**. The lightweight first milestone excludes embeddings and
+local summarizers. FTS/entity search and structured state provide the initial
+retrieval flow; optional harness helpers provide the first generative extension.
 
 Research checked 2026-09-27 against publisher model cards. No model was downloaded
 or benchmarked on this machine. Recommendations are candidates for evaluation,
@@ -380,13 +397,11 @@ Embedding models retrieve text; a separate generative model can summarize it.
 | [all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) | 384-dimensional short-text embeddings; default truncation above 256 word pieces | Low-resource baseline; current repository already integrates a quantized conversion optionally |
 | [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) | Generative model with documented non-thinking mode | Optional local structured-summary candidate; test a pinned 4-bit conversion, bounded input batches and source validation |
 
-Updated recommendation after user input: **FTS5/exact retrieval always available;
-use a low-cost harness model for optional summaries and thread/session metadata;
-keep local embeddings and local summarization as independent options.** Benchmark
-Qwen3 Embedding 0.6B against EmbeddingGemma and MiniLM before selecting a local
-embedding download. Qwen3-4B is an offline summary candidate, not a required
-installation. Switching works with deterministic/extractive context if every
-helper is unavailable.
+Current recommendation after the lightweight requirement: **no local model in
+the first milestone**. Use FTS5/exact retrieval, preserve protected user intent
+outside ranking, and optionally use a low-cost harness model for source-backed
+summaries and thread/session metadata. Local embedding/summarization benchmarks
+require separate future scope and evidence that retrieval quality needs them.
 
 Qwen3-4B is substantially heavier than an embedding encoder. Four billion
 weights at four bits is approximately 2 GB of weights alone by arithmetic;
@@ -506,31 +521,18 @@ assignment appears inconsistent with offline=true.
 
 ## 10. Implementation order and TODO
 
-Only this proposal is complete. The runtime rewrite remains unimplemented.
+The prerequisite module refactor is complete and committed. Brain continuity
+itself remains unimplemented. Use the reviewed scope and phase gates in
+[the implementation plan](brain-continuity-implementation.md); maintain progress
+in [BRAIN-TODO.md](../refactoring/BRAIN-TODO.md), not duplicate checklists here.
 
-- [ ] Phase 0 — Capability fixtures: supported model changes, resume, input
-  injection, usage, interruption/quiescence, native compaction visibility,
-  tool lifecycle, session expiration and read/search access for each harness.
-- [ ] Phase 1 — Extend durable storage and build the exact conversation capture,
-  user-intent and topic/task state pipeline. Preserve undecided discussions and
-  small preferences. Add source-disposition and correction/supersession tests.
-- [ ] Phase 2 — Sequential same-chat switching: Claude -> Codex -> OpenCode ->
-  Claude. Exact replay when small; initial deterministic compaction, protected
-  state, scoped lexical retrieval and durable delta delivery when large.
-  Validate interruption, rapid switches, queued steering and restart recovery.
-- [ ] Phase 3 — Low-cost harness summaries and thread/session metadata. Isolated
-  helper sessions, source validation, usage caps, deduplication and fallback.
-  Evaluate against exact replay and deterministic checkpoints before defaulting on.
-- [ ] Phase 4 — Optional local embedding benchmark and implementation; optional
-  local summaries for offline/privacy preferences. Version indexes and model recipes.
-- [ ] Phase 5 — Explicit parallel compare/review mode on fixed snapshots. Add
-  parallel coding/worktree integration only as a separate, tested capability.
-- [ ] Phase 6 — Migrate team/bridge consumers, remove superseded context code,
-  document limits and run packaging/cross-platform/long-conversation tests.
+Order: P0 contracts/capabilities; P1 evidence/storage; P2 deterministic sequential
+continuity; P3 long-chat fidelity/performance; P4 optional harness helpers;
+P5 integration and removal of superseded context paths. No local model or
+parallel coding feature is required by this sequence.
 
-Do not delay proving sequential continuity until every optional model or parallel
-feature is implemented. Do not claim seamless long-chat support before user-intent
-coverage, compaction and overflow handling exist.
+Do not claim seamless long-chat support before user-intent coverage, compaction,
+resumable overflow and unknown-delivery recovery are verified.
 
 ## 11. Acceptance criteria
 

@@ -18,6 +18,7 @@ import type {
 } from "../../types.js";
 import { isAdapter } from "../../types.js";
 import { CLOCK_TICK_MS, questionHold } from '../runtime-support.js';
+import type { TurnOptions, TurnResult } from "./turns.js";
 
 /** Dependencies owned by the project coordinator, read live for each operation. */
 export interface RuntimeQueueHost {
@@ -32,7 +33,7 @@ export interface RuntimeQueueHost {
   appendIfOpen: (event: Parameters<EventJournal["append"]>[0]) => void;
   startRoute: (opts: { task: string; spec?: string | RouteStepSpec[]; router?: RouterKind; maxHops?: number; }) => Promise<RouteState>;
   handoff: (to: string, opts?: { source?: "user" | "route"; }) => Promise<{ from: string | null; merge?: MergeOutcome; }>;
-  sendMessage: (text: string, agentId?: string, opts?: { source?: "user" | "route"; chat?: string; plan?: boolean; fromQueue?: boolean; }) => Promise<{ agentId: string; queued?: number; queueId?: string; }>;
+  sendMessage: (text: string, agentId?: string, opts?: TurnOptions) => Promise<TurnResult>;
 }
 
 /** Owns queue state for exactly one open project. */
@@ -65,7 +66,7 @@ export class RuntimeQueue {
 
   /** Change a waiting prompt. A target this project can't run is refused now,
    * not when the queue reaches it and has to stop. */
-  editQueued(itemId: string, patch: { text?: string; target?: QueueTarget; plan?: boolean }): QueueItem {
+  editQueued(itemId: string, patch: { text?: string; target?: QueueTarget; plan?: boolean; when?: QueueCondition | null }): QueueItem {
     if (patch.target?.kind === "agent") this.mustTakeTurns(patch.target.agentId);
     const item = this.host.queue.edit(itemId, patch);
     this.kickQueue();
@@ -82,6 +83,7 @@ export class RuntimeQueue {
   /** Why the head can't go yet, or null when it can. */
   queueBlocker(item: QueueItem): string | null {
     // A condition comes first: a prompt held for 3am isn't waiting on an agent.
+    if (this.host.config.brain?.continuity && this.host.busySince.size) return "waiting for the foreground native turn";
     const held = item.when ? this.conditionUnmet(item.when) : null;
     if (held) return held;
     const route = this.host.routeState();
@@ -235,6 +237,9 @@ export class RuntimeQueue {
     const to = t.kind === "agent" ? t.agentId : undefined;
     const holder = this.host.validHolder();
     if (to && holder && holder !== to) await this.host.handoff(to, { source: item.source });
-    await this.host.sendMessage(item.text, to, { source: item.source, chat: item.chat, fromQueue: true, ...(item.plan ? { plan: true } : {}) });
+    await this.host.sendMessage(item.text, to, { source: item.source, chat: item.chat, fromQueue: true,
+      requestId: item.continuity?.requestId ?? (item.editedAt ? `queue:${item.id}:edit:${item.editedAt}` : `queue:${item.id}`),
+      ...(item.continuity ? { capturedModel: item.continuity.model } : {}),
+      ...(item.plan ? { plan: true } : {}) });
   }
 }

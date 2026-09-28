@@ -183,7 +183,7 @@ import { applyTheme,themeNow } from './theme.js';
     // ---- Preferences: theme, and per-project brain/handoff knobs -------------
     function patchCfg(body, okMsg){
       sapi("/api/projects/" + pid + "/config", { method: "PATCH", body: JSON.stringify(body) })
-        .then(function(){ if (okMsg) toast(okMsg); })
+        .then(function(){ if (okMsg) toast(okMsg); if(body.brain && typeof body.brain.continuity === "boolean") renderPrefs(); })
         .catch(function(e){ toast(e.message); renderPrefs(); });
     }
     function renderPrefs(){
@@ -205,16 +205,21 @@ import { applyTheme,themeNow } from './theme.js';
       sapi("/api/projects/" + pid + "/config").then(function(cfg){
         var pname = state.project && state.project.name ? state.project.name : "this project";
         var hh = '<div class="sgrouph">Brain \u00b7 ' + esc(pname) + "</div>";
-        hh += '<div class="prow"><div class="pl"><div class="pt">Memory extractor</div>' +
-          '<div class="pd">After each turn a small Claude reads what changed and files what\u2019s worth keeping. Off means the brain holds only what you write by hand.</div></div>' +
-          '<div class="pc">' + seg("extractor", [{ v: "auto", l: "Auto" }, { v: "off", l: "Off" }], cfg.brain.extractor) + "</div></div>";
-        hh += '<div class="prow"><div class="pl"><div class="pt">Semantic retrieval</div>' +
-          '<div class="pd">Finds memories that mean the same thing in different words — “how does login work” reaching a note about JWKS. Needs a local model runtime Loom doesn’t ship: <code>npm i -g @huggingface/transformers</code> (~470MB once), then a 23MB model downloads on first use. Without it, retrieval is the three lexical channels it has always been.</div></div>' +
-          '<div class="pc">' + seg("semantic", [{ v: "on", l: "On" }, { v: "off", l: "Off" }], cfg.brain.semantic ? "on" : "off") + "</div></div>";
-        hh += '<div class="sgrouph">Handoffs</div>';
-        hh += '<div class="prow"><div class="pl"><div class="pt">Brief style</div>' +
-          '<div class="pd">How the baton note is written when one agent hands to the next. Template is instant and free; LLM distills it with a small Claude.</div></div>' +
-          '<div class="pc">' + seg("projection", [{ v: "template", l: "Template" }, { v: "llm", l: "LLM" }], cfg.projection.mode) + "</div></div>";
+        hh += '<div class="prow"><div class="pl"><div class="pt">Native context continuity</div>' +
+          '<div class="pd">Sequential Codex and Claude switching with per-chat sessions, protected user context and delivery diagnostics. Uses SQLite search; helpers and local inference are disabled. OpenCode and parallel execution are not supported in this mode.</div></div>' +
+          '<div class="pc">' + seg("continuity", [{ v: "on", l: "On" }, { v: "off", l: "Off" }], cfg.brain.continuity ? "on" : "off") + "</div></div>";
+        if (!cfg.brain.continuity) {
+          hh += '<div class="prow"><div class="pl"><div class="pt">Memory extractor</div>' +
+            '<div class="pd">After each turn a small Claude reads what changed and files what\u2019s worth keeping. Off means the brain holds only what you write by hand.</div></div>' +
+            '<div class="pc">' + seg("extractor", [{ v: "auto", l: "Auto" }, { v: "off", l: "Off" }], cfg.brain.extractor) + "</div></div>";
+          hh += '<div class="prow"><div class="pl"><div class="pt">Semantic retrieval</div>' +
+            '<div class="pd">Finds memories that mean the same thing in different words — “how does login work” reaching a note about JWKS. Needs a local model runtime Loom doesn’t ship: <code>npm i -g @huggingface/transformers</code> (~470MB once), then a 23MB model downloads on first use. Without it, retrieval is the three lexical channels it has always been.</div></div>' +
+            '<div class="pc">' + seg("semantic", [{ v: "on", l: "On" }, { v: "off", l: "Off" }], cfg.brain.semantic ? "on" : "off") + "</div></div>";
+          hh += '<div class="sgrouph">Handoffs</div>';
+          hh += '<div class="prow"><div class="pl"><div class="pt">Brief style</div>' +
+            '<div class="pd">How the baton note is written when one agent hands to the next. Template is instant and free; LLM distills it with a small Claude.</div></div>' +
+            '<div class="pc">' + seg("projection", [{ v: "template", l: "Template" }, { v: "llm", l: "LLM" }], cfg.projection.mode) + "</div></div>";
+        }
         var agents = cfg.agents || [];
         hh += '<div class="prow"><div class="pl"><div class="pt">Default agent</div>' +
           '<div class="pd">Who receives a message when nobody holds the baton.</div></div>' +
@@ -222,6 +227,7 @@ import { applyTheme,themeNow } from './theme.js';
           agents.map(function(a){ return '<option value="' + esc(a.id) + '"' + (a.id === cfg.defaultAgent ? " selected" : "") + ">" + esc(a.id) + "</option>"; }).join("") +
           "</select></div></div>";
         pp.innerHTML = hh;
+        bindSeg("continuity", function(v){ patchCfg({ brain: { continuity: v === "on" } }, "Native continuity " + v); });
         bindSeg("extractor", function(v){ patchCfg({ brain: { extractor: v } }, v === "off" ? "Extractor off" : "Extractor on"); });
         bindSeg("semantic", function(v){
           patchCfg({ brain: { semantic: v === "on" } },

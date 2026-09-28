@@ -5,6 +5,7 @@ import { ICONS,LOADER } from '../icons.js';
 import { toast } from '../notifications.js';
 import { openSettingsModal } from '../settings.js';
 import { teamShareHtml,wireTeamShare } from '../team.js';
+import { showContinuityOverflow } from './continuity.js';
 
 /** brain behavior for one mounted project.
  * view contains live accessors to the owning project view's state and callbacks.
@@ -22,12 +23,14 @@ export function createBrain(view) {
       Promise.all([
         api("/api/projects/" + view.pid + "/brain?limit=200"),
         api("/api/projects/" + view.pid + "/memory").catch(function(){ return { memory: {} }; }),
+        api("/api/projects/" + view.pid + "/brain/continuity").catch(function(){ return { enabled: false }; }),
       ]).then(function(r){
         el = document.getElementById("pane-brain"); if (!el || view.brainView !== "mine") return;
         var memories = (r[0] && r[0].memories) || [];
         var stats = (r[0] && r[0].stats) || { total: 0, byKind: {} };
         var m = (r[1] && r[1].memory) || {};
         var sources = m.sources || [];
+        var continuity = r[2] || {};
 
         // Filter chips — All, then each kind that has memories, with its count.
         var chips = '<button class="bkind' + (view.brainKind === "" ? " on" : "") + '" data-kind="">All <span class="kn">' + (stats.total || 0) + "</span></button>";
@@ -37,6 +40,7 @@ export function createBrain(view) {
           chips += '<button class="bkind bk-' + k + (view.brainKind === k ? " on" : "") + '" data-kind="' + k + '">' + k + ' <span class="kn">' + n + "</span></button>";
         });
         var head = '<div class="bhead">' + brainSwitchHtml() + '<div class="bkinds">' + chips + "</div></div>";
+        if (continuity.enabled) head += '<div class="bsec">Native continuity <button class="lnk" id="continuity-inspect">Inspect packets and delivery</button></div><div class="bsec">Legacy memories below are retained for compatibility and are not injected by native continuity.</div>';
 
         // The memory list — the learned units. This is what phase 2 fills.
         var shown = view.brainKind ? memories.filter(function(x){ return x.kind === view.brainKind; }) : memories;
@@ -44,7 +48,7 @@ export function createBrain(view) {
         if (!shown.length) {
           list = '<div class="bempty">' + (memories.length
             ? "No " + esc(view.brainKind) + " memories yet."
-            : "Nothing learned yet. As agents finish turns, Loom reads each one and records what's worth keeping — constraints, decisions, and the failures worth not repeating. Add a decision below to seed it, or let an agent take a turn.") + "</div>";
+            : continuity.enabled ? "Your original user messages are protected automatically. Review packets and source-backed checkpoints through native continuity diagnostics." : "Nothing learned yet. As agents finish turns, Loom reads each one and records what's worth keeping — constraints, decisions, and the failures worth not repeating. Add a decision below to seed it, or let an agent take a turn.") + "</div>";
         } else {
           list = '<div class="bmems">' + shown.map(function(x){
             var ents = (x.entities || []).slice(0, 6).map(function(e){ return '<span class="bent">' + esc(e) + "</span>"; }).join("");
@@ -84,6 +88,33 @@ export function createBrain(view) {
 
         el.innerHTML = '<div class="pane-inner brain">' + head + seed + '<div id="bconflicts"></div>' + list + src + "</div>";
         wireBrainSwitch(el);
+        var inspect = el.querySelector("#continuity-inspect");
+        if(inspect) inspect.onclick = function(){
+          var scrim = document.createElement("div"); scrim.className = "scrim";
+          scrim.innerHTML = '<div class="modal"><div class="modalhead">Continuity delivery<button class="iconbtn" data-close aria-label="close">' + ICONS.x + '</button></div><div class="modalbody"><p>Acceptance records native protocol evidence. Retention and understanding remain unknown. Showing the latest 100 attempts.</p><div data-attempts></div></div></div>';
+          function close(){ scrim.remove(); document.removeEventListener("keydown", key); }
+          function key(e){ if(e.key === "Escape") close(); }
+          document.addEventListener("keydown", key); scrim.querySelector("[data-close]").onclick = close;
+          scrim.addEventListener("click", function(e){ if(e.target === scrim) close(); });
+          (continuity.receipts || []).slice().reverse().forEach(function(entry){
+            var details = document.createElement("details"), title = document.createElement("summary"), pre = document.createElement("pre");
+            title.textContent = entry.packet.conversationId + " — " + entry.receipt.status + " / " + entry.receipt.execution + " — ~" + entry.packet.budget.estimatedAddedTokens + " added tokens";
+            pre.textContent = JSON.stringify(entry, null, 2); pre.style.cssText = "max-height:280px;overflow:auto;white-space:pre-wrap";
+            details.addEventListener("toggle", function(){
+              if(!details.open || details.dataset.loaded) return; details.dataset.loaded = "1";
+              api("/api/projects/" + view.pid + "/brain/continuity/packets/" + encodeURIComponent(entry.packet.id)).then(function(full){
+                pre.textContent = JSON.stringify({ receipt: entry.receipt, packet: full.packet, rendered: full.rendered }, null, 2);
+              }).catch(function(e){ pre.textContent = e.message; delete details.dataset.loaded; });
+            });
+            details.append(title, pre);
+            if(entry.receipt.status === "prepared") {
+              var resume = document.createElement("button"); resume.className = "btn"; resume.textContent = "Review and resume saved request";
+              resume.onclick = function(){ close(); showContinuityOverflow(view, { requestId: entry.receipt.requestId }); }; details.appendChild(resume);
+            }
+            scrim.querySelector("[data-attempts]").appendChild(details);
+          });
+          document.body.appendChild(scrim);
+        };
 
         // Contradictions, above the units: two memories that likely disagree
         // are worth more attention than either alone. Quiet when clean.

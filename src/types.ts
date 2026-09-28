@@ -194,6 +194,9 @@ export interface ProjectionConfig {
 
 /** The brain's phase-2 extractor — learning from each turn. See core/brain-extract.ts. */
 export interface BrainConfig {
+  /** Opt into versioned native continuity (SQLite, Codex/Claude only).
+   * Legacy memory/extraction remains available when false. */
+  continuity?: boolean;
   /**
    * Who reads finished turns for memory:
    *   "auto" (default) — a small Claude, when the CLI is available; a no-op when not.
@@ -397,6 +400,10 @@ export interface ProjectInfo {
 
 export interface SendInput {
   text: string;
+  /** App-owned conversation binding; native IDs never cross chat/workspace scopes.
+   * Context is injected into the ordinary input on every invocation. */
+  continuity?: { runId: string; bindingId: string; sessionEpoch: number;
+    nativeSessionId: string | null; context: string };
   /** One-shot handoff briefing injected alongside this turn. */
   briefing?: string;
   /**
@@ -514,6 +521,7 @@ export interface AgentStatus {
 }
 
 export interface ProjectStatus {
+  continuity?: boolean;
   id: string;
   name: string;
   dir: string;
