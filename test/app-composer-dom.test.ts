@@ -504,10 +504,12 @@ describe("web app · permissions", () => {
   it("shows the chosen agent's mode as a chip, and changes it from the dropdown", async () => {
     // A mode change is refused mid-turn (it rebuilds the agent), and an earlier
     // test's turn can still be finishing on a slow runner: start from idle.
-    await waitUntil(
-      async () => !(await rest<{ project: { agents: Array<{ busy?: boolean }> } }>("GET", "")).project.agents.some((a) => a.busy),
-      { timeoutMs: 30_000 },
-    );
+    // "busy" here is the fleet's: it counts a turn from the moment it's sent,
+    // which is what the refusal checks (the status payload waits for the CLI).
+    type Activity = { projects: Array<{ id: string; agents: Array<{ id: string; busy: boolean; since: number | null }> }> };
+    const busyAgents = async () =>
+      ((await api<Activity>("GET", "/api/activity")).projects.find((p) => p.id === projectId)?.agents ?? []).filter((a) => a.busy);
+    await waitUntil(async () => (await busyAgents()).length === 0, { timeoutMs: 30_000 });
     const m = await opened();
     await ready(m, "#cperm");
     await waitUntil(() => shown($(m, "#cperm")) && text(m, "#cperm") === "Auto");
@@ -524,7 +526,11 @@ describe("web app · permissions", () => {
       (await rest<{ project: { agents: Array<{ id: string; permissions: string }> } }>("GET", "")).project.agents.some(
         (a) => a.permissions === "bypass",
       ),
-    );
+    ).catch(async (err) => {
+      // what the daemon said, so a failure on CI names its cause
+      console.log("PERMDBG " + JSON.stringify({ toast: text(m, "#toast"), busy: await busyAgents(), sent: m.sent.filter((x) => /permissions/.test(x.path)) }));
+      throw err;
+    });
     expect(m.sent.some((s) => /\/agents\/[^/]+\/permissions$/.test(s.path) && s.body?.permissions === "bypass")).toBe(true);
 
     // Orchestrate: each worker chip wears its mode, and the badge opens the same menu
