@@ -8,6 +8,7 @@ import type { LoomEvent, SendInput } from "../../types.js";
 import { MAIN_CHAT } from "../../types.js";
 import { ContextArtifacts } from "./artifacts.js";
 import { eventText, isUser, type ContinuityStore } from "./store.js";
+import { isNativeKind } from "./capabilities.js";
 import { ContextItemV1, ContextPacketV1, RequestV1, ContinuityError, NativeDispatchRejected, NativeQuiescenceUnknown, NativeSessionMissing, digest, parseBounded,
   type Binding, type ContextItem, type ContextPacket, type ContinuityRequest, type Receipt,
   type RenderedBriefing, type SourceRef, type WorkspaceRef } from "./contracts.js";
@@ -161,11 +162,12 @@ export class ContinuityEngine {
    * covered as exact, summarized, referenced or omitted.
    */
   async prepare(request: ContinuityRequest, kind: string, dir: string, options: Record<string, unknown>, supplement = ""): Promise<{ packet: ContextPacket; rendered: RenderedBriefing; receipt: Receipt }> {
-    if (kind !== "codex" && kind !== "claude-code")
+    if (!isNativeKind(kind))
       throw new ContinuityError("unsupported", `${kind} has no verified native continuity protocol; use the legacy workflow`);
     const observed = await observeWorkspace(dir);
     this.store.assertWorkspaceIdle(observed.workspace.id);
-    // Both CLIs switch models on resume, so a model change keeps the native session.
+    // Every native harness switches models on resume (opencode in place, per
+    // session), so a model change keeps the native session.
     const { model: _model, ...stable } = options;
     const fingerprint = digest(JSON.stringify([kind, stable, observed.workspace.id, "turn-input-v2"]));
     const slot = digest(JSON.stringify([request.conversationId, request.agentInstanceId, observed.workspace.id, fingerprint]));

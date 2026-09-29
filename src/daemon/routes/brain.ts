@@ -4,6 +4,7 @@ import type { MemoryKind, MemoryPatch } from "../../core/brain.js";
 import type { WithRuntime } from './context.js';
 import { z } from "zod";
 import { ContextItemV1, ContinuityError, Id, parseBounded } from "../../core/continuity/contracts.js";
+import { NATIVE_KINDS } from "../../core/continuity/capabilities.js";
 /** Register brain routes in the order established by LoomDaemon.routes(). */
 export function registerBrainRoutes(app: Express, withRuntime: WithRuntime): void {
   // Keep concrete continuity routes before /brain/:mid. Diagnostics contain
@@ -26,7 +27,7 @@ export function registerBrainRoutes(app: Express, withRuntime: WithRuntime): voi
       .json({ error: error instanceof Error ? error.message : String(error), code: error instanceof ContinuityError ? error.code : "invalid" });
   };
   app.get("/api/projects/:id/brain/continuity", withRuntime(async (rt, req, res) => {
-    if (!rt.continuity) { res.json({ enabled: false, supportedHarnesses: ["codex", "claude-code"] }); return; }
+    if (!rt.continuity) { res.json({ enabled: false, supportedHarnesses: NATIVE_KINDS }); return; }
     try {
       const requestId = req.query.requestId === undefined ? undefined : parseBounded(Id, req.query.requestId);
       res.json({ enabled: true, ...rt.continuity.diagnostics(requestId) });

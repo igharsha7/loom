@@ -1469,7 +1469,7 @@ export class ProjectRuntime {
   /** Can this agent be handed a different model for one turn? */
   private switchesModelPerTurn(agentId: string): boolean {
     const kind = this.config.agents.find((a) => a.id === agentId)?.kind;
-    return kind === "model" || Boolean(this.continuity && (kind === "codex" || kind === "claude-code"));
+    return kind === "model" || Boolean(this.continuity && kind && isNativeKind(kind));
   }
 
   /** Bind (or unbind) who answers in a thread. */
@@ -2218,7 +2218,7 @@ export class ProjectRuntime {
       if (input.target?.kind === "orchestra") throw new ContinuityError("unsupported", "parallel orchestra is outside sequential native continuity");
       const target = input.target?.kind === "agent" ? input.target.agentId : bound.agentId ?? this.validHolder() ?? this.defaultAdapterId();
       const cfg = this.config.agents.find(a => a.id === target);
-      if (!cfg || !["codex", "claude-code"].includes(cfg.kind)) throw new ContinuityError("unsupported", "queued native continuity needs a supported harness");
+      if (!cfg || !isNativeKind(cfg.kind)) throw new ContinuityError("unsupported", "queued native continuity needs a supported harness (Codex, Claude Code or OpenCode)");
       const captured = this.continuity.capture({ id: newId(16), text: input.text, conversationId: input.chat ?? MAIN_CHAT,
         agentInstanceId: target, source: input.source ?? "user", model: bound.agentId === target ? bound.model ?? null : null,
         plan: Boolean(input.plan), targetAddedTokens: 6000 });

@@ -11,9 +11,12 @@ const exec = promisify(execFile);
 export const NATIVE_PROTOCOLS = {
   codex: { protocol: "codex-app-server-v2", acceptance: "turn/start response or turn/started", compaction: "contextCompaction item", tested: ["0.153.4"] },
   "claude-code": { protocol: "claude-agent-sdk-stream-json-v1", acceptance: "status requesting or assistant/result output", compaction: "status compacting + compact_boundary", tested: ["2.1.278"] },
+  opencode: { protocol: "opencode-serve-api-v2", acceptance: "prompt admitted (POST /api/session/{id}/prompt)", compaction: "session.next.compaction.ended", tested: ["1.18.31"] },
 } as const;
 export type NativeKind = keyof typeof NATIVE_PROTOCOLS;
-export const isNativeKind = (kind: string): kind is NativeKind => kind === "codex" || kind === "claude-code";
+/** The harnesses native continuity speaks to, in one place. */
+export const NATIVE_KINDS = Object.keys(NATIVE_PROTOCOLS) as NativeKind[];
+export const isNativeKind = (kind: string): kind is NativeKind => (NATIVE_KINDS as string[]).includes(kind);
 
 export interface HarnessHealth {
   kind: string;
@@ -35,7 +38,18 @@ export async function probeHarness(kind: string, options: Record<string, unknown
   if (process.platform === "win32") return down("native continuity requires verified process containment; Windows Job Objects are not implemented yet");
   if (!isNativeKind(kind)) return down(`no native continuity protocol for ${kind}`);
   const override = typeof options.bin === "string" ? options.bin : undefined;
-  const bin = kind === "codex" ? codexBin(override) : claudeBin(override);
+  // An opencode agent pointed at a running server is as reachable as that server.
+  if (kind === "opencode" && typeof options.baseUrl === "string" && options.baseUrl) {
+    try {
+      const res = await fetch(`${options.baseUrl.replace(/\/$/, "")}/api/health`, { signal: AbortSignal.timeout(5000) });
+      if (!res.ok) return down(`opencode server at ${options.baseUrl} answered ${res.status}`);
+    } catch (error) {
+      return down(`opencode server at ${options.baseUrl} is not reachable: ${error instanceof Error ? error.message.slice(0, 200) : String(error)}`);
+    }
+    return { kind, available: true, version: null, tested: false, binary: null,
+      fingerprint: digest(JSON.stringify([options.baseUrl, NATIVE_PROTOCOLS.opencode.protocol])), checkedAt };
+  }
+  const bin = kind === "codex" ? codexBin(override) : kind === "claude-code" ? claudeBin(override) : override ?? "opencode";
   if (!bin) return down(`${kind} CLI was not found`);
   let version: string | null;
   try {
