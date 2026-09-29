@@ -30,6 +30,7 @@ import { randomUUID } from "node:crypto";
 import { ContinuityError, NativeDispatchRejected } from "../../core/continuity/contracts.js";
 import type { ContinuityEngine } from "../../core/continuity/engine.js";
 import type { HarnessHealth } from "../../core/continuity/capabilities.js";
+import { isNativeKind } from "../../core/continuity/capabilities.js";
 
 export interface TurnOptions {
   source?: "user" | "route"; chat?: string; plan?: boolean; fromQueue?: boolean;
@@ -465,8 +466,8 @@ export class RuntimeTurns {
     const target = agentId ?? bound.agentId ?? this.host.validHolder() ?? this.host.defaultAdapterId();
     const agent = this.host.agent(target);
     const cfg = this.host.config.agents.find(a => a.id === target)!;
-    if (!isAdapter(agent) || !["codex", "claude-code"].includes(cfg.kind))
-      throw new ContinuityError("unsupported", "native continuity currently supports Codex and Claude Code only; bridges/OpenCode require a verified protocol");
+    if (!isAdapter(agent) || !isNativeKind(cfg.kind))
+      throw new ContinuityError("unsupported", "native continuity supports Codex, Claude Code and OpenCode; bridges and model agents use the legacy workflow");
     if (/^\[(?:image|file)\]\s/m.test(text))
       throw new ContinuityError("unsupported", "attachment continuity is not verified for these CLI protocols; use an ordinary workspace file reference or the legacy attachment workflow");
     if (Array.isArray(cfg.options?.extraArgs) && cfg.options.extraArgs.length)

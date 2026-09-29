@@ -20,7 +20,7 @@ export const ContextItemV1 = z.strictObject({ id: Id, revision: Counter,
 export const CoverageV1 = z.strictObject({ source: SourceRefV1,
   disposition: z.enum(["exact", "summarized", "referenced", "omitted"]), reason: z.string().min(1).max(1000) });
 export const BindingV1 = z.strictObject({ id: Id, conversationId: Id,
-  agentInstanceId: Id, harnessKind: z.enum(["codex", "claude-code"]),
+  agentInstanceId: Id, harnessKind: z.enum(["codex", "claude-code", "opencode"]),
   workspaceId: Hash, compatibilityFingerprint: Hash, nativeSessionId: Id.nullable(),
   // "compacted": the harness reported native compaction; the next packet rebuilds state.
   sessionEpoch: Counter, retention: z.enum(["unknown", "observed", "compacted"]) });
