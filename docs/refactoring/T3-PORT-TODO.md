@@ -132,6 +132,16 @@ Claude settings); override per session through the protocol instead.
   before RED, ask for the codewords. Both answered "BLUE". Codex (`gpt-6-astra`
   override) went through the `thread/rollback` fallback and stayed on one
   app-server. Claude resumed the fork. Projects untouched.
+- [x] Projects without git (or with no commit yet): checkpoints in Loom's own store,
+  a bare repo at `.loom/checkpoints.git` driven with `GIT_DIR`/`GIT_WORK_TREE`.
+  Capture, rewind, one-file restore and undo work as in a repository; the turn's
+  diff card comes from the checkpoint (`checkpoints.diffSince`). Default excludes,
+  a new-content cap (20k files / 256 MB, listing ≤ 15 s), and `gc --auto` after
+  pruning. The same for Codex and Claude; Claude's SDK file checkpointing
+  (`enableFileCheckpointing` / `rewindFiles`) is deliberately not used. Tests:
+  5 in `test/checkpoint.test.ts`, 1 runtime test in `rollback.test.ts`. No extra
+  live check: the store is harness-independent and was tested against real git,
+  and the native rollback was already checked live.
 - Not done: other chats' conversations are left alone even though their files were
   put back too (decided; see notes). An undo of a rewind restores files only.
 

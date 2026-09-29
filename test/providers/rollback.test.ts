@@ -265,3 +265,35 @@ describe("runtime · rewind", () => {
     expect((binding(dir, side.id).turnLedger as { turns: unknown[] }).turns).toHaveLength(sideTurns);
   });
 });
+
+describe("runtime · rewind without git", () => {
+  it("checkpoints, shows the turn's changes, and rewinds files and conversation the same way", async () => {
+    const bin = fakeCodex();
+    const dir = makeProjectDir({ agents: [{ id: "codex", kind: "codex", options: { bin } }] });
+    fs.writeFileSync(path.join(dir, "app.txt"), "v0\n");
+    const rt = await ProjectRuntime.open({ id: `p-${Math.random().toString(36).slice(2)}`, name: "plain", dir });
+    open.push(rt);
+    await turn(rt, "first");
+    fs.writeFileSync(path.join(dir, "app.txt"), "v1\n");
+    await turn(rt, "second");
+    fs.writeFileSync(path.join(dir, "app.txt"), "v2\n");
+    fs.writeFileSync(path.join(dir, "made.txt"), "by the second turn\n");
+    await turn(rt, "third");
+    expect(fs.existsSync(path.join(dir, ".git"))).toBe(false);
+
+    // Turn cards: what changed, and the point to put it back to. (The test's
+    // own writes land between turns, so which card names them is timing.)
+    await until(() => rt.log.list().some((e) => e.kind === "turn_diff"));
+    const diffs = rt.log.list().filter((e) => e.kind === "turn_diff");
+    const ids = new Set(rt.log.list().filter((e) => e.kind === "checkpoint").map((e) => e.payload.id));
+    expect(diffs.every((d) => ids.has(d.payload.checkpoint))).toBe(true);
+    expect(diffs.some((d) => (d.payload.files as Array<{ path: string }>).some((f) => f.path === "app.txt"))).toBe(true);
+
+    const out = await rt.rewind(checkpointBefore(rt, "second"));
+    expect(fs.readFileSync(path.join(dir, "app.txt"), "utf8")).toBe("v1\n");
+    expect(fs.existsSync(path.join(dir, "made.txt"))).toBe(false);
+    expect(out.conversation).toEqual([{ agentId: "codex", provider: "codex", turns: 2 }]);
+    expect(rpcOf(bin, "thread/revert")).toHaveLength(1);
+  });
+});
+

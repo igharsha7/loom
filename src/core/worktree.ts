@@ -6,7 +6,7 @@
 
 import { execFile } from "node:child_process";
 
-const PATCH_EVENT_LIMIT = 12_000; // per-turn patch stored in the event log
+export const PATCH_EVENT_LIMIT = 12_000; // per-turn patch stored in the event log
 const PATCH_VIEW_LIMIT = 64_000; // full working-tree patch served to apps
 
 function git(args: string[], cwd: string): Promise<string> {

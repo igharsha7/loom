@@ -13,7 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { capture, find, forgetAll, list, prune, restore, restoreFile } from "../src/core/checkpoint.js";
+import { capture, diffSince, find, forgetAll, list, prune, restore, restoreFile, STORE_LIMITS } from "../src/core/checkpoint.js";
 import { tmpDir } from "./helpers.js";
 
 const git = (dir: string, ...args: string[]): string => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
@@ -110,13 +110,18 @@ describe("taking a checkpoint", () => {
     expect(fs.readdirSync(path.join(dir, ".git")).some((f) => f.startsWith("loom-checkpoint-"))).toBe(false);
   });
 
-  it("says no rather than lying when there is nothing to check point", async () => {
-    // Not a repository at all.
-    expect(await capture(tmpDir("norepo"), "x")).toBeNull();
-    // A repository with no commits: no HEAD to go back to.
+  it("keeps a project with no repository, or no commit yet, in Loom's own store", async () => {
+    const plain = tmpDir("norepo");
+    write(plain, "a.txt", "a\n");
+    expect(await capture(plain, "x")).toMatchObject({ store: "loom" });
+    // A repository with no commits: no HEAD to parent on, so Loom's store too.
     const fresh = tmpDir("empty");
     git(fresh, "init", "-q", "-b", "main");
-    expect(await capture(fresh, "x")).toBeNull();
+    write(fresh, "a.txt", "a\n");
+    expect(await capture(fresh, "x")).toMatchObject({ store: "loom" });
+    // …and the project's own repository is left exactly as it was.
+    expect(git(fresh, "status", "--porcelain")).toContain("?? a.txt");
+    expect(git(fresh, "for-each-ref")).toBe("");
   });
 });
 
@@ -298,5 +303,105 @@ describe("what git status says afterwards", () => {
     // Nothing staged: the first column is a space or a ?, never M or A.
     expect(status.every((l) => l[0] === " " || l[0] === "?")).toBe(true);
     expect(git(dir, "diff", "--cached", "--name-only").trim()).toBe("");
+  });
+});
+
+
+/** A folder that isn't a git repository, with things a rewind must never touch. */
+function plainProject(): string {
+  const dir = tmpDir("plain");
+  write(dir, "app.ts", "export const port = 3000;\n");
+  write(dir, "src/util.ts", "export const one = 1;\n");
+  write(dir, ".env", "SECRET=hunter2\n");
+  write(dir, "node_modules/left/index.js", "module.exports = 1;\n");
+  write(dir, ".loom/events.db", "pretend this is the log\n");
+  return dir;
+}
+
+describe("Loom's own store (a project without git)", () => {
+  it("captures, rewinds and undoes the rewind, leaving excluded files and .loom alone", async () => {
+    const dir = plainProject();
+    const cp = (await capture(dir, "before the turn"))!;
+    expect(cp.store).toBe("loom");
+    expect(fs.existsSync(path.join(dir, ".git"))).toBe(false);
+    const tree = execFileSync("git", ["ls-tree", "-r", "--name-only", cp.commit], { cwd: dir, encoding: "utf8",
+      env: { ...process.env, GIT_DIR: path.join(dir, ".loom", "checkpoints.git") } }).split("\n").filter(Boolean);
+    expect(tree.sort()).toEqual(["app.ts", "src/util.ts"]);
+
+    // The turn: an edit, a new file, a deletion, and one by a shell command.
+    write(dir, "app.ts", "export const port = 8080;\n");
+    write(dir, "generated/out.ts", "made by the agent\n");
+    fs.rmSync(path.join(dir, "src/util.ts"));
+    execFileSync("sh", ["-c", "echo appended >> app.ts"], { cwd: dir });
+    write(dir, "node_modules/left/index.js", "module.exports = 2;\n");
+
+    const out = await restore(dir, cp.id);
+    expect(out.changed.sort()).toEqual(["app.ts", "generated/out.ts", "src/util.ts"]);
+    expect(read(dir, "app.ts")).toBe("export const port = 3000;\n");
+    expect(read(dir, "src/util.ts")).toBe("export const one = 1;\n");
+    expect(read(dir, "generated/out.ts")).toBeNull();
+    expect(fs.existsSync(path.join(dir, "generated"))).toBe(false);
+    expect(read(dir, ".env")).toBe("SECRET=hunter2\n");
+    expect(read(dir, "node_modules/left/index.js")).toBe("module.exports = 2;\n");
+    expect(read(dir, ".loom/events.db")).toBe("pretend this is the log\n");
+
+    // Undo: the turn's work comes back.
+    await restore(dir, out.undo.id);
+    expect(read(dir, "app.ts")).toBe("export const port = 8080;\nappended\n");
+    expect(read(dir, "generated/out.ts")).toBe("made by the agent\n");
+    expect(read(dir, "src/util.ts")).toBeNull();
+  });
+
+  it("puts one file back, or removes one the turn created", async () => {
+    const dir = plainProject();
+    const cp = (await capture(dir, "before"))!;
+    write(dir, "app.ts", "changed\n");
+    write(dir, "new.ts", "new\n");
+    write(dir, "src/util.ts", "changed too\n");
+    await restoreFile(dir, cp.id, "app.ts");
+    expect(read(dir, "app.ts")).toBe("export const port = 3000;\n");
+    expect(read(dir, "src/util.ts")).toBe("changed too\n");
+    expect(await restoreFile(dir, cp.id, "new.ts")).toMatchObject({ removed: true });
+    expect(read(dir, "new.ts")).toBeNull();
+  });
+
+  it("says what a turn changed, with new files' content", async () => {
+    const dir = plainProject();
+    const cp = (await capture(dir, "before"))!;
+    expect(await diffSince(dir, cp.id)).toBeNull();
+    write(dir, "app.ts", "export const port = 8080;\n");
+    write(dir, "fresh.ts", "hello\n");
+    fs.rmSync(path.join(dir, "src/util.ts"));
+    const diff = (await diffSince(dir, cp.id))!;
+    expect(diff.files).toEqual([{ status: " M", path: "app.ts" }, { status: "??", path: "fresh.ts" }, { status: " D", path: "src/util.ts" }]);
+    expect(diff).toMatchObject({ added: 2, removed: 2, truncated: false });
+    expect(diff.patch).toContain("+hello");
+    // A git project's turn diff comes from git status, not from here.
+    const gitDir = repo();
+    const gitCp = (await capture(gitDir, "x"))!;
+    write(gitDir, "app.ts", "changed\n");
+    expect(await diffSince(gitDir, gitCp.id)).toBeNull();
+  });
+
+  it("skips a capture that would take in too much new content", async () => {
+    const dir = plainProject();
+    const was = STORE_LIMITS.files;
+    STORE_LIMITS.files = 3;
+    try {
+      for (const n of [1, 2, 3, 4]) write(dir, `data/${n}.csv`, "x\n");
+      expect(await capture(dir, "too much")).toBeNull();
+    } finally {
+      STORE_LIMITS.files = was;
+    }
+    expect(await capture(dir, "fine")).toMatchObject({ store: "loom" });
+  });
+
+  it("lists, prunes and forgets checkpoints in Loom's store", async () => {
+    const dir = plainProject();
+    for (const n of [1, 2, 3]) { write(dir, "app.ts", `step ${n}\n`); await capture(dir, `step ${n}`); }
+    expect((await list(dir)).map((c) => [c.label, c.store])).toEqual([["step 3", "loom"], ["step 2", "loom"], ["step 1", "loom"]]);
+    expect(await prune(dir, 1)).toBe(2);
+    expect(await forgetAll(dir)).toBe(1);
+    expect(await list(dir)).toEqual([]);
   });
 });

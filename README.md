@@ -1067,6 +1067,18 @@ loom rewind cm8x2k1p --files-only   # the files, and leave the conversation as i
 Checkpoints live on hidden refs under `refs/loom/checkpoints/`, so no branch
 listing, no stash and no `git log` ever shows them. The newest 60 are kept.
 
+**No git repository? Same rewind.** A project that isn't a repository (or has
+no commit yet) keeps its checkpoints in Loom's own store, `.loom/checkpoints.git`,
+and gets the same thing: a checkpoint before every turn, the turn's changes on
+its card, and a rewind of files and conversation for Codex and Claude Code
+alike. Shell commands' changes are covered too, which Claude Code's own
+checkpoints miss. It needs the `git` program, but not a repository, and it
+creates nothing in the project outside `.loom/`. With no `.gitignore` to go by,
+it leaves out `node_modules/`, `.env`, virtualenvs, build output and similar
+(a `.gitignore` in the folder still counts). A turn that would add more than
+20,000 new files or 256 MB to the store gets no checkpoint, so a folder full
+of media doesn't get copied before every turn.
+
 ## Opening a PR from a card
 
 With `git.branchPerTask` on, dragging a card to **Working** cuts its branch.

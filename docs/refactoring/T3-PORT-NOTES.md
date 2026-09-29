@@ -242,3 +242,15 @@ test fix (#212). These are the changes that touch the port:
   happened"). The `rewound` event records the chat and each conversation's
   result. The UI (Phase 7) and anything that rebuilds context from the log (Phase 5)
   read the dropped turns from that event.
+- **2026-09-29.** Rewind without git uses one Loom-owned mechanism for every
+  provider, not each harness's own. Claude Code's file checkpoints (`/rewind`, SDK
+  `enableFileCheckpointing` + `rewindFiles`) only see its edit tools, not shell
+  commands, and Codex has nothing like them, so a per-provider approach would
+  cover a chat differently depending on who ran each turn. Loom's store is a bare
+  git repo at `.loom/checkpoints.git` with `GIT_WORK_TREE` set to the project.
+  It is the same plumbing as in-repo checkpoints, with temporary indexes seeded
+  from the latest checkpoint, so it catches shell changes too and adds nothing
+  to the project outside `.loom/`. t3code refuses checkpoints outside a git
+  repository; this goes beyond it. A repository with no commit yet also uses
+  Loom's store, and the repo itself is untouched. Checkpoints are listed from both
+  stores, and a restore's undo point goes to the store of the checkpoint it undoes.

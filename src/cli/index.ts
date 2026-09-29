@@ -753,7 +753,7 @@ program
     const project = await currentProject(client);
     const { checkpoints } = await client.checkpoints(project.id);
     if (!checkpoints.length) {
-      console.log(pc.dim("no checkpoints yet — one is taken before every turn, in a git repository"));
+      console.log(pc.dim("no checkpoints yet — one is taken before every turn"));
       return;
     }
     if (!checkpoint) {

@@ -289,7 +289,12 @@ export class RuntimeTurns {
     // agent may already be on its next turn somewhere else. Without it, every
     // "changed N files" card landed in Main whatever thread asked.
     const turnChat = this.turnChat.get(agentId);
-    const pending = diffSinceSnapshot(this.host.agentDir(agentId), before).catch(() => null);
+    // A project without git has no status to compare; its checkpoint (in
+    // Loom's own store) says what the turn changed instead.
+    const dir = this.host.agentDir(agentId);
+    const pending = diffSinceSnapshot(dir, before)
+      .then((diff) => diff ?? (checkpoint ? checkpoints.diffSince(dir, checkpoint) : null))
+      .catch(() => null);
     this.lastTurnDiff.set(agentId, pending);
     const finalized = pending
       .then(async (diff) => {

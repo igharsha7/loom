@@ -486,7 +486,7 @@ export function createOrchestra(view) {
         state.checkpoints = rows;
         var list = document.getElementById("cmlist"); if (!list) return;
         if (!rows.length) {
-          list.innerHTML = '<div class="cmmore">no checkpoints yet \u2014 one is taken before every turn, in a git repository</div>';
+          list.innerHTML = '<div class="cmmore">no checkpoints yet \u2014 one is taken before every turn</div>';
           return;
         }
         list.innerHTML = rows.slice(0, 40).map(function(c){
