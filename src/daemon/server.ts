@@ -755,8 +755,11 @@ export class LoomDaemon {
       if (recovered) {
         rt.unquarantine(agent);
         const retried = rt.baton.holder() !== agent;
-        if (retried) await rt.handoff(agent).catch(() => { });
-        rt.log.append({ kind: "status", agentId: agent, payload: { state: "alert_recovery", alert, retried, attempt, via: "recheck" } });
+        // A hand-back that's refused (the stand-in is mid-turn, say) is part
+        // of what happened; recording "recovered" without it reads as done.
+        let handBack: string | undefined;
+        if (retried) await rt.handoff(agent).catch((err: unknown) => { handBack = err instanceof Error ? err.message : String(err); });
+        rt.log.append({ kind: "status", agentId: agent, payload: { state: "alert_recovery", alert, retried, attempt, via: "recheck", ...(handBack ? { handBackFailed: handBack } : {}) } });
         return;
       }
       if (attempt >= maxRetries) {

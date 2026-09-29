@@ -97,17 +97,25 @@ export function registerAlertsRoutes(app: Express, ctx: Pick<RouteContext, "host
             kind: "status", agentId: String(agent),
             payload: { state: "alert_intervention", alert: alertName, holder, fallback: fallback ?? null }
           });
-          // Start the recheck loop: pause → recheck → return the baton if the
-          // agent stops erroring, retrying a few times before giving up.
-          ctx.startHealLoop(rt, String(agent), alertName, Date.now());
-          if (displaced) {
-            await rt.handoff(fallback!);
-            actions.push({ project: info.name, agent, alert: alertName, action: `quarantined; baton handed to ${fallback}` });
-          } else {
-            actions.push({
-              project: info.name, agent, alert: alertName,
-              action: fallback ? "quarantined (agent wasn't holding the baton)" : "quarantined (no fallback agent)"
-            });
+          // Then the recheck loop: pause → recheck → return the baton if the
+          // agent stops erroring, retrying a few times before giving up. It
+          // starts once the failover has landed: started before, a quick
+          // recheck could find the agent still holding the baton, call it
+          // recovered with nothing to hand back, and let the failover strand
+          // the baton on the stand-in a moment later.
+          const since = Date.now();
+          try {
+            if (displaced) {
+              await rt.handoff(fallback!);
+              actions.push({ project: info.name, agent, alert: alertName, action: `quarantined; baton handed to ${fallback}` });
+            } else {
+              actions.push({
+                project: info.name, agent, alert: alertName,
+                action: fallback ? "quarantined (agent wasn't holding the baton)" : "quarantined (no fallback agent)"
+              });
+            }
+          } finally {
+            ctx.startHealLoop(rt, String(agent), alertName, since);
           }
         } catch (e) {
           actions.push({ agent, error: e instanceof Error ? e.message : String(e) });
