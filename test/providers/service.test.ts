@@ -163,21 +163,36 @@ describe("ProviderService · turns", () => {
     expect(codex.responses).toEqual([{ requestId: "r1", decision: "accept" }]);
   });
 
-  it("refuses compaction and rollback the adapter doesn't support", async () => {
-    const { service } = setup();
+  it("refuses compaction, and a rollback the adapter doesn't support, before anything changes", async () => {
+    const { service, codex } = setup();
     await service.ensureSession({ threadId: "main", instanceId: "codex", ...base });
     await expect(service.compact("main", "codex")).rejects.toMatchObject({ code: "unsupported" });
-    await expect(service.rollback("main", "codex", 1)).rejects.toMatchObject({ code: "unsupported" });
-    expect(() => service.assertRollbackSupported("codex")).toThrow(/cannot roll back/);
+    await service.sendTurn({ threadId: "main", instanceId: "codex", input: "one", ...base });
+    await new Promise(r => setTimeout(r, 5));
+    const cutoff = Date.now();
+    await new Promise(r => setTimeout(r, 5));
+    await service.sendTurn({ threadId: "main", instanceId: "codex", input: "two", ...base });
+    expect(() => service.planRollback("main", "codex", cutoff, "/repo")).toThrow(/cannot roll back/);
+    expect(codex.calls.some(c => c.op === "rollbackThread")).toBe(false);
   });
 
-  it("routes compaction and rollback the adapter supports, and validates the count", async () => {
-    const { service, codex } = setup({ capabilities: { manualCompaction: true, supportsConversationRollback: true } });
+  it("plans a rollback from the turn ledger and routes it to the adapter", async () => {
+    const { service, codex, directory } = setup({ capabilities: { manualCompaction: true, supportsConversationRollback: true } });
     await service.ensureSession({ threadId: "main", instanceId: "codex", ...base });
     await service.compact("main", "codex");
-    await service.rollback("main", "codex", 2);
-    await expect(service.rollback("main", "codex", 0)).rejects.toMatchObject({ code: "validation" });
-    expect(codex.calls.filter(c => c.op === "compact" || c.op === "rollbackThread").map(c => c.args)).toEqual([["main"], ["main", 2]]);
+    const first = await service.sendTurn({ threadId: "main", instanceId: "codex", input: "one", ...base });
+    await waitUntil(() => !service.activeTurn("main", "codex"));
+    await new Promise(r => setTimeout(r, 5));
+    const cutoff = Date.now();
+    await new Promise(r => setTimeout(r, 5));
+    const second = await service.sendTurn({ threadId: "main", instanceId: "codex", input: "two", ...base });
+    await waitUntil(() => !service.activeTurn("main", "codex"));
+    const step = service.planRollback("main", "codex", cutoff, "/repo")!;
+    expect(step).toMatchObject({ beforeTurnId: second.turnId, turns: 1 });
+    await service.rollbackConversation(step);
+    expect(codex.calls.filter(c => c.op === "compact" || c.op === "rollbackThread").map(c => c.args)).toEqual([["main"], ["main", second.turnId]]);
+    expect(directory.get("main", "codex")!.turnLedger!.turns.map(t => t.id)).toEqual([first.turnId]);
+    expect(service.planRollback("main", "codex", cutoff, "/repo")).toBeNull();
   });
 
   it("stopAll stops every session and marks every binding stopped", async () => {

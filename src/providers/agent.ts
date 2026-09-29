@@ -29,7 +29,7 @@ import { permissionFor } from "../core/permissions.js";
 import { MAIN_CHAT, type AgentCapabilities, type McpServerEntry, type SendInput } from "../types.js";
 import type { ProviderAdapter } from "./adapter.js";
 import { ApprovalBridge } from "./approvals.js";
-import { ClaudeProviderAdapter, claudeBin } from "./claude/adapter.js";
+import { ClaudeProviderAdapter, claudeBin, type ClaudeHistory } from "./claude/adapter.js";
 import { CodexProviderAdapter, codexBin } from "./codex/adapter.js";
 import type { ProviderKind, ProviderRuntimeEvent, ThreadId, TurnId } from "./contracts.js";
 import { runtimeModeFor } from "./contracts.js";
@@ -37,7 +37,7 @@ import { FileSessionDirectory } from "./directory.js";
 import { isProviderError } from "./errors.js";
 import { RuntimeIngestion, type LiveDelta, type LiveItem } from "./ingestion.js";
 import { SessionReaper } from "./reaper.js";
-import { ProviderService } from "./service.js";
+import { ProviderService, type RollbackStep } from "./service.js";
 import type { Json } from "./codex/rpc.js";
 
 // ---------------------------------------------------------------------------
@@ -100,6 +100,8 @@ interface AgentOptions {
   loomProject?: string;
   /** How long a finished turn waits for its running commands (tests). */
   commandSettleMs?: number;
+  /** Claude session history in place of the SDK's (tests). */
+  claudeHistory?: ClaudeHistory;
   [key: string]: unknown;
 }
 
@@ -245,6 +247,7 @@ export class ProviderAgent extends AdapterBase {
       : new ClaudeProviderAdapter(this.id, { ...(this.options.bin ? { bin: this.options.bin } : {}),
         ...(this.options.extraArgs ? { extraArgs: this.options.extraArgs } : {}),
         ...(this.options.permissionMode ? { permissionMode: this.options.permissionMode } : {}),
+        ...(this.options.claudeHistory ? { history: this.options.claudeHistory } : {}),
         mcpServers: () => Object.fromEntries(mcpServers().map(s => [s.key, claudeMcpServer(s.entry)])), canAsk: hasApprovalBroker });
     providers.service.register(adapter);
     providers.owners.set(this.id, this);
@@ -427,8 +430,27 @@ export class ProviderAgent extends AdapterBase {
     if (live) await service.stopSession(chat, this.id);
     const binding = service.directory.get(chat, this.id);
     if ((binding?.resumeCursor ?? null) !== nativeSessionId) {
+      // Another native session: its turns aren't on record here.
       service.directory.upsert({ threadId: chat, instanceId: this.id, provider: this.provider, status: "stopped",
-        resumeCursor: nativeSessionId, runtimePayload: { cwd: this.projectDir }, runtimeMode: this.runtimeMode() });
+        resumeCursor: nativeSessionId, runtimePayload: { cwd: this.projectDir }, runtimeMode: this.runtimeMode(), turnLedger: null });
+    }
+  }
+
+  /** What putting this agent's conversation in `chat` back to `cutoff` (epoch ms) takes; throws when it can't be done. */
+  async planRollback(chat: ThreadId, cutoff: number): Promise<RollbackStep | null> {
+    const { service } = await this.attach();
+    return service.planRollback(chat, this.id, cutoff, this.projectDir);
+  }
+
+  /** Carry out a planned rollback. The agent takes no turn meanwhile. */
+  async rollbackConversation(step: RollbackStep): Promise<void> {
+    if (this._busy) throw new Error(`${this.provider} agent "${this.id}" is busy`);
+    this._busy = true;
+    try {
+      const { service } = await this.attach();
+      await service.rollbackConversation(step);
+    } finally {
+      this._busy = false;
     }
   }
 

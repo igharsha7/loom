@@ -14,9 +14,23 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import type { InstanceId, ProviderKind, RuntimeMode, ThreadId } from "./contracts.js";
+import type { InstanceId, ProviderKind, RuntimeMode, ThreadId, TurnId } from "./contracts.js";
 
 export type BindingStatus = "starting" | "running" | "stopped" | "error";
+
+/**
+ * The native turns a session has run, so a rewind can name the first turn to
+ * drop. It is complete from `since` on (every turn started since then is
+ * listed); `fromStart` means it is complete for the whole native session.
+ */
+export interface TurnLedger {
+  since: number;
+  fromStart: boolean;
+  turns: Array<{ id: TurnId; at: number }>;
+}
+
+/** Turns kept per binding; older ones fall off and `since` moves up. */
+export const LEDGER_CAP = 500;
 
 export interface ProviderBinding {
   threadId: ThreadId;
@@ -30,14 +44,21 @@ export interface ProviderBinding {
   runtimeMode: RuntimeMode;
   /** Epoch ms of the last start, turn or activity. */
   lastSeenAt: number;
+  /** Absent or null: turns of this native session are not known. */
+  turnLedger?: TurnLedger | null;
 }
 
 export interface SessionDirectory {
   get(threadId: ThreadId, instanceId: InstanceId): ProviderBinding | undefined;
-  /** Insert or merge; `lastSeenAt` defaults to now. */
+  /**
+   * Insert or replace; `lastSeenAt` defaults to now. The turn ledger is kept
+   * unless the binding gives one (null clears it).
+   */
   upsert(binding: Omit<ProviderBinding, "lastSeenAt"> & { lastSeenAt?: number }): ProviderBinding;
   /** Mark activity without changing anything else. */
   touch(threadId: ThreadId, instanceId: InstanceId, at?: number): void;
+  /** Add a started native turn to the binding's ledger. */
+  recordTurn(threadId: ThreadId, instanceId: InstanceId, turnId: TurnId, at: number): void;
   list(options?: { excludeStopped?: boolean; threadId?: ThreadId }): ProviderBinding[];
   remove(threadId: ThreadId, instanceId: InstanceId): void;
 }
@@ -53,7 +74,9 @@ export class MemorySessionDirectory implements SessionDirectory {
   }
 
   upsert(binding: Omit<ProviderBinding, "lastSeenAt"> & { lastSeenAt?: number }): ProviderBinding {
-    const row: ProviderBinding = { ...binding, lastSeenAt: binding.lastSeenAt ?? Date.now() };
+    const ledger = binding.turnLedger !== undefined ? binding.turnLedger : this.rows.get(key(binding.threadId, binding.instanceId))?.turnLedger;
+    const row: ProviderBinding = { ...binding, lastSeenAt: binding.lastSeenAt ?? Date.now(), ...(ledger ? { turnLedger: ledger } : {}) };
+    if (!ledger) delete row.turnLedger;
     this.rows.set(key(row.threadId, row.instanceId), row);
     this.changed();
     return { ...row };
@@ -63,6 +86,17 @@ export class MemorySessionDirectory implements SessionDirectory {
     const row = this.rows.get(key(threadId, instanceId));
     if (!row) return;
     row.lastSeenAt = Math.max(row.lastSeenAt, at);
+    this.changed();
+  }
+
+  /** Record a native turn that started at `at`. */
+  recordTurn(threadId: ThreadId, instanceId: InstanceId, turnId: TurnId, at: number): void {
+    const row = this.rows.get(key(threadId, instanceId));
+    if (!row) return;
+    const ledger = row.turnLedger ?? { since: at, fromStart: false, turns: [] };
+    const turns = [...ledger.turns.filter(t => t.id !== turnId), { id: turnId, at }];
+    const kept = turns.slice(-LEDGER_CAP);
+    row.turnLedger = kept.length < turns.length ? { since: kept[0]!.at, fromStart: false, turns: kept } : { ...ledger, turns };
     this.changed();
   }
 
@@ -86,6 +120,8 @@ const BindingFile = z.object({
     status: z.enum(["starting", "running", "stopped", "error"]), resumeCursor: z.unknown().nullable(),
     runtimePayload: z.object({ cwd: z.string().optional(), model: z.string().optional() }).nullable(),
     runtimeMode: z.enum(["approval-required", "auto-accept-edits", "full-access"]), lastSeenAt: z.number(),
+    turnLedger: z.object({ since: z.number(), fromStart: z.boolean(),
+      turns: z.array(z.object({ id: z.string().min(1), at: z.number() })) }).nullable().optional(),
   })),
 });
 
@@ -107,7 +143,11 @@ export class FileSessionDirectory extends MemorySessionDirectory {
     if (!fs.existsSync(this.file)) return;
     try {
       const parsed = BindingFile.parse(JSON.parse(fs.readFileSync(this.file, "utf8")));
-      for (const b of parsed.bindings) this.rows.set(key(b.threadId, b.instanceId), b as ProviderBinding);
+      // A binding from before turn ledgers: nothing ran on it since it was written,
+      // so its turns are known from now on.
+      const now = Date.now();
+      for (const b of parsed.bindings)
+        this.rows.set(key(b.threadId, b.instanceId), { ...b, turnLedger: b.turnLedger ?? { since: now, fromStart: false, turns: [] } } as ProviderBinding);
     } catch (error) {
       const aside = `${this.file}.unreadable.${randomUUID()}`;
       try { fs.renameSync(this.file, aside); } catch { /* reported below either way */ }

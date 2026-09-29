@@ -88,7 +88,7 @@ import { pageGone } from './format.js';
       }
       if (r.status === 401) { logout(); throw new Error("session revoked — pair again"); }
       return r.json().then(function(j){
-        if (!r.ok) throw new Error(j.message || j.error || ("HTTP " + r.status));
+        if (!r.ok) { var e = new Error(j.message || j.error || ("HTTP " + r.status)); e.status = r.status; if (j.code) e.code = j.code; throw e; }
         return j;
       });
     });

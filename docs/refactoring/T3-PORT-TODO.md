@@ -104,16 +104,48 @@ Claude settings); override per session through the protocol instead.
   management). Per-turn diffs: Loom's own `turn_diff` (git, per turn) already covers
   both providers; Codex's `turn.diff.updated` is mapped but not yet shown.
 
-## Phase 4 — Checkpoints and revert
+## Phase 4 — Checkpoints and revert ✅ (2026-09-29)
 
-- [ ] Hidden-ref checkpoints per turn; revert coordinated with native rollback;
-  refuse before touching files when rollback is unsupported.
+- [x] Hidden-ref checkpoints per turn: already Loom's (`core/checkpoint.ts`, #101).
+  The checkpoint event now records the chat whose turn it precedes.
+- [x] Turn ledger: each (chat, agent) binding records its native turns (id and start
+  time) in `.loom/providers/sessions.json`, complete from the session's start (or
+  from when the ledger began, for older bindings).
+- [x] Contract: `rollbackThread(threadId, beforeTurnId)` → `{ resumeCursor, live }`
+  (t3code counts turns; Loom names the first turn to drop). Service:
+  `planRollback` (no files touched; refuses when unsupported or when the turns
+  since are not on record) and `rollbackConversation`.
+- [x] Codex: `thread/revert` before the turn; on a thread that refuses it (codex-cli
+  0.153.4: "only supports paginated threads"), `thread/read` + deprecated
+  `thread/rollback` with the counted turns. The session stays warm.
+- [x] Claude: `getSessionMessages` finds the turn's user message (uuid = turn id),
+  `forkSession` up to the message before it, the session ends, and the next turn
+  resumes the fork. A turn compaction replaced is refused.
+- [x] Rewind: `rewind(id, { conversation })` plans every provider agent's rollback
+  in the checkpoint's chat, refuses (409 `conversation_refused`) before files move,
+  restores files, rolls back, and logs `checkpoint · rewound` with `chat` and
+  `conversation`. Whole-session drops forget the binding (next turn starts fresh).
+  CLI `loom rewind --files-only`; the web app offers files-only when refused.
+- [x] Tests: `test/providers/rollback.test.ts` (10), service tests updated. Full
+  suite green.
+- [x] Live check (read-only, scratch git projects): BLUE, then RED, roll back
+  before RED, ask for the codewords. Both answered "BLUE". Codex (`gpt-6-astra`
+  override) went through the `thread/rollback` fallback and stayed on one
+  app-server. Claude resumed the fork. Projects untouched.
+- Not done: other chats' conversations are left alone even though their files were
+  put back too (decided; see notes). An undo of a rewind restores files only.
 
 ## Phase 5 — Cross-provider switching
 
 - [ ] Park/resume sessions across providers within a chat; Brain packet sized by the
   target's context window; switch offered at a usage limit; revert across a provider
   boundary; continuity on by default.
+- [ ] Carried over from Phase 4: the log still holds the turns a rewind dropped.
+  Anything that rebuilds context from the log (Brain packets for the switched-to
+  provider, briefings) must skip a chat's events between a `before_turn`
+  checkpoint and the `rewound` event that went back to it. The per-(chat, agent)
+  rollback already covers "revert across a provider boundary", since each
+  provider's session in the chat is rolled back on its own.
 
 ## Phase 6 — Provider management
 
@@ -121,3 +153,9 @@ Claude settings); override per session through the protocol instead.
   detection, native session history import.
 
 ## Phase 7 — UI overhaul
+
+- [ ] Thread: grey out or fold the turns a rewind dropped (the `rewound` checkpoint
+  event carries `chat` and `conversation`); a proper "files only / files and
+  conversation" choice in place of the confirm dialogs.
+- [ ] One live text path for provider agents: upstream now sends their text both as
+  `delta` frames and as `stream` frames (see notes, upstream changes).

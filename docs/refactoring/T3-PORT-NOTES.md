@@ -163,3 +163,82 @@ under `t3code/` refer to the local clone at `/Volumes/Programming Vault/t3code`
   proposed plan to `plans/` itself, so the artifact stays.
 - **2026-09-28.** A Claude write outside the session directory (plan mode's own
   plan file) is a tool call, not a project file edit.
+
+## Upstream changes after the Phases 1–3 merge (PR #211, main `50c9ec9`)
+
+The maintainer merged Phases 1–3 together with an enhancement sweep (#209) and a
+test fix (#212). These are the changes that touch the port:
+
+- **Live text goes out twice.** `runtime.ts` sends each provider's
+  `assistant_text`/reasoning delta both to `live` (the `delta` frames from Phase 2)
+  and to `liveText`, which becomes `stream` frames, the path every other agent
+  uses. That path also keeps a reload-safe snapshot. `thread.js` draws only
+  `stream` frames; its `onDelta` returns early and is kept only for clients that
+  see nothing but deltas. Tool progress still goes out as `item` frames. The UI
+  phase should choose one text path rather than keep both.
+- **`ProviderAgent.selfCheck()`** (`providers/agent.ts`) reports CLI presence and
+  version via `cliOutput`/`firstLine` from `adapters/base.ts`, for `loom doctor`.
+- **Briefings** (`runtime/turns.ts`): the reply `length` line ("brief"/"detailed")
+  and `host.agentInstructions(target)` (standing instructions per agent) go into
+  the briefing and into the continuity supplement. A provider switch must carry
+  both.
+- `turn_diff` events are tagged with the turn's chat.
+- The web-DOM tests read the generated page: run `npm run build:web` after
+  syncing, and use `npm test`, which runs the DOM files serially. With a stale
+  build, a plain `vitest run` shows false failures.
+
+## Sources read (Phase 4)
+
+- t3code `apps/server/src/orchestration/Layers/CheckpointReactor.ts`
+  (`handleRevertRequested`, ~766): assert rollback supported, then restore
+  files, then `rollbackConversation({ numTurns })`, then delete stale checkpoint
+  refs. It refuses a file restore when the workspace isn't isolated to the thread.
+- t3code `provider/Layers/ProviderService.ts` (`assertConversationRollbackSupported`,
+  `rollbackConversation`, ~2200).
+- t3code `provider/Layers/CodexSessionRuntime.ts` (`rollbackCodexThread`, ~1283):
+  `thread/turns/list`, then `thread/revert { beforeTurnId }`.
+- t3code `provider/Layers/ClaudeAdapter.ts` (`rollbackThread`, ~5293;
+  `isClaudeHumanTurnStart`, `remapClaudeForkTurnBoundaries`, ~149–225):
+  `getSessionMessages`, then `forkSession({ upToMessageId })` at the message before
+  the first dropped turn, then a restart that resumes the fork. The user message
+  is sent with `uuid = turnId` (~5263), and those ids are the turn boundaries.
+- codex-cli 0.153.4 `app-server generate-ts`: `thread/revert` (history only, not
+  files; `turns` empty in the reply), `thread/rollback { numTurns }` (deprecated),
+  `thread/read { includeTurns }`, `thread/turns/list`. Probe: `thread/revert` on a
+  new thread answers "thread/revert only supports paginated threads".
+- Agent SDK 0.3.283 `sdk.d.ts`: `getSessionMessages(id, { dir, includeSystemMessages })`,
+  `forkSession(id, { dir, upToMessageId })` → `{ sessionId }`. `upToMessageId` is
+  inclusive and may be "the uuid you supplied on a streamed SDKUserMessage".
+
+## Decisions (Phase 4)
+
+- **2026-09-29.** Rollback names the first native turn to drop (`beforeTurnId`)
+  instead of t3code's turn count. A Loom chat's native turns don't match Loom's
+  one to one (Claude `/compact` turns, continuity turns, and two providers in one
+  chat after Phase 5), so each binding keeps a ledger of native turn ids and start
+  times, and a checkpoint's capture time (its id) picks the first turn at or after it.
+- **2026-09-29.** A ledger counts only when it is provably complete over the window.
+  It must be complete from the session's start, or have begun before the
+  checkpoint. Otherwise the rewind refuses rather than guessing. Bindings from
+  before Phase 4 start a ledger when loaded; a continuity rebind to another native
+  session clears it.
+- **2026-09-29.** Order is plan → files → conversations. All refusals happen in
+  planning, before any file moves (t3code checks support first too). A rollback
+  that fails after the files are back is reported per agent, and the files can be
+  undone. Rolling the conversation back first was rejected because Codex's revert
+  is destructive and can't be undone if the file restore then fails.
+- **2026-09-29.** Scope is the checkpoint's own chat. Files are project-wide (as
+  Loom's rewind always was), and other chats' conversations are left alone.
+  t3code instead refuses a file restore unless the worktree is isolated to the
+  thread. Loom keeps its existing project-wide rewind and reports what it rolled
+  back.
+- **2026-09-29.** Dropping every turn of a native session doesn't call the provider.
+  The binding is forgotten, and the next turn starts a new session, as t3code's
+  Claude rollback restarts fresh when all turns go.
+- **2026-09-29.** Codex falls back to `thread/rollback` when `thread/revert` is
+  refused. The live check showed codex-cli 0.153.4 refuses revert on its threads.
+  t3code, on a newer Codex, uses revert only.
+- **2026-09-29.** The event log is not edited by a rewind ("history is what
+  happened"). The `rewound` event records the chat and each conversation's
+  result. The UI (Phase 7) and anything that rebuilds context from the log (Phase 5)
+  read the dropped turns from that event.

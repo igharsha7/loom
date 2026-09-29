@@ -1047,9 +1047,21 @@ meant to keep.
 a running agent gives it a working directory that contradicts everything it has
 read, and the damage lands in whatever it writes next.
 
+**The conversation goes back too.** Rewinding to the point before a turn also
+takes that chat's Codex and Claude Code sessions back to before it: Codex drops
+the turns from its thread, and Claude continues from a fork of its session that
+ends just before the turn (the original session file is kept). The agent then
+remembers the conversation as it stood at that point, not the work you just
+removed. Other chats' conversations are left alone. If a conversation can't
+go back, for example because Claude has compacted that turn away, the rewind
+refuses before touching a file and says why. `--files-only` (or answering the
+prompt in the app) puts back just the files. Undoing a rewind brings back the
+files only; the dropped turns stay dropped.
+
 ```sh
 loom rewind                 # the points you can go back to
 loom rewind cm8x2k1p        # go back to one (asks first)
+loom rewind cm8x2k1p --files-only   # the files, and leave the conversation as it is
 ```
 
 Checkpoints live on hidden refs under `refs/loom/checkpoints/`, so no branch

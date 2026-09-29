@@ -25,7 +25,7 @@ import { VERSION } from "../../version.js";
 import { EventHub, type ProviderAdapter } from "../adapter.js";
 import type {
   AdapterCapabilities, ApprovalDecision, CanonicalItemType, CanonicalRequestType, ContentStreamKind, InstanceId,
-  ItemLifecyclePayload, ProviderRuntimeEvent, ProviderSession, RequestId, RuntimeEventPayloads, RuntimeEventType,
+  ItemLifecyclePayload, ProviderRuntimeEvent, ProviderSession, RequestId, RollbackResult, RuntimeEventPayloads, RuntimeEventType,
   RuntimeItemStatus, RuntimeMode, RuntimeTurnState, SendTurnInput, SessionStartInput, ThreadId, TurnId, TurnStartResult,
   UserInputAnswers, UserInputQuestion,
 } from "../contracts.js";
@@ -159,7 +159,7 @@ interface Session {
 
 export class CodexProviderAdapter implements ProviderAdapter {
   readonly provider = "codex" as const;
-  readonly capabilities: AdapterCapabilities = { sessionModelSwitch: "in-session", supportsConversationRollback: false, manualCompaction: true };
+  readonly capabilities: AdapterCapabilities = { sessionModelSwitch: "in-session", supportsConversationRollback: true, manualCompaction: true };
   private readonly sessions = new Map<ThreadId, Session>();
   private readonly hub = new EventHub<ProviderRuntimeEvent>();
 
@@ -344,6 +344,41 @@ export class CodexProviderAdapter implements ProviderAdapter {
   async compact(threadId: ThreadId): Promise<void> {
     const s = this.session(threadId, "compact");
     await s.rpc.request("thread/compact/start", { threadId: s.providerThreadId });
+  }
+
+  /**
+   * `thread/revert` replaces the thread's history with the turns before
+   * `beforeTurnId` (t3code's rollbackCodexThread). A thread still on legacy
+   * history refuses it; for that one the older `thread/rollback` drops a count
+   * of turns from the end, counted on the thread as Codex reads it.
+   */
+  async rollbackThread(threadId: ThreadId, beforeTurnId: TurnId): Promise<RollbackResult> {
+    const s = this.session(threadId, "rollbackThread");
+    const fail = (message: string, cause?: unknown) => new ProviderError("request", "rollbackThread", message,
+      { provider: this.provider, instanceId: this.instanceId, threadId, cause });
+    if (s.info.activeTurnId) throw new ProviderError("validation", "rollbackThread", "a codex turn is running in this chat",
+      { provider: this.provider, instanceId: this.instanceId, threadId });
+    try {
+      await s.rpc.request("thread/revert", { threadId: s.providerThreadId, beforeTurnId });
+    } catch (error) {
+      if ((error as RpcError).code === undefined) throw fail(`codex did not answer the rollback: ${(error as Error).message}`, error);
+      let turns: Json[];
+      try {
+        const read = await s.rpc.request("thread/read", { threadId: s.providerThreadId, includeTurns: true });
+        turns = ((read.thread as Json | undefined)?.turns ?? []) as Json[];
+      } catch (readError) {
+        throw fail(`codex could not roll back its thread: ${(error as Error).message}`, readError);
+      }
+      const index = turns.findIndex(t => t.id === beforeTurnId);
+      if (index < 0) throw fail(`codex could not roll back its thread (${(error as Error).message}), and its history has no turn ${beforeTurnId}`, error);
+      try { await s.rpc.request("thread/rollback", { threadId: s.providerThreadId, numTurns: turns.length - index }); }
+      catch (rollbackError) { throw fail(`codex could not roll back its thread: ${(rollbackError as Error).message}`, rollbackError); }
+    }
+    // The running totals restart from the rolled-back thread.
+    s.baseline = null;
+    s.turnUsage = null;
+    s.finished.clear();
+    return { resumeCursor: s.providerThreadId, live: true };
   }
 
   async stopSession(threadId: ThreadId): Promise<void> {

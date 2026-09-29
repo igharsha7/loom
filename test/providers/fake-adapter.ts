@@ -9,7 +9,7 @@ import { randomUUID } from "node:crypto";
 import { EventHub, type ProviderAdapter } from "../../src/providers/adapter.js";
 import type {
   AdapterCapabilities, ApprovalDecision, ProviderKind, ProviderRuntimeEvent, ProviderSession, RuntimeEventPayloads,
-  RuntimeEventType, SendTurnInput, SessionStartInput, ThreadSnapshot, TurnStartResult, UserInputAnswers,
+  RollbackResult, RuntimeEventType, SendTurnInput, SessionStartInput, TurnStartResult, UserInputAnswers,
 } from "../../src/providers/contracts.js";
 import { ProviderError } from "../../src/providers/errors.js";
 
@@ -132,9 +132,9 @@ export class FakeAdapter implements ProviderAdapter {
     this.calls.push({ op: "respondToUserInput", args: [threadId, requestId, answers] });
   }
 
-  async rollbackThread(threadId: string, numTurns: number): Promise<ThreadSnapshot> {
-    this.calls.push({ op: "rollbackThread", args: [threadId, numTurns] });
-    return { threadId, turns: [] };
+  async rollbackThread(threadId: string, beforeTurnId: string): Promise<RollbackResult> {
+    this.calls.push({ op: "rollbackThread", args: [threadId, beforeTurnId] });
+    return { resumeCursor: this.sessions.get(threadId)?.resumeCursor ?? null, live: true };
   }
 
   async compact(threadId: string): Promise<void> {

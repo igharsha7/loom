@@ -18,8 +18,8 @@
 
 import { EventHub, type ProviderAdapter } from "./adapter.js";
 import type {
-  AdapterCapabilities, ApprovalDecision, InstanceId, ProviderRuntimeEvent, ProviderSession, RequestId,
-  RuntimeMode, SendTurnInput, ThreadId, ThreadSnapshot, TurnId, TurnStartResult, UserInputAnswers,
+  AdapterCapabilities, ApprovalDecision, InstanceId, ProviderKind, ProviderRuntimeEvent, ProviderSession, RequestId,
+  RuntimeMode, SendTurnInput, ThreadId, TurnId, TurnStartResult, UserInputAnswers,
 } from "./contracts.js";
 import type { SessionDirectory } from "./directory.js";
 import { ProviderError, isProviderError } from "./errors.js";
@@ -46,6 +46,20 @@ export interface EnsuredSession {
   via: "live" | "resumed" | "fresh";
   /** True when a recorded native session was gone and a fresh one replaced it. */
   replacedLostSession: boolean;
+}
+
+/** A planned conversation rollback for one (chat, agent). */
+export interface RollbackStep {
+  threadId: ThreadId;
+  instanceId: InstanceId;
+  provider: ProviderKind;
+  /** The first native turn to drop; null drops the whole native session. */
+  beforeTurnId: TurnId | null;
+  /** How many native turns go. */
+  turns: number;
+  cwd: string;
+  runtimeMode: RuntimeMode;
+  model?: string;
 }
 
 const sessionKey = (threadId: string, instanceId: string) => `${threadId}\u0000${instanceId}`;
@@ -126,9 +140,10 @@ export class ProviderService {
     const cwd = binding?.runtimePayload?.cwd ?? input.cwd;
     const model = input.model ?? binding?.runtimePayload?.model;
     const launch = async (resumeCursor: unknown) => {
+      // A new native session: every turn it will ever have gets recorded.
       this.directory.upsert({ threadId: input.threadId, instanceId: input.instanceId, provider: adapter.provider,
         status: "starting", resumeCursor: resumeCursor ?? null, runtimePayload: { cwd, ...(model ? { model } : {}) },
-        runtimeMode: input.runtimeMode });
+        runtimeMode: input.runtimeMode, ...(resumeCursor === undefined ? { turnLedger: { since: Date.now(), fromStart: true, turns: [] } } : {}) });
       try {
         return await adapter.startSession({ threadId: input.threadId, instanceId: input.instanceId, cwd,
           runtimeMode: input.runtimeMode, ...(model || input.effort ? { modelSelection: { ...(model ? { model } : {}), ...(input.effort ? { effort: input.effort } : {}) } } : {}),
@@ -174,6 +189,7 @@ export class ProviderService {
     if (!input.input.trim()) throw new ProviderError("validation", "sendTurn", "a turn needs input");
     const ensured = await this.ensureSession(input);
     const adapter = this.adapter(input.instanceId, "sendTurn");
+    const startedAt = Date.now();
     const result = await adapter.sendTurn({ threadId: input.threadId, instanceId: input.instanceId, input: input.input,
       ...(input.modelSelection ? { modelSelection: input.modelSelection } : {}),
       ...(input.interactionMode ? { interactionMode: input.interactionMode } : {}),
@@ -182,6 +198,7 @@ export class ProviderService {
     if (this.finishedTurns.get(k) !== result.turnId) this.activeTurns.set(k, result.turnId);
     const binding = this.directory.get(input.threadId, input.instanceId);
     if (binding) this.directory.upsert({ ...binding, status: "running", ...(result.resumeCursor !== undefined ? { resumeCursor: result.resumeCursor } : {}) });
+    this.directory.recordTurn(input.threadId, input.instanceId, result.turnId, startedAt);
     return { ...result, session: ensured };
   }
 
@@ -211,16 +228,67 @@ export class ProviderService {
     await adapter.compact(threadId);
   }
 
-  assertRollbackSupported(instanceId: InstanceId): void {
+  /**
+   * What putting (thread, instance)'s conversation back to `cutoff` (epoch ms)
+   * takes: nothing (no turn started since), dropping the whole native session,
+   * or a native rollback before the first turn started since. Throws, before
+   * anything changes, when it can't be done: the turns since the cutoff aren't
+   * known, or the provider can't roll back (t3code's
+   * assertConversationRollbackSupported, checked before files are touched).
+   */
+  planRollback(threadId: ThreadId, instanceId: InstanceId, cutoff: number, cwd: string): RollbackStep | null {
+    const binding = this.directory.get(threadId, instanceId);
+    if (!binding || binding.resumeCursor === null || binding.resumeCursor === undefined) return null;
     const adapter = this.adapter(instanceId, "rollback");
-    if (!adapter.capabilities.supportsConversationRollback || !adapter.rollbackThread)
-      throw new ProviderError("unsupported", "rollback", `${adapter.provider} cannot roll back its conversation`, { provider: adapter.provider });
+    const ledger = binding.turnLedger;
+    if (!ledger || (!ledger.fromStart && ledger.since > cutoff)) {
+      // Nothing has touched the binding since the cutoff, so no turn ran.
+      if (binding.lastSeenAt < cutoff) return null;
+      throw new ProviderError("unsupported", "rollback", `the turns ${adapter.provider} ran in this chat since then aren't on record, so its conversation can't be put back with the files`,
+        { provider: adapter.provider, instanceId, threadId });
+    }
+    const after = ledger.turns.filter(t => t.at >= cutoff);
+    const first = after[0];
+    if (!first) return null;
+    const everything = ledger.fromStart && ledger.turns[0]?.id === first.id;
+    if (!everything && (!adapter.capabilities.supportsConversationRollback || !adapter.rollbackThread))
+      throw new ProviderError("unsupported", "rollback", `${adapter.provider} cannot roll back its conversation`, { provider: adapter.provider, instanceId, threadId });
+    return { threadId, instanceId, provider: adapter.provider, beforeTurnId: everything ? null : first.id, turns: after.length,
+      cwd: binding.runtimePayload?.cwd ?? cwd, runtimeMode: binding.runtimeMode, ...(binding.runtimePayload?.model ? { model: binding.runtimePayload.model } : {}) };
   }
 
-  async rollback(threadId: ThreadId, instanceId: InstanceId, numTurns: number): Promise<ThreadSnapshot> {
-    this.assertRollbackSupported(instanceId);
-    if (!Number.isInteger(numTurns) || numTurns < 1) throw new ProviderError("validation", "rollback", "numTurns must be a positive integer");
-    return this.live(threadId, instanceId, "rollback").rollbackThread!(threadId, numTurns);
+  /**
+   * Carry out a planned rollback. Dropping everything forgets the native
+   * session (the next turn starts a new one); otherwise the session is resumed
+   * if it isn't live and the provider rolls it back. A native session that is
+   * already gone has nothing left to roll back.
+   */
+  async rollbackConversation(step: RollbackStep): Promise<void> {
+    const adapter = this.adapter(step.instanceId, "rollback");
+    if (this.activeTurn(step.threadId, step.instanceId))
+      throw new ProviderError("validation", "rollback", `a ${adapter.provider} turn is running in this chat`, { provider: adapter.provider, instanceId: step.instanceId, threadId: step.threadId });
+    const forget = async () => {
+      await this.stopSession(step.threadId, step.instanceId);
+      const b = this.directory.get(step.threadId, step.instanceId);
+      if (b) this.directory.upsert({ ...b, status: "stopped", resumeCursor: null, turnLedger: null });
+    };
+    if (step.beforeTurnId === null) return forget();
+    try {
+      await this.ensureSession({ threadId: step.threadId, instanceId: step.instanceId, cwd: step.cwd, runtimeMode: step.runtimeMode,
+        ...(step.model ? { model: step.model } : {}), onMissingSession: "fail" });
+    } catch (error) {
+      if (isProviderError(error, "session_missing")) return forget();
+      throw error;
+    }
+    const result = await adapter.rollbackThread!(step.threadId, step.beforeTurnId);
+    // Nothing of the native conversation is left.
+    if (result.resumeCursor === null) return forget();
+    const b = this.directory.get(step.threadId, step.instanceId);
+    if (!b) return;
+    const ledger = b.turnLedger;
+    const cut = ledger ? ledger.turns.findIndex(t => t.id === step.beforeTurnId) : -1;
+    this.directory.upsert({ ...b, resumeCursor: result.resumeCursor, status: result.live ? "running" : "stopped",
+      turnLedger: ledger ? { ...ledger, turns: cut < 0 ? ledger.turns : ledger.turns.slice(0, cut) } : null });
   }
 
   /** Stop one session. Its binding stays, marked stopped, so it can be resumed. */

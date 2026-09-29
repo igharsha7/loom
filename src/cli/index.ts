@@ -747,7 +747,8 @@ program
   .command("rewind [checkpoint]")
   .description("put the working tree back to a checkpoint (no argument lists them)")
   .option("-y, --yes", "don't ask")
-  .action(async (checkpoint: string | undefined, opts: { yes?: boolean }) => {
+  .option("--files-only", "leave the chat's Codex and Claude conversations as they are")
+  .action(async (checkpoint: string | undefined, opts: { yes?: boolean; filesOnly?: boolean }) => {
     const client = await ensureDaemon();
     const project = await currentProject(client);
     const { checkpoints } = await client.checkpoints(project.id);
@@ -772,15 +773,20 @@ program
     if (!opts.yes) {
       console.log(`${pc.yellow("!")} this puts the files back to ${pc.bold(target.label)}`);
       console.log(pc.dim("  anything written since is removed; commits, history and ignored files are untouched"));
+      if (!opts.filesOnly) console.log(pc.dim("  the chat's Codex and Claude conversations go back to that turn too (--files-only to keep them)"));
       console.log(pc.dim("  the rewind is itself saved, so it can be undone"));
       const ok = await confirm("rewind?");
       if (!ok) return;
     }
     try {
-      const out = await client.rewind(project.id, target.id);
+      const out = await client.rewind(project.id, target.id, opts.filesOnly ? { conversation: false } : {});
       console.log(
-        `${pc.green("✓")} rewound ${pc.dim(`· ${out.changed.length} file${out.changed.length === 1 ? "" : "s"} · undo with \`loom rewind ${out.undo.id}\``)}`,
+        `${pc.green("✓")} rewound ${pc.dim(`· ${out.changed.length} file${out.changed.length === 1 ? "" : "s"} · undo the files with \`loom rewind ${out.undo.id}\``)}`,
       );
+      for (const c of out.conversation ?? []) {
+        if (c.error) console.log(`${pc.yellow("!")} ${c.agentId}'s conversation stayed as it was: ${c.error}`);
+        else console.log(pc.dim(`  ${c.agentId}'s conversation went back ${c.turns} turn${c.turns === 1 ? "" : "s"}`));
+      }
     } catch (err) {
       console.error(pc.red(err instanceof Error ? err.message : String(err)));
       process.exitCode = 1;

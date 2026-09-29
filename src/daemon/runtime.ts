@@ -91,7 +91,7 @@ import { RuntimeAccounting } from './runtime/accounting.js';
 import { RuntimeAgents } from './runtime/agents.js';
 import { RuntimeBriefings } from './runtime/briefings.js';
 import { RuntimeQueue } from './runtime/queue.js';
-import { RuntimeTurns, type TurnOptions, type TurnResult } from './runtime/turns.js';
+import { RuntimeTurns, type RewindResult, type TurnOptions, type TurnResult } from './runtime/turns.js';
 import { ContinuityEngine } from "../core/continuity/engine.js";
 import { ContinuityError } from "../core/continuity/contracts.js";
 import { HarnessMonitor, isNativeKind } from "../core/continuity/capabilities.js";
@@ -1785,7 +1785,8 @@ export class ProjectRuntime {
 
   checkpoints(): Promise<checkpoints.Checkpoint[]> { return this.turns.checkpoints(); }
 
-  async rewind(id: string): Promise<checkpoints.RestoreResult> { return this.turns.rewind(id); }
+  /** Put the files back to a checkpoint, and the checkpoint's chat's conversations with them (see RuntimeTurns.rewind). */
+  async rewind(id: string, options: { conversation?: boolean } = {}): Promise<RewindResult> { return this.turns.rewind(id, options); }
 
   /** Put one file back as a checkpoint had it (see checkpoints.restoreFile). */
   async rewindFile(id: string, file: string): Promise<Awaited<ReturnType<typeof checkpoints.restoreFile>>> {

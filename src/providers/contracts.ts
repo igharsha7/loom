@@ -96,6 +96,17 @@ export interface ThreadSnapshot {
   turns: Array<{ id: TurnId; items: unknown[] }>;
 }
 
+/** What a conversation rollback left behind. */
+export interface RollbackResult {
+  /**
+   * What resumes the rolled-back conversation (a Claude rollback is a new,
+   * forked session); null when no turn is left and the next turn starts fresh.
+   */
+  resumeCursor: unknown;
+  /** Whether the session is still live afterwards; when false, the next turn resumes `resumeCursor`. */
+  live: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Canonical runtime events
 // ---------------------------------------------------------------------------

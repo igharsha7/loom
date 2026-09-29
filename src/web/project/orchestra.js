@@ -442,14 +442,25 @@ export function createOrchestra(view) {
       if (!window.confirm(
         "Put the files back to " + what + "?\n\n" +
         "Anything written since is removed, and anything removed since comes back. " +
+        "The chat's Codex and Claude conversations go back to that turn too. " +
         "Your commits, your history and files git ignores are untouched \u2014 and the rewind itself " +
         "is saved, so you can undo it."
       )) return;
       if (btn) btn.disabled = true;
-      api("/api/projects/" + view.pid + "/checkpoints/" + encodeURIComponent(id) + "/rewind", { method: "POST" })
+      var url = "/api/projects/" + view.pid + "/checkpoints/" + encodeURIComponent(id) + "/rewind";
+      api(url, { method: "POST" })
+        .catch(function(err){
+          // The chat's conversation can't go back with the files: offer the files alone.
+          if (err.code !== "conversation_refused" || !window.confirm(err.message + "\n\nPut the files back anyway, and leave the conversation as it is?")) throw err;
+          return api(url, { method: "POST", body: JSON.stringify({ conversation: false }) });
+        })
         .then(function(j){
           var n = (j && j.changed || []).length;
-          toast("rewound \u00b7 " + n + " file" + (n === 1 ? "" : "s"));
+          var turns = (j && j.conversation || []).reduce(function(a, c){ return a + (c.error ? 0 : c.turns); }, 0);
+          var failed = (j && j.conversation || []).filter(function(c){ return c.error; });
+          toast("rewound \u00b7 " + n + " file" + (n === 1 ? "" : "s") +
+            (turns ? " \u00b7 conversation back " + turns + " turn" + (turns === 1 ? "" : "s") : "") +
+            (failed.length ? " \u00b7 " + failed.map(function(c){ return c.agentId + "'s conversation stayed: " + c.error; }).join("; ") : ""));
           state.checkpoints = null;
           view.refreshTree(true);
           if (state.refreshExplorer) state.refreshExplorer();

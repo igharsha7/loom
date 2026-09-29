@@ -12,7 +12,7 @@
 
 import type {
   AdapterCapabilities, ApprovalDecision, InstanceId, ProviderKind, ProviderRuntimeEvent, ProviderSession,
-  RequestId, SendTurnInput, SessionStartInput, ThreadId, ThreadSnapshot, TurnId, TurnStartResult, UserInputAnswers,
+  RequestId, RollbackResult, SendTurnInput, SessionStartInput, ThreadId, ThreadSnapshot, TurnId, TurnStartResult, UserInputAnswers,
 } from "./contracts.js";
 
 export type RuntimeEventListener = (event: ProviderRuntimeEvent) => void;
@@ -34,7 +34,13 @@ export interface ProviderAdapter {
   /** Start a compaction; completion arrives as `thread.state.changed: compacted`. */
   compact?(threadId: ThreadId): Promise<void>;
   readThread?(threadId: ThreadId): Promise<ThreadSnapshot>;
-  rollbackThread?(threadId: ThreadId, numTurns: number): Promise<ThreadSnapshot>;
+  /**
+   * Drop `beforeTurnId` and every later turn from the live session's native
+   * conversation. t3code counts turns back from the end; Loom names the first
+   * turn to drop, because a chat's native turns and Loom's turns don't line up
+   * one to one (compaction turns, a provider switch in between).
+   */
+  rollbackThread?(threadId: ThreadId, beforeTurnId: TurnId): Promise<RollbackResult>;
   /** Stop one session and wait for its process to be gone. */
   stopSession(threadId: ThreadId): Promise<void>;
   stopAll(): Promise<void>;

@@ -157,6 +157,8 @@ export interface FakeCodexOptions {
   /** The model thread/start reports. */
   model?: string;
   version?: string;
+  /** The thread is on legacy history: thread/revert is refused, thread/rollback works. */
+  legacyHistory?: boolean;
 }
 
 const usage = (input: number, cached: number, output: number, reasoning = 0) =>
@@ -183,7 +185,7 @@ export function fakeCodex(options: FakeCodexOptions = {}): string {
   const dir = tmpDir("fake-codex"), bin = path.join(dir, "codex");
   const config = { script: options.script ?? CODEX_OK, scripts: options.scripts ?? [], missingThread: options.missingThread ?? false,
     refuseTurn: options.refuseTurn ?? null, dieAtStart: options.dieAtStart ?? null, model: options.model ?? "gpt-test",
-    version: options.version ?? "codex-cli 0.155.0" };
+    version: options.version ?? "codex-cli 0.155.0", legacyHistory: options.legacyHistory ?? false };
   fs.writeFileSync(bin, `#!/usr/bin/env node
 ${RUNNER}
 const config = ${JSON.stringify(config)};
@@ -195,6 +197,7 @@ if (config.dieAtStart) { process.stderr.write(config.dieAtStart.stderr + "\\n");
 const vars = { THREAD: "", TURN: "", SESSION: "" };
 const pending = new Map();
 let seq = 0, turns = 0, interrupted = false;
+const history = []; // this process's turn ids, as the thread holds them
 const reply = (id, result) => out({ id, result });
 async function run(script) {
   for (const step of script) {
@@ -232,6 +235,7 @@ require("node:readline").createInterface({ input: process.stdin }).on("line", (l
       // One app-server serves many turns on the same thread.
       turns++;
       vars.TURN = "turn-" + process.pid + "-" + turns;
+      history.push(vars.TURN);
       interrupted = false;
       record("turns.jsonl", { turn: turns, pid: process.pid, thread: vars.THREAD });
       reply(m.id, { turn: { id: vars.TURN, items: [], status: "inProgress", error: null } });
@@ -240,6 +244,20 @@ require("node:readline").createInterface({ input: process.stdin }).on("line", (l
     case "thread/compact/start":
       reply(m.id, {});
       return;
+    case "thread/revert": {
+      if (config.legacyHistory) return out({ id: m.id, error: { code: -32600, message: "thread uses legacy history" } });
+      const at = history.indexOf(m.params.beforeTurnId);
+      if (at < 0) return out({ id: m.id, error: { code: -32600, message: "unknown turn " + m.params.beforeTurnId } });
+      history.splice(at);
+      record("history.jsonl", { pid: process.pid, turns: history });
+      return reply(m.id, { thread: { id: vars.THREAD, turns: [] }, turnsBackwardsCursor: null, itemsBackwardsCursor: null });
+    }
+    case "thread/read":
+      return reply(m.id, { thread: { id: vars.THREAD, turns: history.map((id) => ({ id, items: [] })) } });
+    case "thread/rollback":
+      history.splice(Math.max(0, history.length - m.params.numTurns));
+      record("history.jsonl", { pid: process.pid, turns: history });
+      return reply(m.id, { thread: { id: vars.THREAD, turns: history.map((id) => ({ id, items: [] })) } });
     case "turn/interrupt":
       interrupted = true;
       reply(m.id, {});

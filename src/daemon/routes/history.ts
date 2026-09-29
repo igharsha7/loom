@@ -1,5 +1,6 @@
 import type { Express } from 'express';
 import type { WithRuntime } from './context.js';
+import { RewindRefused } from '../runtime/turns.js';
 /** Register history routes in the order established by LoomDaemon.routes(). */
 export function registerHistoryRoutes(app: Express, withRuntime: WithRuntime): void {
 
@@ -84,10 +85,13 @@ export function registerHistoryRoutes(app: Express, withRuntime: WithRuntime): v
   app.post(
     "/api/projects/:id/checkpoints/:cpId/rewind",
     withRuntime(async (rt, req, res) => {
+      // { conversation: false } puts the files back and leaves every conversation as it is.
+      const conversation = (req.body as { conversation?: unknown } | undefined)?.conversation !== false;
       try {
-        res.json(await rt.rewind(String(req.params.cpId)));
+        res.json(await rt.rewind(String(req.params.cpId), { conversation }));
       } catch (err) {
-        res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+        const code = err instanceof RewindRefused ? err.code : undefined;
+        res.status(code ? 409 : 400).json({ error: err instanceof Error ? err.message : String(err), ...(code ? { code } : {}) });
       }
     }),
   );

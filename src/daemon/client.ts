@@ -415,10 +415,14 @@ export class DaemonClient {
     return this.request("GET", `/api/projects/${encodeURIComponent(id)}/checkpoints`);
   }
 
-  rewind(id: string, checkpointId: string): Promise<RestoreResult> {
+  /** Files and (unless `conversation: false`) the checkpoint's chat's conversations. */
+  rewind(id: string, checkpointId: string, options: { conversation?: boolean } = {}): Promise<RestoreResult & {
+    conversation?: Array<{ agentId: string; provider: string; turns: number; error?: string }>;
+  }> {
     return this.request(
       "POST",
       `/api/projects/${encodeURIComponent(id)}/checkpoints/${encodeURIComponent(checkpointId)}/rewind`,
+      options.conversation === false ? { conversation: false } : undefined,
     );
   }
 

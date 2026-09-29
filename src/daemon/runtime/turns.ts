@@ -26,6 +26,19 @@ import type {
 import { MAIN_CHAT, isAdapter } from "../../types.js";
 import { planModeBriefing } from '../runtime-support.js';
 import { ProviderAgent } from "../../providers/agent.js";
+import type { ProviderKind } from "../../providers/contracts.js";
+import type { RollbackStep } from "../../providers/service.js";
+
+/** A rewind: the files put back, and each conversation that went back with them. */
+export interface RewindResult extends checkpoints.RestoreResult {
+  /** Per provider agent in the checkpoint's chat: turns dropped, or why its rollback failed. */
+  conversation: Array<{ agentId: string; provider: ProviderKind; turns: number; error?: string }>;
+}
+
+/** A rewind refused before anything changed, because a conversation can't go back with the files. */
+export class RewindRefused extends Error {
+  readonly code = "conversation_refused";
+}
 import { randomUUID } from "node:crypto";
 import { ContinuityError, NativeDispatchRejected } from "../../core/continuity/contracts.js";
 import type { ContinuityEngine } from "../../core/continuity/engine.js";
@@ -152,7 +165,7 @@ export class RuntimeTurns {
    * a project that isn't a git repo simply doesn't get one. What it must
    * never do is stop the turn.
    */
-  async checkpointBefore(agentId: string, prompt: string): Promise<void> {
+  async checkpointBefore(agentId: string, prompt: string, chat: string = MAIN_CHAT): Promise<void> {
     try {
       const label = prompt.replace(/\s+/g, " ").trim().slice(0, 120) || `a turn by ${agentId}`;
       const cp = await checkpoints.capture(this.host.agentDir(agentId), label);
@@ -162,10 +175,12 @@ export class RuntimeTurns {
       // client by "the checkpoint nearest above this card" would be right
       // until the day two turns interleave.
       this.turnCheckpoint.set(agentId, cp.id);
+      // The chat is what a rewind to this point rolls back.
       this.host.log.append({
         kind: "checkpoint",
         agentId,
-        payload: { id: cp.id, label: cp.label, at: cp.at, dirty: cp.dirty, branch: cp.branch, reason: "before_turn" },
+        ...(chat !== MAIN_CHAT ? { chat } : {}),
+        payload: { id: cp.id, label: cp.label, at: cp.at, dirty: cp.dirty, branch: cp.branch, reason: "before_turn", chat },
       });
     } catch {
       /* never the reason a turn doesn't run */
@@ -184,7 +199,7 @@ export class RuntimeTurns {
    * agent gives it a working directory that contradicts everything it has
    * read this turn, and the damage lands in whatever it writes next.
    */
-  async rewind(id: string): Promise<checkpoints.RestoreResult> {
+  async rewind(id: string, options: { conversation?: boolean } = {}): Promise<RewindResult> {
     if (this.host.continuity?.store.activeReceipts().length)
       throw new ContinuityError("recovery_required", "finish or reconcile native writers before rewinding files");
     const busy = [...this.busySince.keys()];
@@ -193,9 +208,39 @@ export class RuntimeTurns {
         `${busy.join(", ")} ${busy.length === 1 ? "is" : "are"} mid-turn — stop the turn first, or the rewind lands underneath it`,
       );
     }
+    // A checkpoint taken before a turn also puts that chat's conversations
+    // back: every Codex and Claude session in it drops the turns it ran since
+    // (t3code's checkpoint revert). All of it is planned before any file moves,
+    // so a conversation that can't be rolled back refuses the whole rewind.
+    const chat = options.conversation === false ? null : this.checkpointChat(id);
+    const cutoff = checkpoints.capturedAt(id);
+    const steps: Array<{ agent: ProviderAgent; step: RollbackStep }> = [];
+    if (chat !== null && cutoff !== null) {
+      for (const agent of this.host.agents.values()) {
+        if (!(agent instanceof ProviderAgent)) continue;
+        let step: RollbackStep | null;
+        try { step = await agent.planRollback(chat, cutoff); }
+        catch (error) {
+          throw new RewindRefused(`${agent.id}: ${error instanceof Error ? error.message : String(error)}. Nothing was changed; rewind the files alone to leave the conversation as it is.`);
+        }
+        if (step) steps.push({ agent, step });
+      }
+    }
     const out = await checkpoints.restore(this.host.info.dir, id);
+    // The files are back; a conversation that fails now is reported, and the
+    // rewind itself can still be undone.
+    const conversation: RewindResult["conversation"] = [];
+    for (const { agent, step } of steps) {
+      try {
+        await agent.rollbackConversation(step);
+        conversation.push({ agentId: agent.id, provider: step.provider, turns: step.turns });
+      } catch (error) {
+        conversation.push({ agentId: agent.id, provider: step.provider, turns: 0, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
     this.host.log.append({
       kind: "checkpoint",
+      ...(chat && chat !== MAIN_CHAT ? { chat } : {}),
       payload: {
         id: out.restored.id,
         label: out.restored.label,
@@ -203,9 +248,19 @@ export class RuntimeTurns {
         reason: "rewound",
         files: out.changed.length,
         undo: out.undo.id,
+        ...(chat ? { chat } : {}),
+        ...(conversation.length ? { conversation } : {}),
       },
     });
-    return out;
+    return { ...out, conversation };
+  }
+
+  /** The chat whose turn a checkpoint was taken before; null for other checkpoints (a rewind's undo point). */
+  private checkpointChat(id: string): string | null {
+    const taken = this.host.log.list({ kinds: ["checkpoint"] })
+      .find((e) => e.payload.id === id && e.payload.reason === "before_turn");
+    if (!taken) return null;
+    return typeof taken.payload.chat === "string" ? taken.payload.chat : taken.chat ?? MAIN_CHAT;
   }
 
   /** What an agent's last turn changed — for route step conditions. */
@@ -435,7 +490,7 @@ export class RuntimeTurns {
       // …and a checkpoint you can actually go back to. The porcelain snapshot
       // above only says *which* paths changed; this holds their content, so
       // "undo what that turn did" is a click rather than a re-typing (#101).
-      await this.checkpointBefore(target, text);
+      await this.checkpointBefore(target, text, chat);
       // Fire-and-notify: the turn runs in the background; progress streams
       // into the log and completion lands as run_complete.
       if (!this.host.isCurrentAgent(agent)) throw new Error(`agent "${target}" is no longer active`);
@@ -516,7 +571,7 @@ export class RuntimeTurns {
       if (!this.host.isCurrentAgent(agent)) throw new Error("native target was replaced before dispatch");
       // Snapshot/checkpoint is complete before the frozen context is observed.
       this.preTurnTree.set(target, await porcelainStatus(this.host.agentDir(target)));
-      await this.checkpointBefore(target, text);
+      await this.checkpointBefore(target, text, chat);
       assertPrepared();
       const nativePlan = Boolean(opts.plan) && agent instanceof ProviderAgent;
       const supplement = [this.host.agentInstructions(target), this.host.activeSkillsBlock(), opts.plan && !nativePlan ? planModeBriefing(text) : "", lengthLine(opts.length)].filter(Boolean).join("\n");

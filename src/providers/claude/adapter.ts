@@ -25,14 +25,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import {
-  query, type CanUseTool, type McpServerConfig, type Options, type PermissionResult, type PermissionUpdate, type Query, type SDKMessage,
+  forkSession, getSessionMessages, query, type CanUseTool, type McpServerConfig, type Options, type PermissionResult, type PermissionUpdate, type Query, type SDKMessage,
   type SDKUserMessage, type SpawnedProcess,
 } from "@anthropic-ai/claude-agent-sdk";
 import { guardNativeOutput } from "../../adapters/base.js";
 import { EventHub, type ProviderAdapter } from "../adapter.js";
 import type {
   AdapterCapabilities, ApprovalDecision, CanonicalItemType, CanonicalRequestType, InstanceId, ItemLifecyclePayload,
-  ProviderRuntimeEvent, ProviderSession, RequestId, RuntimeEventPayloads, RuntimeEventType, RuntimeMode, SendTurnInput,
+  ProviderRuntimeEvent, ProviderSession, RequestId, RollbackResult, RuntimeEventPayloads, RuntimeEventType, RuntimeMode, SendTurnInput,
   SessionStartInput, ThreadId, TurnId, TurnStartResult, UserInputAnswers, UserInputQuestion,
 } from "../contracts.js";
 import { ProviderError } from "../errors.js";
@@ -51,7 +51,19 @@ export interface ClaudeAdapterOptions {
   canAsk?: () => boolean;
   /** How long to wait for the CLI to initialize. */
   startTimeoutMs?: number;
+  /** Session history access (the SDK's getSessionMessages/forkSession); replaced in tests. */
+  history?: ClaudeHistory;
 }
+
+export interface ClaudeHistory {
+  messages(sessionId: string, dir: string): Promise<Array<{ type: string; uuid: string }>>;
+  fork(sessionId: string, dir: string, upToMessageId: string): Promise<{ sessionId: string }>;
+}
+
+const sdkHistory: ClaudeHistory = {
+  messages: (sessionId, dir) => getSessionMessages(sessionId, { dir, includeSystemMessages: true }),
+  fork: (sessionId, dir, upToMessageId) => forkSession(sessionId, { dir, upToMessageId }),
+};
 
 /**
  * Where `claude` lives when it isn't on PATH. The installer puts it in
@@ -197,7 +209,7 @@ interface Session {
 
 export class ClaudeProviderAdapter implements ProviderAdapter {
   readonly provider = "claude-code" as const;
-  readonly capabilities: AdapterCapabilities = { sessionModelSwitch: "in-session", supportsConversationRollback: false, manualCompaction: false };
+  readonly capabilities: AdapterCapabilities = { sessionModelSwitch: "in-session", supportsConversationRollback: true, manualCompaction: false };
   private readonly sessions = new Map<ThreadId, Session>();
   private readonly hub = new EventHub<ProviderRuntimeEvent>();
 
@@ -462,6 +474,35 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     const s = this.session(threadId, "respondToUserInput");
     if (!this.resolveInput(s, requestId, answers))
       throw new ProviderError("not_found", "respondToUserInput", `no open claude question "${requestId}"`, { provider: this.provider, threadId });
+  }
+
+  /**
+   * Claude has no in-place rollback: the session is forked just before the
+   * dropped turn's user message (whose uuid is the turn id, set in sendTurn),
+   * this session ends, and the next turn resumes the fork. The original
+   * session file is left as it was. (t3code's rollbackThread, which finds the
+   * same boundary through its recorded turn-start message ids.)
+   */
+  async rollbackThread(threadId: ThreadId, beforeTurnId: TurnId): Promise<RollbackResult> {
+    const s = this.session(threadId, "rollbackThread");
+    const fail = (message: string, cause?: unknown) => new ProviderError("request", "rollbackThread", message,
+      { provider: this.provider, instanceId: this.instanceId, threadId, cause });
+    if (s.turn) throw new ProviderError("validation", "rollbackThread", "a claude turn is running in this chat",
+      { provider: this.provider, instanceId: this.instanceId, threadId });
+    const history = this.options.history ?? sdkHistory;
+    let messages: Array<{ type: string; uuid: string }>;
+    try { messages = await history.messages(s.sessionId, s.info.cwd); }
+    catch (error) { throw fail(`claude's session history could not be read: ${(error as Error).message}`, error); }
+    const index = messages.findIndex(m => m.uuid === beforeTurnId);
+    if (index < 0) throw fail("the turn isn't in claude's session history (compaction replaces it), so the conversation can't be put back to before it");
+    const keepThrough = index > 0 ? messages[index - 1]!.uuid : null;
+    let resumeCursor: string | null = null;
+    if (keepThrough) {
+      try { resumeCursor = (await history.fork(s.sessionId, s.info.cwd, keepThrough)).sessionId; }
+      catch (error) { throw fail(`claude could not fork its session: ${(error as Error).message}`, error); }
+    }
+    await this.stopSession(threadId);
+    return { resumeCursor, live: false };
   }
 
   async stopSession(threadId: ThreadId): Promise<void> {

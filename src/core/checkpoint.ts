@@ -215,6 +215,13 @@ export async function list(dir: string): Promise<Checkpoint[]> {
   return rows.sort((a, b) => (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
 }
 
+/** When a checkpoint was captured (epoch ms), read from its id; null for an id that isn't one. */
+export function capturedAt(id: string): number | null {
+  if (!/^c[a-z0-9]+$/.test(id)) return null;
+  const ms = parseInt(id.slice(1), 36);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 export async function find(dir: string, id: string): Promise<Checkpoint | null> {
   if (!/^c[a-z0-9]+$/.test(id)) return null;
   return (await list(dir)).find((c) => c.id === id) ?? null;
