@@ -22,7 +22,7 @@
 
 import path from "node:path";
 import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
-import { AdapterBase, ADAPTER_CAPABILITIES, cliAvailable, frameBriefing } from "../adapters/base.js";
+import { AdapterBase, ADAPTER_CAPABILITIES, cliAvailable, cliOutput, firstLine, frameBriefing, type AgentCheck } from "../adapters/base.js";
 import { hasApprovalBroker } from "../core/approvals.js";
 import { NativeDispatchRejected, NativeQuiescenceUnknown, NativeSessionMissing } from "../core/continuity/contracts.js";
 import { permissionFor } from "../core/permissions.js";
@@ -196,6 +196,26 @@ export class ProviderAgent extends AdapterBase {
     const bin = this.bin;
     return bin ? cliAvailable(bin) : false;
   }
+  /** Installed, and (Codex) signed in — asked of the CLI itself, no turn spent. */
+  async selfCheck(): Promise<AgentCheck[]> {
+    const bin = this.bin;
+    const name = this.provider === "codex" ? "codex" : "claude";
+    if (!bin) return [{ name: "installed", ok: false, detail: `${name} CLI not found — install it${this.provider === "codex" ? " or open Codex.app once" : ""}` }];
+    const v = await cliOutput(bin, ["--version"]);
+    const checks: AgentCheck[] = [
+      { name: "installed", ok: v?.code === 0, detail: v?.code === 0 ? firstLine(v.out) || bin : `${name} didn't answer --version` },
+    ];
+    if (this.provider === "codex") {
+      const s = await cliOutput(bin, ["login", "status"]);
+      checks.push({
+        name: "signed in",
+        ok: s?.code === 0,
+        detail: s ? firstLine(s.out) || (s.code === 0 ? "signed in" : "not signed in — run: codex login") : "couldn't ask codex",
+      });
+    }
+    return checks;
+  }
+
 
   async start(): Promise<void> {
     this.emit({ kind: "status", payload: { state: "ready" } });

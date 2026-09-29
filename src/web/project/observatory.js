@@ -3,6 +3,8 @@ import { esc,money } from '../format.js';
 import { ICONS,LOADER } from '../icons.js';
 import { toast } from '../notifications.js';
 import { state } from '../state.js';
+import { avatarFor,durfmt } from '../transcript.js';
+import { labelOf } from '../agents.js';
 
 /** observatory behavior for one mounted project.
  * view contains live accessors to the owning project view's state and callbacks.
@@ -306,6 +308,7 @@ export function createObservatory(view) {
         // nobody asked separately from "what is this costing me".
         body = renderKairoMetrics(state.obKairo || {}) + obCharts(p, events, byAgent) +
           observatoryMetricsDetail(p, events, byAgent, state.obHealth || {}) +
+          '<div id="obboard" class="obasync">' + LOADER + "</div>" +
           '<div id="obburn" class="obasync">' + LOADER + "</div>" +
           '<div id="obmex" class="obasync">' + LOADER + "</div>";
       else if (state.obView === "decisions") body = '<div id="obdecisions" class="obasync">' + LOADER + "</div>";
@@ -388,7 +391,7 @@ export function createObservatory(view) {
       if (askBtn) askBtn.onclick = function(){ state.obAsk.open = !state.obAsk.open; renderAskPanel(); };
       renderAskPanel();
       if (state.obView === "canvas" || state.obView === "graph") wireObservatoryDrag(el);
-      if (state.obView === "metrics") observatoryBurn(p);
+      if (state.obView === "metrics") { observatoryBoard(p); observatoryBurn(p); }
       if (state.obView === "metrics") observatoryMetricExplorer(p);
       if (state.obView === "decisions") observatoryDecisions(p);
       if (state.obView === "logs") observatoryLogs(p);
@@ -470,6 +473,68 @@ export function createObservatory(view) {
     function traceUiLink(){
       var b = backendBase();
       return b ? '<a class="obtraceui" href="' + b + '" target="_blank" rel="noreferrer">' + ICONS.route + " View traces</a>" : "";
+    }
+    // LEADERBOARD + HEATMAP: every turn off the log — who finishes, how fast,
+    // what a turn costs — and twelve weeks of activity, a square a day.
+    function observatoryBoard(p){
+      var host = document.getElementById("obboard"); if (!host) return;
+      api("/api/projects/" + p.id + "/insights/turns?days=84").then(function(r){
+        if (!document.getElementById("obboard")) return;
+        var lb = r.leaderboard || [], days = r.days || [];
+        var rows = lb.length ? lb.map(function(a, i){
+          var pct = Math.round((a.successRate || 0) * 100);
+          var tone = pct >= 90 ? "ok" : pct >= 70 ? "warn" : "bad";
+          return '<tr><td class="lbrank">' + (i + 1) + '</td><td><span class="lbwho">' + avatarFor(a.agentId) + esc(labelOf(a.agentId)) + "</span></td>" +
+            '<td class="num">' + a.turns + '</td><td><span class="lbbar ' + tone + '"><i style="width:' + pct + '%"></i></span><span class="num">' + pct + "%</span></td>" +
+            '<td class="num">' + (a.medianMs != null ? durfmt(a.medianMs) : "—") + "</td>" +
+            '<td class="num">' + (a.avgCostUsd != null ? money(a.avgCostUsd) : "—") + '</td><td class="num">' + money(a.totalCostUsd || 0) + "</td>" +
+            '<td class="num lbrated">' + (a.rated ? '<span class="up">' + a.rated.up + '</span> · <span class="dn">' + a.rated.down + "</span>" : "—") + "</td></tr>";
+        }).join("") : '<tr><td colspan="8" class="lbempty">No finished turns yet — the table fills in as agents work.</td></tr>';
+        // the heatmap: weeks as columns, Monday on top
+        var max = 1; days.forEach(function(d){ if (d.turns > max) max = d.turns; });
+        var first = days.length ? new Date(days[0].date + "T00:00:00") : new Date();
+        var pad = (first.getDay() + 6) % 7, cells = [];
+        for (var k = 0; k < pad; k++) cells.push('<i class="hm pad"></i>');
+        days.forEach(function(d){
+          var lvl = d.turns ? Math.min(4, 1 + Math.floor((d.turns / max) * 3.999)) : 0;
+          cells.push('<i class="hm l' + lvl + (d.errors ? " err" : "") + '" title="' + esc(new Date(d.date + "T00:00:00").toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" }) +
+            " · " + d.turns + " turn" + (d.turns === 1 ? "" : "s") + (d.errors ? " (" + d.errors + " failed)" : "") + (d.costUsd ? " · " + money(d.costUsd) : "")) + '"></i>');
+        });
+        var active = days.filter(function(d){ return d.turns; }).length;
+        // this month so far, and where this month's pace ends up
+        var now = new Date(), ym = now.getFullYear() + "-" + String(now.getMonth() + 1).padStart(2, "0");
+        var month = days.filter(function(d){ return d.date.slice(0, 7) === ym; });
+        var spent = month.reduce(function(a, d){ return a + (d.costUsd || 0); }, 0);
+        var dim = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate(), dayN = now.getDate();
+        var pace = dayN ? spent / dayN : 0, forecast = spent + pace * (dim - dayN);
+        host.innerHTML =
+          '<div class="burnstats monthstats">' +
+            '<div class="obminicard"><div class="obcl">This month so far</div><div class="obcv sm">' + money(spent) + "</div></div>" +
+            '<div class="obminicard"><div class="obcl">Daily average</div><div class="obcv sm">' + money(pace) + "</div></div>" +
+            '<div class="obminicard" title="this month’s spend so far, plus the daily average for the days left"><div class="obcl">Month-end at this pace</div><div class="obcv sm">' + money(forecast) + "</div></div></div>" +
+          '<div class="obmlabel lbhead">Agent leaderboard<span class="spacer"></span>' +
+            '<button type="button" class="btn xs outline" id="turnscsv">' + ICONS.download + "Export turns (CSV)</button></div>" +
+          '<div class="lbwrap"><table class="lbtable"><thead><tr><th>#</th><th>Agent</th><th class="num">Turns</th><th>Finished cleanly</th><th class="num">Median time</th><th class="num">Per turn</th><th class="num">Total</th><th class="num" title="your thumbs up and down on its replies">You rated</th></tr></thead><tbody>' + rows + "</tbody></table></div>" +
+          '<div class="obmlabel" style="margin-top:18px">Activity · last 12 weeks<span class="hmsum">' + (r.total || 0) + " turns · active " + active + " of " + days.length + " days</span></div>" +
+          '<div class="hmgrid" role="img" aria-label="turns per day for twelve weeks">' + cells.join("") + "</div>" +
+          '<div class="hmkey">Less <i class="hm l0"></i><i class="hm l1"></i><i class="hm l2"></i><i class="hm l3"></i><i class="hm l4"></i> More<span class="spacer"></span><i class="hm l2 err"></i> a day with a failed turn</div>';
+        var csv = document.getElementById("turnscsv");
+        if (csv) csv.onclick = function(){
+          csv.disabled = true;
+          fetch("/api/projects/" + p.id + "/insights/turns.csv", { headers: { Authorization: "Bearer " + state.token } })
+            .then(function(res){ if (!res.ok) throw new Error("export failed (" + res.status + ")"); return res.blob(); })
+            .then(function(blob){
+              var a = document.createElement("a");
+              a.href = URL.createObjectURL(blob);
+              a.download = String(p.name || "loom").replace(/[^\w.-]+/g, "-") + "-turns.csv";
+              document.body.appendChild(a); a.click(); a.remove();
+              setTimeout(function(){ URL.revokeObjectURL(a.href); }, 4000);
+              toast("exported " + a.download);
+            })
+            .catch(function(err){ toast(err.message); })
+            .then(function(){ csv.disabled = false; });
+        };
+      }).catch(function(err){ if (host) host.innerHTML = '<div class="obnote">Couldn’t read turns: ' + esc(err.message) + "</div>"; });
     }
 
     // BURN: per-agent cost over time (real ClickHouse), linear projection, budgets.

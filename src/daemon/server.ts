@@ -10,6 +10,7 @@ import {
   type ApprovalDecision
 } from "../core/approvals.js";
 import { logbook } from "../core/logbook.js";
+import { hostedTarget } from "../core/hosted.js";
 import {
   ensureDaemonConfig,
   ensureLoomHome,
@@ -290,6 +291,22 @@ export class LoomDaemon {
     };
 
     const app = this.app;
+    app.disable("x-powered-by");
+    // Headers every response carries. No full CSP: the app shell is one
+    // inline document by design. What it does get: no MIME sniffing, no
+    // referrer leaking a token-bearing URL to a site you click through to,
+    // and only Loom itself may frame the app (the Browser tab's previews
+    // are same-origin, so they keep working).
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      res.setHeader("Referrer-Policy", "no-referrer");
+      res.setHeader("Permissions-Policy", "geolocation=(), payment=(), usb=(), serial=(), bluetooth=()");
+      if (req.path === "/app" || req.path === "/") {
+        res.setHeader("X-Frame-Options", "SAMEORIGIN");
+        res.setHeader("Content-Security-Policy", "frame-ancestors 'self'");
+      }
+      next();
+    });
 
     app.use(express.json({ limit: "2mb" }));
 
@@ -414,6 +431,23 @@ export class LoomDaemon {
     registerBoardRoutes(app, ctx, withRuntime);
     registerIntegrationsProjectRoutes(app);
     registerFilesRoutes(app);
+
+    // Anything under /api nobody answered: JSON, like every other API reply,
+    // not Express's HTML page.
+    app.use("/api", (_req: Request, res: Response) => {
+      res.status(404).json({ error: "no such endpoint" });
+    });
+    // Errors that escaped a route, and bodies that never parsed. Express's
+    // default answers these with an HTML page carrying a stack trace.
+    app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+      if (res.headersSent) return void next(err);
+      const e = (err ?? {}) as { type?: string; status?: number; message?: string };
+      if (e.type === "entity.too.large") return void res.status(413).json({ error: "that request is too large (the limit is 2 MB)" });
+      if (e.type === "entity.parse.failed") return void res.status(400).json({ error: "that request body isn't valid JSON" });
+      logbook.error("daemon", `request failed: ${e.message ?? String(err)}`, err);
+      const status = typeof e.status === "number" && e.status >= 400 && e.status < 600 ? e.status : 500;
+      res.status(status).json({ error: status >= 500 ? "something went wrong in the daemon — the Console has the details" : e.message || "bad request" });
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -452,7 +486,39 @@ export class LoomDaemon {
     rt.onLiveDelta((d) => {
       this.broadcastFrame({ type: "phase" in d ? "item" : "delta", projectId: info.id, ...d }, info.id);
     });
+    // Replies as they're written. Deltas are coalesced per agent for a frame
+    // (~40ms), so a fast model is a few dozen socket frames a second at most,
+    // not one per token. Never logged: the finished message is the record.
+    const live = new Map<string, { chat: string; text: string; reasoning: boolean; off?: number }>();
+    let liveTimer: NodeJS.Timeout | null = null;
+    const flushLive = () => {
+      liveTimer = null;
+      for (const [agentId, f] of live) {
+        this.broadcastFrame({
+          type: "stream", projectId: info.id, agentId, chat: f.chat, text: f.text,
+          ...(f.reasoning ? { reasoning: true } : {}),
+          ...(f.off !== undefined ? { off: f.off } : {}),
+        }, info.id);
+      }
+      live.clear();
+    };
+    rt.onStream((f) => {
+      const key = f.agentId;
+      const have = live.get(key);
+      // A switch between thinking and answering (or thread) is a new piece.
+      if (have && (have.reasoning !== Boolean(f.reasoning) || have.chat !== f.chat)) flushLive();
+      const cur = live.get(key);
+      if (cur) cur.text += f.text;
+      else live.set(key, { chat: f.chat, text: f.text, reasoning: Boolean(f.reasoning), ...(f.off !== undefined ? { off: f.off } : {}) });
+      if (!liveTimer) liveTimer = setTimeout(flushLive, 40);
+    });
     rt.log.onEvent((e) => {
+      // A finished message supersedes its typing: send what's buffered first
+      // so the last few characters can't land after the message they belong to.
+      if (e.kind === "message" && e.agentId && live.has(e.agentId)) {
+        if (liveTimer) clearTimeout(liveTimer);
+        flushLive();
+      }
       this.broadcast(info.id, e);
       // The single central hook for live events — agent turns as well as
       // API-driven handoffs, routes and memory folds. Rehydration reads through
@@ -689,8 +755,11 @@ export class LoomDaemon {
       if (recovered) {
         rt.unquarantine(agent);
         const retried = rt.baton.holder() !== agent;
-        if (retried) await rt.handoff(agent).catch(() => { });
-        rt.log.append({ kind: "status", agentId: agent, payload: { state: "alert_recovery", alert, retried, attempt, via: "recheck" } });
+        // A hand-back that's refused (the stand-in is mid-turn, say) is part
+        // of what happened; recording "recovered" without it reads as done.
+        let handBack: string | undefined;
+        if (retried) await rt.handoff(agent).catch((err: unknown) => { handBack = err instanceof Error ? err.message : String(err); });
+        rt.log.append({ kind: "status", agentId: agent, payload: { state: "alert_recovery", alert, retried, attempt, via: "recheck", ...(handBack ? { handBackFailed: handBack } : {}) } });
         return;
       }
       if (attempt >= maxRetries) {
@@ -743,6 +812,7 @@ export class LoomDaemon {
       clients: this.relay?.clientCount() ?? 0,
       stats: this.relay?.stats ?? null,
       supabaseUrl: target?.url ?? null,
+      hostedUrl: hostedTarget().supabaseUrl,
       error: this.relayError,
     };
   }
@@ -827,10 +897,16 @@ export class LoomDaemon {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
     this.extra.clear();
+    // Close the live sockets too. wss.close() stops new connections but leaves
+    // open ones open, and server.close() waits for every keep-alive socket a
+    // browser holds — so a restart used to leave the old daemon alive forever,
+    // its port freed but the process (and everything it held) still running.
+    for (const ws of this.wss?.clients ?? []) ws.terminate();
     this.wss?.close();
     await new Promise<void>((resolve) => {
       if (!this.server) return resolve();
       this.server.close(() => resolve());
+      this.server.closeAllConnections?.();
     });
     const cfg = readDaemonConfig();
     if (cfg && cfg.pid === process.pid) {

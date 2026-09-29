@@ -3,11 +3,11 @@ import { api } from '../connection.js';
 import { clog } from '../console.js';
 import { esc,money,pageGone,rel } from '../format.js';
 import { ICONS,LOADER } from '../icons.js';
-import { toast } from '../notifications.js';
+import { askConfirm,askText,fitMenu,toast } from '../notifications.js';
 import { modelBadge,permBadge,permOf } from '../permissions.js';
 import { state } from '../state.js';
 import { fleetSince,jobProgressText,loadTeam,onlineRunners,runnerAct,runnerName,teamGlobs,teamGoalOf,teamRunners } from '../team.js';
-import { LAND_ST,ORCH_RUN_ST,ORCH_TASK_ST,landPill } from '../transcript.js';
+import { durfmt,emptyArt,LAND_ST,landPill,ORCH_RUN_ST,ORCH_TASK_ST,plainPreview } from '../transcript.js';
 
 /** orchestra behavior for one mounted project.
  * view contains live accessors to the owning project view's state and callbacks.
@@ -24,10 +24,22 @@ export function createOrchestra(view) {
       var p = state.project || {};
       return (p.agents || []).filter(function(a){ return a.tier === "adapter" && a.enabled !== false; });
     }
+    // The cast is remembered per project: a reload used to reset it to "every
+    // agent", and the next Orchestrate quietly ran agents you'd left out.
+    var ORCH_KEY = "loomOrch:" + view.pid;
+    function saveOrchCfg(c){
+      try { localStorage.setItem(ORCH_KEY, JSON.stringify({ orchestrator: c.orchestrator, off: c.off, parallel: c.parallel, race: !!c.race })); } catch (e) {}
+    }
 
     function orchCfg(){
       var roster = orchRoster();
-      var c = state.orchCfg || (state.orchCfg = { orchestrator: null, off: {}, parallel: 4 });
+      if (!state.orchCfg || state.orchCfg.pid !== view.pid) {
+        var saved = null;
+        try { saved = JSON.parse(localStorage.getItem(ORCH_KEY) || "null"); } catch (e) { saved = null; }
+        state.orchCfg = { pid: view.pid, orchestrator: (saved && saved.orchestrator) || null, off: (saved && saved.off) || {},
+          parallel: Math.max(1, Math.min(12, Number(saved && saved.parallel) || 4)), race: !!(saved && saved.race) };
+      }
+      var c = state.orchCfg;
       var ids = roster.map(function(a){ return a.id; });
       // Claude Code conducts by default when it's here; otherwise whoever's first.
       if (!c.orchestrator || ids.indexOf(c.orchestrator) < 0) {
@@ -89,31 +101,54 @@ export function createOrchestra(view) {
     function drawOrchControls(){
       var el = document.getElementById("corch"); if (!el || state.cmode !== "orch") return;
       var roster = orchRoster(), c = orchCfg();
+      saveOrchCfg(c); // every change to the cast ends in a redraw, so this keeps it
       if (!roster.length) {
         el.innerHTML = '<span class="colbl">No adapters in this project \u2014 add an agent to orchestrate</span>';
         return;
       }
       var lead = roster.filter(function(a){ return a.id === c.orchestrator; })[0] || roster[0];
-      el.innerHTML =
-        '<span class="colbl">Orchestrator</span>' +
+      var modeSeg = '<span class="corace" role="group" aria-label="how to run the goal">' +
+        '<button type="button" data-omode="plan" class="' + (c.race ? "" : "on") + '" title="one agent plans the goal and the team works it">Plan &amp; split</button>' +
+        '<button type="button" data-omode="race" class="' + (c.race ? "on" : "") + '" title="every checked agent gets the same prompt in its own worktree — you compare and pick one">' + ICONS.play + "Race</button></span>";
+      if (c.race) {
+        el.innerHTML = modeSeg +
+          '<span class="colbl" title="each gets the same prompt, in its own worktree">Racers</span>' +
+          '<span class="cowk" id="cowk">' + roster.map(function(a){
+            var on = !c.off[a.id];
+            return '<button type="button" class="cowchip' + (on ? " on" : "") + '" data-wk="' + esc(a.id) + '" aria-pressed="' + on + '"><span class="cwon">' + (on ? ICONS.check : "") + "</span>" +
+              agentGlyph(a.kind, a.id) + '<span class="cwn">' + esc(agentLabel(a.kind, a.id)) + '</span><span class="cwset">' + modelBadge(a) + permBadge(permOf(a), a.id) + "</span></button>";
+          }).join("") + "</span>";
+        Array.prototype.forEach.call(el.querySelectorAll("[data-wk]"), function(b){
+          b.onclick = function(){ var id = b.getAttribute("data-wk"); c.off[id] = !c.off[id]; drawOrchControls(); };
+        });
+        Array.prototype.forEach.call(el.querySelectorAll("[data-omode]"), function(b){
+          b.onclick = function(){ c.race = b.getAttribute("data-omode") === "race"; drawOrchControls(); };
+        });
+        wirePermBadges(el); wireModelBadges(el);
+        var osb = document.getElementById("orchsend"); if (osb) osb.title = "start the race";
+        return;
+      }
+      el.innerHTML = modeSeg +
+        '<span class="colbl" title="plans the goal, splits it into tasks, reviews the results">Lead</span>' +
         '<button class="cagent" id="corchpick" type="button" title="who plans the goal and reviews the results">' +
           agentGlyph(lead.kind, lead.id) + '<span class="can">' + esc(agentLabel(lead.kind, lead.id)) + "</span>" +
           permBadge(permOf(lead), lead.id) + modelBadge(lead) +
           '<span class="cchev">' + ICONS.chevron + "</span></button>" +
-        '<span class="colbl">Workers</span>' +
+        '<span class="colbl" title="who can be given tasks \u2014 click to include or leave out">Team</span>' +
         '<span class="cowk" id="cowk">' + roster.map(function(a){
           var on = !c.off[a.id];
           return '<button type="button" class="cowchip' + (on ? " on" : "") + '" data-wk="' + esc(a.id) + '" aria-pressed="' + on + '" title="' +
-            esc(a.id + (a.role ? " \u00b7 " + a.role : "")) + '">' + agentGlyph(a.kind, a.id) + esc(agentLabel(a.kind, a.id)) +
-            // each worker's mode and model, changeable without leaving the row
-            permBadge(permOf(a), a.id) + modelBadge(a) + "</button>";
+            esc((on ? "included \u2014 click to leave out" : "left out \u2014 click to include") + " \u00b7 " + a.id) + '"><span class="cwon">' + (on ? ICONS.check : "") + "</span>" +
+            agentGlyph(a.kind, a.id) + '<span class="cwn">' + esc(agentLabel(a.kind, a.id)) + "</span>" +
+            // each worker's model and mode, in their own zone of the chip
+            '<span class="cwset">' + modelBadge(a) + permBadge(permOf(a), a.id) + "</span></button>";
         }).join("") +
           // A roster of CLIs is whatever you happen to have installed. An API
           // model is a name off a list, so it can be added here, in the row
           // where you are already deciding who runs the goal.
           '<button type="button" class="cowchip cowadd" id="cowadd" title="add an API model as a worker">' +
             ICONS.plus + "model</button>" + "</span>" +
-        '<span class="colbl">Parallel</span>' +
+        '<span class="colbl" title="how many tasks run at the same time">At once</span>' +
         '<span class="cstep" title="how many tasks run at once"><button type="button" data-step="-1" aria-label="fewer in parallel"' + (c.parallel <= 1 ? " disabled" : "") + ">\u2212</button>" +
           '<span class="cpar" id="cpar">' + c.parallel + "</span>" +
           '<button type="button" data-step="1" aria-label="more in parallel"' + (c.parallel >= 12 ? " disabled" : "") + ">+</button></span>" +
@@ -140,6 +175,9 @@ export function createOrchestra(view) {
           c.parallel = Math.max(1, Math.min(12, c.parallel + Number(b.getAttribute("data-step"))));
           drawOrchControls();
         };
+      });
+      Array.prototype.forEach.call(el.querySelectorAll("[data-omode]"), function(b){
+        b.onclick = function(){ c.race = b.getAttribute("data-omode") === "race"; drawOrchControls(); };
       });
       wirePermBadges(el);
       wireModelBadges(el);
@@ -212,7 +250,7 @@ export function createOrchestra(view) {
       var roster = orchRoster(), c = orchCfg();
       var m = document.getElementById("cmenu"); if (!m || !roster.length) return;
       view.menuState = { kind: "orchmenu", at: 0, sel: 0, items: [] };
-      m.style.display = "block"; m.className = "cmenu";
+      m.style.display = "block"; fitMenu(m); m.className = "cmenu";
       m.innerHTML = '<div class="cmhead">who orchestrates</div>' + roster.map(function(a, i){
         var lbl = agentLabel(a.kind, a.id);
         var sub = agentSub(a, lbl);
@@ -249,6 +287,7 @@ export function createOrchestra(view) {
       var cast = roster.filter(function(a){ return !c.off[a.id]; });
       var workers = cast.map(function(a){ return a.id; });
       if (!workers.length) { toast("pick at least one worker"); return; }
+      if (c.race && workers.length < 2) { toast("a race needs at least two agents — check another"); return; }
       // A model agent with no model is a name for nothing. Catch it here, where
       // the chip that fixes it is on screen, rather than three tasks into a run.
       var lead = roster.filter(function(a){ return a.id === c.orchestrator; })[0];
@@ -280,7 +319,7 @@ export function createOrchestra(view) {
       }
       api("/api/projects/" + view.pid + "/orchestra", { method: "POST", body: JSON.stringify({
         goal: goal, orchestrator: c.orchestrator || undefined, workers: workers, maxParallel: c.parallel,
-        plan: view.planState || undefined,
+        plan: view.planState || undefined, race: c.race || undefined,
         // Orchestrate here, answer here. Without this the run opened a thread
         // of its own and walked you into it, leaving the goal you typed behind
         // in a thread that then said nothing at all (#100).
@@ -428,7 +467,7 @@ export function createOrchestra(view) {
     function openRewindMenu(){
       var m = document.getElementById("cmenu"); if (!m) return;
       view.menuState = { kind: "rewindmenu", at: 0, sel: 0, items: [] };
-      m.style.display = "block"; m.className = "cmenu";
+      m.style.display = "block"; fitMenu(m); m.className = "cmenu";
       m.innerHTML = '<div class="cmhead">put the files back to\u2026</div><div class="cmlist" id="cmlist">' + LOADER + "</div>";
       setTimeout(function(){ document.addEventListener("mousedown", view.menuAway); }, 0);
       api("/api/projects/" + view.pid + "/checkpoints").then(function(j){
@@ -543,7 +582,7 @@ export function createOrchestra(view) {
         '<span class="spacer"></span><button class="iconbtn" id="orefresh" title="refresh">' + ICONS.refresh + "</button></div>";
       if (view.orch.runs === null) { el.innerHTML = '<div class="orchview">' + head + (view.orch.err ? '<div class="onote err">' + esc(view.orch.err) + "</div>" : LOADER) + "</div>"; wireOrchHead(); return; }
       if (!view.orch.runs.length) {
-        el.innerHTML = '<div class="orchview">' + head + '<div class="oempty"><b>No orchestra runs yet.</b><br>' +
+        el.innerHTML = '<div class="orchview">' + head + '<div class="oempty">' + emptyArt("orch") + '<b>No orchestra runs yet.</b><br>' +
           "Switch the composer to <b>Orchestrate</b>, describe a goal, and pick who plans and who works.<br>" +
           '<button class="btn outline sm" id="ostart" style="margin-top:14px">' + ICONS.orchestra + "Start one</button></div></div>";
         wireOrchHead();
@@ -567,6 +606,123 @@ export function createOrchestra(view) {
       wireOrchHead();
       wireOrchDetail(el, run);
     }
+    /** A race's entrants side by side: how each did, what it changed, and the one to keep. */
+    function raceBoard(run){
+      var tasks = run.tasks || [], picked = run.applied && run.applied.task;
+      var fastest = null;
+      tasks.forEach(function(t){ if (t.status === "done" && t.startedAt && t.finishedAt && (!fastest || t.finishedAt - t.startedAt < fastest.finishedAt - fastest.startedAt)) fastest = t; });
+      return '<div class="raceboard">' + tasks.map(function(t){
+        var s = ORCH_TASK_ST[t.status] || [t.status, "off"];
+        var dur = t.startedAt ? durfmt((t.finishedAt || Date.now()) - t.startedAt) : "—";
+        var files = (t.files || []).length;
+        return '<div class="racecard' + (picked === t.id ? " picked" : "") + '">' +
+          '<div class="rch">' + agentGlyph(t.kind, t.agent) + '<b>' + esc(agentLabel(t.kind, t.agent)) + "</b>" +
+            '<span class="opill ' + s[1] + '"><span class="odot ' + s[1] + '"></span>' + esc(s[0]) + "</span>" +
+            (fastest && fastest.id === t.id && tasks.length > 1 ? '<span class="rfast" title="finished first">fastest</span>' : "") + "</div>" +
+          '<div class="rcm"><span>' + esc(dur) + "</span><span>" + files + " file" + (files === 1 ? "" : "s") + "</span><span>" + Number(t.lines || 0) + " lines</span>" +
+            (t.costUsd ? "<span>" + money(t.costUsd) + "</span>" : "") + "</div>" +
+          (t.result ? '<div class="rcr">' + esc(plainPreview(t.result, 260)) + "</div>" : t.error ? '<div class="rcr err">' + esc(t.error.slice(0, 200)) + "</div>" : "") +
+          '<div class="rca">' +
+            (t.status === "done" ? '<button type="button" class="btn xs outline" data-racediff="' + esc(t.id) + '">' + ICONS.tree + "Diff</button>" : "") +
+            '<button type="button" class="btn xs ghost" data-racechat="' + esc(t.chat) + '">' + ICONS.thread + "Thread</button>" +
+            (picked === t.id ? '<span class="rpicked">' + ICONS.check + "applied to " + esc(run.applied.into) + "</span>"
+              : !picked && t.status === "done" && orchTerminal(run.status) ? '<button type="button" class="btn xs primary" data-racepick="' + esc(t.id) + '">Pick this one</button>' : "") +
+          "</div></div>";
+      }).join("") + "</div>";
+    }
+    /**
+     * The plan as a graph: each task a node, each dependsOn an arrow, left to
+     * right in the order they can run. Colours are the task's live status.
+     */
+    function orchGraph(tasks){
+      var byId = {}; tasks.forEach(function(t){ byId[t.id] = t; });
+      var level = {}, seen = {};
+      function lv(t){
+        if (level[t.id] != null) return level[t.id];
+        if (seen[t.id]) return 0; // a cycle the orchestrator shouldn't have made: flatten it
+        seen[t.id] = true;
+        var deps = (t.dependsOn || []).filter(function(d){ return byId[d]; });
+        level[t.id] = deps.length ? 1 + Math.max.apply(null, deps.map(function(d){ return lv(byId[d]); })) : 0;
+        return level[t.id];
+      }
+      tasks.forEach(lv);
+      var cols = [];
+      tasks.forEach(function(t){ (cols[level[t.id]] = cols[level[t.id]] || []).push(t); });
+      var NW = 168, NH = 44, GX = 58, GY = 14, PAD = 10;
+      var rows = Math.max.apply(null, cols.map(function(c){ return c.length; }));
+      var W = PAD * 2 + cols.length * NW + (cols.length - 1) * GX, H = PAD * 2 + rows * NH + (rows - 1) * GY;
+      var pos = {};
+      cols.forEach(function(c, ci){
+        var off = (H - (c.length * NH + (c.length - 1) * GY)) / 2;
+        c.forEach(function(t, ri){ pos[t.id] = { x: PAD + ci * (NW + GX), y: off + ri * (NH + GY) }; });
+      });
+      var edges = "";
+      tasks.forEach(function(t){
+        (t.dependsOn || []).forEach(function(d){
+          if (!pos[d]) return;
+          var a = pos[d], b = pos[t.id], x1 = a.x + NW, y1 = a.y + NH / 2, x2 = b.x, y2 = b.y + NH / 2, mx = (x1 + x2) / 2;
+          var done = byId[d].status === "done";
+          edges += '<path class="oge' + (done ? " done" : "") + '" d="M' + x1 + " " + y1 + " C" + mx + " " + y1 + " " + mx + " " + y2 + " " + (x2 - 4) + " " + y2 + '" marker-end="url(#ogarrow)"/>';
+        });
+      });
+      var nodes = tasks.map(function(t){
+        var s = ORCH_TASK_ST[t.status] || [t.status, "off"], q = pos[t.id];
+        var title = String(t.title || t.id);
+        return '<g class="ogn ' + s[1] + '" data-otask="' + esc(t.id) + '" transform="translate(' + q.x + " " + q.y + ')"><title>' + esc(t.id + " · " + title + " · " + s[0]) + "</title>" +
+          '<rect width="' + NW + '" height="' + NH + '" rx="10"/>' +
+          '<circle cx="14" cy="15" r="4" class="ogd"/>' +
+          '<text x="24" y="19" class="ogid">' + esc(t.id) + " · " + esc(labelOf(t.agent)) + "</text>" +
+          '<text x="12" y="34" class="ogt">' + esc(title.length > 24 ? title.slice(0, 23) + "…" : title) + "</text></g>";
+      }).join("");
+      return '<details class="ograph" open><summary>Plan graph<span class="ogs">' + tasks.length + " tasks · " + cols.length + " stage" + (cols.length === 1 ? "" : "s") + "</span></summary>" +
+        '<div class="ogscroll"><svg viewBox="0 0 ' + W + " " + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="task dependency graph">' +
+        '<defs><marker id="ogarrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L8 4L0 8z" fill="currentColor"/></marker></defs>' +
+        edges + nodes + "</svg></div></details>";
+    }
+    /**
+     * When each task actually ran, on one time axis from the run's start:
+     * where the parallelism was, and what everything waited on.
+     */
+    function orchTimeline(run, tasks){
+      var t0 = Number(run.createdAt) || Math.min.apply(null, tasks.map(function(t){ return t.startedAt || Infinity; }));
+      var now = Date.now();
+      var end = Math.max.apply(null, tasks.map(function(t){ return t.finishedAt || (t.status === "running" ? now : t.startedAt || t0); }).concat([orchTerminal(run.status) ? Number(run.updatedAt) || t0 : now]));
+      var span = Math.max(1000, end - t0);
+      var rows = tasks.filter(function(t){ return t.startedAt; }).sort(function(a, b){ return a.startedAt - b.startedAt; }).map(function(t){
+        var s = ORCH_TASK_ST[t.status] || [t.status, "off"];
+        var a = (t.startedAt - t0) / span * 100;
+        var b = ((t.finishedAt || (t.status === "running" ? now : t.startedAt)) - t0) / span * 100;
+        var dur = (t.finishedAt || now) - t.startedAt;
+        return '<div class="otlrow" data-otask="' + esc(t.id) + '" title="' + esc(t.id + " · " + (t.title || "") + " · " + s[0] + " · " + durfmt(dur)) + '">' +
+          '<span class="otlid">' + esc(t.id) + '</span><span class="otltrack"><i class="otlbar ' + s[1] + '" style="left:' + a.toFixed(2) + "%;width:" + Math.max(0.8, b - a).toFixed(2) + '%"></i></span>' +
+          '<span class="otld">' + esc(durfmt(dur)) + "</span></div>";
+      }).join("");
+      return '<details class="ograph otl" open><summary>Timeline<span class="ogs">' + esc(durfmt(span)) + " from start" + (orchTerminal(run.status) ? " to finish" : " so far") + "</span></summary>" +
+        '<div class="otlbody">' + rows + '<div class="otlaxis"><span>0</span><span>' + esc(durfmt(span / 2)) + "</span><span>" + esc(durfmt(span)) + "</span></div></div></details>";
+    }
+    /** Put a finished goal back in the composer, cast and all. */
+    function runAgain(run){
+      var c = orchCfg(), roster = orchRoster(), ids = roster.map(function(a){ return a.id; });
+      var lead = run.orchestrator && run.orchestrator.agent;
+      if (lead && ids.indexOf(lead) >= 0) c.orchestrator = lead;
+      var ws = (run.workers || []).filter(function(w){ return ids.indexOf(w) >= 0; });
+      if (ws.length) { var off = {}; ids.forEach(function(id){ if (ws.indexOf(id) < 0) off[id] = true; }); c.off = off; }
+      if (run.maxParallel) c.parallel = Math.max(1, Math.min(12, Number(run.maxParallel)));
+      c.race = !!run.race;
+      saveOrchCfg(c);
+      if (owns(run) || orchRunForChat()) {
+        // this thread steers its run; a new goal starts from Main
+        try { localStorage.setItem(view.draftKey("main"), run.goal); localStorage.setItem("loomOrchNext:" + view.pid, "1"); } catch (e) {}
+        if (state.setChat) state.setChat(view.pid, "main");
+        return;
+      }
+      if (view.desktop) view.showTab("thread"); else closeOrchSheet();
+      setComposerMode("orch");
+      var box = document.getElementById("box");
+      if (box) { box.value = run.goal; view.autosizeBox(); view.saveDraft(); box.focus(); }
+      drawOrchControls();
+      toast("the goal is back in the composer — same lead and team; edit it or press Enter");
+    }
 
     function orchDetail(run){
       var tasks = run.tasks || [];
@@ -581,20 +737,27 @@ export function createOrchestra(view) {
       var h = '<div class="ocard">' +
         '<div class="ogoal">' + esc(run.goal) + "</div>" +
         '<div class="ometa">' + orchPill(run.status) +
-          '<span class="omi"><span class="omk">Orchestrator</span>' + agentGlyph(o.kind, o.agent) + '<span class="omv">' + esc(agentLabel(o.kind, o.agent)) + "</span></span>" +
+          (run.race ? '<span class="omi"><span class="omk">Mode</span><span class="omv">' + ICONS.play + " Race</span></span>"
+            : '<span class="omi"><span class="omk">Orchestrator</span>' + agentGlyph(o.kind, o.agent) + '<span class="omv">' + esc(agentLabel(o.kind, o.agent)) + "</span></span>") +
           '<span class="omi"><span class="omk">Workers</span><span class="omv">' + (run.workers || []).map(function(w){ return agentGlyph(kindOf(w), w) + esc(labelOf(w)); }).join(", ") + "</span></span>" +
-          '<span class="omi"><span class="omk">Round</span><span class="omv">' + Number(run.round || 0) + "/" + Number(run.maxRounds || 0) + "</span></span>" +
+          (run.race ? "" : '<span class="omi"><span class="omk">Round</span><span class="omv">' + Number(run.round || 0) + "/" + Number(run.maxRounds || 0) + "</span></span>") +
           '<span class="omi"><span class="omk">Parallel</span><span class="omv">' + Number(run.maxParallel || 0) + "</span></span>" +
           '<span class="omi"><span class="omk">Cost</span><span class="omv">' + money(run.costUsd) + "</span></span>" +
+          '<span class="omi"><span class="omk">Elapsed</span><span class="omv"' + (terminal ? "" : ' data-oel="' + Number(run.createdAt || 0) + '"') + ">" +
+            durfmt(Math.max(0, (terminal ? Number(run.updatedAt || run.createdAt) : Date.now()) - Number(run.createdAt || 0))) + "</span></span>" +
           '<span class="omi"><span class="omk">Branch</span><code>' + esc(run.branch || "\u2014") + "</code></span>" +
         "</div>" +
         '<div class="oprog"><div class="obar" title="' + done + " done, " + running + ' running"><i style="width:' + pct + '%"></i><i class="run" style="width:' + rpct + '%"></i></div>' +
           '<span class="opn">' + done + "/" + tasks.length + " done</span></div>" +
         '<div class="oacts">' +
-          (run.chat && view.desktop ? '<button class="btn outline sm" id="othread">' + ICONS.thread + "Orchestrator thread</button>" : "") +
+          (run.chat && view.desktop ? '<button class="btn outline sm" id="othread">' + ICONS.thread + (run.race ? "Thread" : "Orchestrator thread") + "</button>" : "") +
           (!terminal ? '<button class="btn outline sm prdanger" id="oabort">' + ICONS.stop + "Abort</button>" : "") +
-          (terminal && !moved && !run.applied ? '<button class="btn primary sm" id="oapply">Apply to ' + esc(run.baseBranch || "your branch") + "</button>" : "") +
-          (terminal && !moved ? '<button class="btn ghost sm" id="oclean" title="remove this run\u2019s worktrees (the branch stays)">Clean up</button>' : "") +
+          (run.status === "aborted" && run.interrupted ? '<button class="btn primary sm" type="button" id="oresume" title="Loom stopped this run by restarting — carry it on: the tasks that were in flight pick up in the worktrees they left">' + ICONS.play + "Resume</button>" : "") +
+          // Apply only when something finished: a run that ended before any task
+          // merged has nothing on its branch to bring over.
+          (!run.race && terminal && !moved && !run.applied && (run.tasks || []).some(function(t){ return t.status === "done"; }) ? '<button class="btn primary sm" id="oapply">Apply to ' + esc(run.baseBranch || "your branch") + "</button>" : "") +
+          (terminal && !moved ? '<button class="btn ghost sm" id="oclean" title="remove this run’s worktrees (the branch stays)">Clean up</button>' : "") +
+          (terminal ? '<button class="btn outline sm" type="button" id="oagain" title="put this goal back in the composer with the same lead, team and parallelism">' + ICONS.refresh + "Run again</button>" : "") +
           (canMove ? '<button class="btn outline sm" type="button" id="orunner" title="move it to your runner; it carries on there">' + ICONS.orchestra + "Continue on runner</button>" : "") +
         "</div>" + orchMovedHtml(run) + orchOutcome(run) + orchLandingHtml(run) + "</div>";
       if (run.status === "waiting_human") {
@@ -617,6 +780,9 @@ export function createOrchestra(view) {
           : "The orchestrator is planning\u2026 tasks appear here as it spawns them.") + "</div>";
         return h;
       }
+      if (run.race) return h + raceBoard(run);
+      if (tasks.length > 1) h += orchGraph(tasks);
+      if (tasks.some(function(t){ return t.startedAt; })) h += orchTimeline(run, tasks);
       // What needs you first, then what's moving, then what's settled.
       var ORDER = ["needs_input", "conflict", "running", "pending", "failed", "done", "cancelled"];
       ORDER.forEach(function(stName){
@@ -755,9 +921,10 @@ export function createOrchestra(view) {
           } else if (act === "review") {
             landAct("review", { runId: run.id }, b, function(){ toast("review requested"); });
           } else if (act === "override") {
-            var why = window.prompt("Override loom/review on PR #" + l.pr + "? Say why \u2014 it goes on the PR.");
-            if (!why || !why.trim()) return;
-            landAct("override", { runId: run.id, reason: why.trim() }, b, function(){ toast("review overridden"); });
+            askText("Override loom/review on PR #" + l.pr + "?", { note: "Say why — it goes on the PR.", multiline: true, required: true, ok: "Override" }).then(function(why){
+              if (!why || !why.trim()) return;
+              landAct("override", { runId: run.id, reason: why.trim() }, b, function(){ toast("review overridden"); });
+            });
           }
         };
       });
@@ -857,14 +1024,56 @@ export function createOrchestra(view) {
     }
 
     function wireOrchDetail(el, run){
+      Array.prototype.forEach.call(el.querySelectorAll("[data-racediff]"), function(b){
+        b.onclick = function(ev){
+          ev.stopPropagation();
+          var tid = b.getAttribute("data-racediff"), t = (run.tasks || []).filter(function(x){ return x.id === tid; })[0];
+          api("/api/projects/" + view.pid + "/orchestra/" + encodeURIComponent(run.id) + "/tasks/" + encodeURIComponent(tid) + "/diff")
+            .then(function(j){
+              if (!j.patch) { toast("no changes on " + tid); return; }
+              if (view.desktop) view.openPatchDock(j.patch, (t ? agentLabel(t.kind, t.agent) + "’s take" : tid));
+              else toast("open this on the desktop to read the diff");
+            })
+            .catch(function(err){ toast(err.message); });
+        };
+      });
+      Array.prototype.forEach.call(el.querySelectorAll("[data-racechat]"), function(b){
+        b.onclick = function(ev){ ev.stopPropagation(); openOrchChat(b.getAttribute("data-racechat")); };
+      });
+      Array.prototype.forEach.call(el.querySelectorAll("[data-racepick]"), function(b){
+        b.onclick = function(ev){
+          ev.stopPropagation();
+          var tid = b.getAttribute("data-racepick"), t = (run.tasks || []).filter(function(x){ return x.id === tid; })[0];
+          askConfirm("Apply " + (t ? agentLabel(t.kind, t.agent) + "’s take" : tid) + " to your branch?\n\nIts changes merge into the branch you’re on. The other entrants stay on their own branches.", { ok: "Pick this one" }).then(function(yes){
+            if (!yes) return;
+            b.disabled = true;
+            api("/api/projects/" + view.pid + "/orchestra/" + encodeURIComponent(run.id) + "/apply", { method: "POST", body: JSON.stringify({ task: tid }) })
+              .then(function(r){ toast("merged " + r.merged + " into " + r.into); loadOrch(); if (state.loadGitStat) state.loadGitStat(); })
+              .catch(function(err){ b.disabled = false; toast(err.message); });
+          });
+        };
+      });
+      var ag = document.getElementById("oagain");
+      if (ag) ag.onclick = function(){ runAgain(run); };
+      var rs = document.getElementById("oresume");
+      if (rs) rs.onclick = function(){
+        rs.disabled = true; rs.textContent = "Resuming…";
+        api("/api/projects/" + view.pid + "/orchestra/" + encodeURIComponent(run.id) + "/resume", { method: "POST", body: "{}" })
+          .then(function(j){ if (j && j.run) mergeOrchRun(j.run); toast("resumed — the interrupted tasks are picking up where they left off"); })
+          .catch(function(err){ toast(err.message); rs.disabled = false; rs.textContent = "Resume"; });
+      };
       Array.prototype.forEach.call(el.querySelectorAll("[data-run]"), function(row){
         row.onclick = function(){ view.orch.sel = row.getAttribute("data-run"); view.orch.pinned = true; drawOrch(); };
       });
       var th = el.querySelector("#othread"); if (th) th.onclick = function(){ openOrchChat(run.chat); };
+      // a long goal is clamped to four lines; clicking it reads the rest
+      var og = el.querySelector(".ogoal");
+      if (og) { og.title = "click to " + (view.orch.goalOpen ? "fold" : "read the whole goal"); if (view.orch.goalOpen) og.classList.add("full");
+        og.onclick = function(){ view.orch.goalOpen = !view.orch.goalOpen; og.classList.toggle("full", view.orch.goalOpen); }; }
       var ab = el.querySelector("#oabort");
       if (ab) ab.onclick = function(){
-        if (!window.confirm("Abort this orchestra run? Running workers are stopped; finished work stays on " + run.branch + ".")) return;
-        orchAction(run, "abort", {}, ab, function(){ toast("orchestra aborted"); });
+        askConfirm("Abort this orchestra run? Running workers are stopped; finished work stays on " + run.branch + ".", { ok: "Abort run", danger: true })
+          .then(function(ok){ if (ok) orchAction(run, "abort", {}, ab, function(){ toast("orchestra aborted"); }); });
       };
       var apb = el.querySelector("#oapply"); if (apb) apb.onclick = function(){ applyOrch(run.id, apb); };
       var rdb = el.querySelector("#oredeliver"); if (rdb) rdb.onclick = function(){ redeliverOrch(run.id, rdb); };
@@ -898,12 +1107,14 @@ export function createOrchestra(view) {
           var tid = b.getAttribute("data-ostopwait");
           var t = (run.tasks || []).filter(function(x){ return x.id === tid; })[0];
           var g = teamGoalOf(t && t.hold && t.hold.runId);
-          if (!window.confirm("Stop waiting? " + tid + " starts now, alongside " + (g.goal ? "\u2018" + g.goal + "\u2019" : "the other goal") +
-            " instead of after its PR merges \u2014 you may have a conflict to resolve when both land.")) return;
-          b.disabled = true;
-          api("/api/projects/" + view.pid + "/orchestra/" + encodeURIComponent(run.id) + "/tasks/" + encodeURIComponent(tid) + "/stop-waiting", { method: "POST", body: "{}" })
-            .then(function(){ toast(tid + " stopped waiting"); loadOrch(); })
-            .catch(function(err){ b.disabled = false; toast(err.message); });
+          askConfirm("Stop waiting? " + tid + " starts now, alongside " + (g.goal ? "\u2018" + g.goal + "\u2019" : "the other goal") +
+            " instead of after its PR merges \u2014 you may have a conflict to resolve when both land.", { ok: "Start it now" }).then(function(ok){
+            if (!ok) return;
+            b.disabled = true;
+            api("/api/projects/" + view.pid + "/orchestra/" + encodeURIComponent(run.id) + "/tasks/" + encodeURIComponent(tid) + "/stop-waiting", { method: "POST", body: "{}" })
+              .then(function(){ toast(tid + " stopped waiting"); loadOrch(); })
+              .catch(function(err){ b.disabled = false; toast(err.message); });
+          });
         };
       });
       var rb = el.querySelector("#oreplybtn"), rt = el.querySelector("#oreply");

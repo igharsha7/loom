@@ -240,6 +240,7 @@ export class RuntimeQueue {
     await this.host.sendMessage(item.text, to, { source: item.source, chat: item.chat, fromQueue: true,
       requestId: item.continuity?.requestId ?? (item.editedAt ? `queue:${item.id}:edit:${item.editedAt}` : `queue:${item.id}`),
       ...(item.continuity ? { capturedModel: item.continuity.model } : {}),
-      ...(item.plan ? { plan: true } : {}) });
+      ...(item.plan ? { plan: true } : {}),
+      ...(item.length ? { length: item.length } : {}) });
   }
 }

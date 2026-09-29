@@ -43,6 +43,7 @@ export class JsonlStore implements EventStore {
   list(opts: ListOpts = {}): LoomEvent[] {
     let out = this.cache;
     if (opts.since !== undefined) out = out.filter((e) => e.id > opts.since!);
+    if (opts.before !== undefined) out = out.filter((e) => e.id < opts.before!);
     if (opts.kinds?.length) out = out.filter((e) => opts.kinds!.includes(e.kind));
     // must match SqliteStore exactly: an event with no chat is main's
     if (opts.chat !== undefined) {
@@ -56,6 +57,26 @@ export class JsonlStore implements EventStore {
 
   lastId(): number {
     return this.cache[this.cache.length - 1]?.id ?? 0;
+  }
+
+  size(): { bytes: number; events: number } {
+    let bytes = 0;
+    try {
+      bytes = fs.statSync(this.file).size;
+    } catch {
+      /* not written yet */
+    }
+    return { bytes, events: this.cache.length };
+  }
+
+  compact(): void {
+    // an append-only text log has no free pages to reclaim
+  }
+
+  lastReplyIds(): Map<string, number> {
+    const out = new Map<string, number>();
+    for (const e of this.cache) if (e.kind === "message" && e.agentId) out.set(e.chat ?? MAIN_CHAT, e.id);
+    return out;
   }
 
   close(): void {}

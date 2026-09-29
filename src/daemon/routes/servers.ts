@@ -62,7 +62,8 @@ export function registerServersRoutes(app: Express, withRuntime: WithRuntime): v
     withRuntime(async (rt, req, res) => {
       try {
         const cfg = rt.servers.mustConfig(String(req.params.name));
-        const target = urlFor(cfg);
+        // configured, or else what the running server announced it's on
+        const target = urlFor(cfg) ?? rt.servers.status(cfg).url ?? null;
         if (!target) return void res.status(400).json({ error: `server "${cfg.name}" has no port or url to preview` });
         const proxy = await rt.previewProxy(cfg.name, target);
         res.json({ url: `http://127.0.0.1:${proxy.port}`, target, bridged: true });

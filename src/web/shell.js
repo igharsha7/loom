@@ -1,12 +1,12 @@
 /** Browser shell module. See README.md for ownership and startup. */
-import { brandMark } from './agents.js';
+import { agentGlyph,agentLabel,brandMark } from './agents.js';
 import { copyText } from './clipboard.js';
 import { api,clearTimers,logout } from './connection.js';
 import { esc,highlight,hue,money } from './format.js';
 import { ICONS,LOADER } from './icons.js';
 import { applyRail,applyWidths,cssPx,makeResizer,railOpen,shellEl,toggleRail } from './layout.js';
 import { openMenu } from './menus.js';
-import { toast } from './notifications.js';
+import { askConfirm,askText,devicePref,isUnread,setDevicePref,toast } from './notifications.js';
 import { openPalette } from './palette.js';
 import { renderProject } from './project.js';
 import { openProjectModal,openProjectSettings,openSetupModal } from './settings.js';
@@ -14,10 +14,15 @@ import { SETUP_SEEN_KEY,root,state } from './state.js';
 import { drawStatusbar,loadGithub,loadLoomPad,loadUpdate } from './statusbar.js';
 import { openTaskModal } from './tasks.js';
 import { THEME_BTN,bindTheme } from './theme.js';
+import { emptyArt } from './transcript.js';
+import { shortModel } from './permissions.js';
 
 
   // ---- router ----------------------------------------------------------
-  var mq = window.matchMedia("(min-width:900px)");
+  // The workspace on anything with a mouse, at any width: narrowing a desktop
+  // window used to swap in the phone layout and take the sidebar, the tabs and
+  // the panels away. The single column is for touch phones only.
+  var mq = window.matchMedia("(min-width:900px), (hover:hover) and (pointer:fine)");
 
   function isDesktop(){ return mq.matches; }
 
@@ -29,7 +34,8 @@ import { THEME_BTN,bindTheme } from './theme.js';
     clearTimers();
     clearShell();
     var m = location.hash.match(/^#p\/(.+)$/);
-    var cur = m ? m[1] : null;
+    // No project in the URL: reopen the one you were last in, not the first.
+    var cur = m ? m[1] : (function(){ try { return localStorage.getItem("loomProject"); } catch (e) { return null; } })();
     // The project the URL asked for, kept separately from the one on screen so
     // a deep link that loses the race with the first /api/projects can still be
     // honoured when it arrives. select() clears it — see refresh().
@@ -60,6 +66,7 @@ import { THEME_BTN,bindTheme } from './theme.js';
           '<button class="iconbtn rvbtn" data-view="search" title="Search">' + ICONS.search + "</button>" +
           '<button class="iconbtn rvbtn" data-view="scm" title="Source Control">' + ICONS.branch + "</button>" +
           '<button class="iconbtn rvbtn" data-view="tasks" title="Agents" aria-label="Agents">' + ICONS.agents + "</button>" +
+          '<button class="iconbtn rvbtn" data-view="outline" title="Outline: your prompts in this chat" aria-label="Outline">' + ICONS.clipboard + "</button>" +
           '<span class="spacer"></span>' +
           '<button id="railrefresh" class="iconbtn" title="refresh">' + ICONS.refresh + "</button>" +
           // No second panel toggle. #railbtn in the tab strip is the one control
@@ -220,6 +227,7 @@ import { THEME_BTN,bindTheme } from './theme.js';
     function drawList(){
       var el = document.getElementById("slist"); if (!el) return;
       if (!state.projects.length) {
+        el._drawn = null;
         el.innerHTML = '<div class="sys" style="padding:24px 8px;line-height:1.7">no projects yet<br><span style="opacity:.75">run <b class="mono" style="font-weight:500">loom init</b></span></div>';
         return;
       }
@@ -232,11 +240,12 @@ import { THEME_BTN,bindTheme } from './theme.js';
         // start of one. The early return here meant the chat hits below never
         // rendered in the exact case you were searching for a message rather than
         // a project, which is the common case.
+        el._drawn = null;
         el.innerHTML = '<div class="sys" style="padding:16px 8px">no project called “' + esc(filter) + '”</div>';
         drawChatHits(el);
         return;
       }
-      el.innerHTML = shown.map(function(p){
+      var listHtml = shown.map(function(p){
         var r = p.route, act = r && (r.status === "running" || r.status === "waiting_human");
         var adapters = (p.agents || []).filter(function(a){ return a.tier === "adapter"; });
         var sel = p.id === cur;
@@ -250,18 +259,54 @@ import { THEME_BTN,bindTheme } from './theme.js';
           // margin-left:auto — .cnt's rule loses to the badge's inline style.
           (act ? '<span class="badge live" style="margin-left:auto">' + (r.current + 1) + "/" + r.steps.length + "</span>" : '<span class="cnt" style="margin-left:auto">' + adapters.length + "</span>") +
           '<button class="psetbtn" data-pset="' + esc(p.id) + '" title="project settings" aria-label="settings for ' + esc(p.name) + '">' + ICONS.gear + "</button></div>" +
-          '<div class="m">baton ' + esc(p.holder || "\u2014") +
-          (p.costUsd > 0 ? " \u00b7 " + money(p.costUsd) : "") + "</div></div>";
-        if (open) {
+          (p.error
+            ? '<div class="m merr">' + ICONS.alert + (p.missing ? "folder missing" : "needs loom init") + "</div></div>"
+            : '<div class="m">baton ' + esc(p.holder || "—") + (p.costUsd > 0 ? " · " + money(p.costUsd) : "") + "</div></div>");
+        if (open && !p.error) {
           // A project holds conversations. The agents that work them live in
           // the rail's roster — they belong to the project, not to one chat.
-          var chats = p.chats || [{ id: "main", title: "Main", createdAt: 0 }];
-          rows += chats.map(function(c){
+          var chats = (p.chats || [{ id: "main", title: "Main", createdAt: 0 }]).slice();
+          // Main first, then newest first; past a handful the older threads
+          // fold behind a "show more" row — an afternoon of orchestra runs
+          // otherwise buries the sidebar in t1/t2/t3 rows. The open thread is
+          // always shown, wherever it falls.
+          var here = currentChat(), SHOW = 8;
+          var mainC = chats.filter(function(c){ return c.id === "main"; });
+          var archOpen = !!(state.chatsArchived && state.chatsArchived[p.id]);
+          var archived = chats.filter(function(c){ return c.id !== "main" && c.archived; });
+          var rest = chats.filter(function(c){ return c.id !== "main" && (!c.archived || archOpen || (sel && c.id === here)); }).sort(function(a, b){
+            // pinned threads first, then newest first
+            return (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || (b.createdAt || 0) - (a.createdAt || 0);
+          });
+          // Filed threads live under their folder; with "group by agent" on,
+          // the loose ones gather under whoever answers them. Groups are never
+          // cut by "show older" — you folded them yourself if they're long.
+          var byAgent = devicePref("chatsByAgent", false);
+          var groups = [], gIndex = {};
+          var byIdG = {}; (p.agents || []).forEach(function(a){ byIdG[a.id] = a; });
+          rest = rest.filter(function(c){
+            var key = c.folder ? "f:" + c.folder : byAgent ? "a:" + (c.agentId || "") : "";
+            if (!key) return true;
+            if (!gIndex[key]) {
+              gIndex[key] = { key: key, folder: !!c.folder, name: c.folder || (c.agentId ? (byIdG[c.agentId] ? agentLabel(byIdG[c.agentId].kind, c.agentId) : c.agentId) : "Follows the baton"), agentId: c.folder ? "" : c.agentId || "", chats: [] };
+              groups.push(gIndex[key]);
+            }
+            gIndex[key].chats.push(c);
+            return false;
+          });
+          groups.sort(function(a, b){ return (b.folder ? 1 : 0) - (a.folder ? 1 : 0) || (a.folder || a.agentId ? 0 : 1) - (b.folder || b.agentId ? 0 : 1) || a.name.localeCompare(b.name); });
+          var moreOpen = !!(state.chatsMore && state.chatsMore[p.id]);
+          var older = moreOpen ? 0 : Math.max(0, rest.length - SHOW);
+          var visible = moreOpen ? rest : rest.slice(0, SHOW).concat(rest.slice(SHOW).filter(function(c){ return (sel && c.id === here) || c.pinned; }));
+          if (!moreOpen && sel && rest.slice(SHOW).some(function(c){ return c.id === here; })) older--;
+          var byId = {}; (p.agents || []).forEach(function(a){ byId[a.id] = a; });
+          var chatRowHtml = function(c){
             var curC = c.id === currentChat();
             return '<div class="crow' + (curC ? " cur" : "") + '" data-p="' + esc(p.id) +
               '" data-chat="' + esc(c.id) + '"' + (curC ? ' data-current="true"' : "") + ">" +
-              '<span class="ci">' + ICONS.chat + "</span>" +
+              '<span class="ci">' + (c.pinned ? ICONS.pin : c.archived ? ICONS.archive : ICONS.chat) + "</span>" +
               '<span class="cnm">' + esc(c.title) + "</span>" +
+              (!curC && isUnread(p.id, c) ? '<span class="udot" title="new replies since you last looked" aria-label="unread"></span>' : "") +
               // Is it working, did it finish, did it fail — from the run's
               // own task rows, so this is a fact Loom already had rather than
               // a guess. A thread that never ran shows nothing at all.
@@ -270,22 +315,74 @@ import { THEME_BTN,bindTheme } from './theme.js';
               // shape of what's running is readable without opening anything.
               (c.agentId
                 ? '<span class="cwho" title="' + esc(c.agentId + (c.model ? " · " + c.model : "")) + '">' +
-                  esc(c.model ? c.model.split("/").pop() : c.agentId) + "</span>"
+                  esc(c.model ? c.model.split("/").pop() : byId[c.agentId] ? agentLabel(byId[c.agentId].kind, c.agentId) : c.agentId) + "</span>"
                 : "") +
               (c.id === "main"
                 ? ""
                 : '<button class="cx iconbtn" data-delchat="' + esc(c.id) +
                   '" title="forget this chat" aria-label="forget chat ' + esc(c.title) + '">' + ICONS.x + "</button>") +
               "</div>";
-          }).join("");
+          };
+          rows += mainC.map(chatRowHtml).join("");
+          groups.forEach(function(g){
+            var fkey = p.id + "|" + g.key, shut = foldShut(fkey);
+            var unread = g.chats.some(function(c){ return c.id !== currentChat() && isUnread(p.id, c); });
+            rows += '<div class="crow fold' + (shut ? "" : " open") + '" data-fold="' + esc(fkey) + '"' + (g.folder ? ' data-folder="' + esc(g.name) + '" data-p="' + esc(p.id) + '"' : "") + ' role="button" aria-expanded="' + (shut ? "false" : "true") + '">' +
+              '<span class="ci fcar">' + ICONS.chevron + "</span>" +
+              (g.folder ? '<span class="ci">' + ICONS.folder + "</span>" : '<span class="ci fg">' + (g.agentId ? agentGlyph((byId[g.agentId] || {}).kind, g.agentId) : ICONS.agents) + "</span>") +
+              '<span class="cnm">' + esc(g.name) + "</span>" +
+              (shut && unread ? '<span class="udot" aria-label="unread inside"></span>' : "") +
+              '<span class="fcnt">' + g.chats.length + "</span></div>";
+            rows += g.chats.filter(function(c){ return !shut || (sel && c.id === here); }).map(function(c){ return chatRowHtml(c).replace('class="crow', 'class="crow infold'); }).join("");
+          });
+          rows += visible.map(chatRowHtml).join("");
+          if (older > 0 || moreOpen && rest.length > SHOW) {
+            rows += '<div class="crow more" data-chatsmore="' + esc(p.id) + '"><span class="ci">' + ICONS.dots + '</span><span class="cnm">' +
+              (moreOpen ? "Show fewer" : "Show " + older + " older") + "</span></div>";
+          }
+          if (archived.length) {
+            rows += '<div class="crow more" data-chatsarch="' + esc(p.id) + '"><span class="ci">' + ICONS.archive + '</span><span class="cnm">' +
+              (archOpen ? "Hide archived" : "Archived · " + archived.length) + "</span></div>";
+          }
           rows += '<div class="crow add" data-newchat="' + esc(p.id) + '">' +
             '<span class="ci">' + ICONS.plus + '</span><span class="cnm">New chat</span></div>';
         }
         return '<div class="sgroup">' + rows + "</div>";
       }).join("");
+      // The list is redrawn on every poll; rebuilding identical rows threw
+      // away hover and focus under the pointer every five seconds (and made
+      // a click on a row land on a node that no longer existed).
+      if (!filter && el._drawn === listHtml) return;
+      el._drawn = filter ? null : listHtml;
+      el.innerHTML = listHtml;
 
       drawChatHits(el);
 
+      Array.prototype.forEach.call(el.querySelectorAll("[data-chatsarch]"), function(row){
+        row.onclick = function(ev){
+          ev.stopPropagation();
+          var id = row.getAttribute("data-chatsarch");
+          state.chatsArchived = state.chatsArchived || {};
+          state.chatsArchived[id] = !state.chatsArchived[id];
+          drawList();
+        };
+      });
+      Array.prototype.forEach.call(el.querySelectorAll("[data-fold]"), function(row){
+        row.onclick = function(ev){ ev.stopPropagation(); setFoldShut(row.getAttribute("data-fold"), !foldShut(row.getAttribute("data-fold"))); drawList(); };
+        if (row.getAttribute("data-folder")) row.oncontextmenu = function(ev){
+          ev.preventDefault(); ev.stopPropagation();
+          folderMenu(row.getAttribute("data-p"), row.getAttribute("data-folder"), ev.clientX, ev.clientY);
+        };
+      });
+      Array.prototype.forEach.call(el.querySelectorAll("[data-chatsmore]"), function(row){
+        row.onclick = function(ev){
+          ev.stopPropagation();
+          var id = row.getAttribute("data-chatsmore");
+          state.chatsMore = state.chatsMore || {};
+          state.chatsMore[id] = !state.chatsMore[id];
+          drawList();
+        };
+      });
       Array.prototype.forEach.call(el.querySelectorAll(".srow"), function(row){
         row.onclick = function(){ select(row.getAttribute("data-id")); };
         row.oncontextmenu = function(ev){
@@ -460,12 +557,17 @@ import { THEME_BTN,bindTheme } from './theme.js';
       if (!agents.length) { onPick(null); return; } // nothing to choose — just make it
       var pop = document.createElement("div");
       pop.className = "pickpop"; pop.id = "chatpick";
+      // Switched-off agents can't answer, so they aren't offered.
+      var usable = agents.filter(function(a){ return a.enabled !== false; });
+      if (!usable.length) usable = agents;
       pop.innerHTML = '<div class="pickhead">start this chat with</div>' +
-        agents.map(function(a){
-          var bridge = a.tier === "bridge";
+        usable.map(function(a){
+          var bridge = a.tier === "bridge", lbl = agentLabel(a.kind, a.id);
+          var sub = bridge ? "drives its own window" : a.model ? shortModel(a.model) : a.kind === "model" ? "no model yet" : "default model";
           return '<button class="pickrow" data-pick="' + esc(a.id) + '">' +
-            brandMark(a.kind) + '<span class="pnm">' + esc(a.id) + "</span>" +
-            '<span class="prole">' + esc(bridge ? "bridge" : a.role) + "</span></button>";
+            '<span class="pic">' + agentGlyph(a.kind, a.id, "brand lg") + "</span>" +
+            '<span class="mtx"><span class="pnm">' + esc(lbl) + (a.id !== lbl && a.id !== a.kind && String(a.kind || "").indexOf(a.id) !== 0 ? '<span class="mfrom">' + esc(a.id) + "</span>" : "") + "</span>" +
+            '<span class="prole">' + esc(sub) + "</span></span></button>";
         }).join("");
       document.body.appendChild(pop);
       var r = anchor.getBoundingClientRect();
@@ -540,11 +642,79 @@ import { THEME_BTN,bindTheme } from './theme.js';
       // Main follows the baton and its name is not yours to change — the menu
       // says so by not offering, rather than by offering and refusing.
       if (!isMain) {
+        items.push({ label: c.pinned ? "Unpin" : "Pin to top", icon: ICONS.pin, run: function(){ flagChat(pid, cid, { pinned: !c.pinned }); } });
+        items.push({ label: c.archived ? "Unarchive" : "Archive", icon: ICONS.archive, hint: c.archived ? "" : "hide, keep history", run: function(){ flagChat(pid, cid, { archived: !c.archived }); } });
+        items.push({ label: "Move to folder…", icon: ICONS.folder, hint: c.folder || "", run: function(){ moveToFolder(p, c); } });
+        if (c.folder) items.push({ label: "Take out of " + c.folder, icon: ICONS.folder, run: function(){ flagChat(pid, cid, { folder: null }); } });
+      }
+      items.push({ label: devicePref("chatsByAgent", false) ? "Stop grouping by agent" : "Group chats by agent", icon: ICONS.agents, run: function(){
+        setDevicePref("chatsByAgent", !devicePref("chatsByAgent", false)); drawList();
+      } });
+      items.push({ label: "Export as Markdown", icon: ICONS.download, run: function(){
+        if (pid === cur && currentChat() === cid && state.exportThread) { state.exportThread(); return; }
+        setChat(pid, cid);
+        setTimeout(function(){ if (state.exportThread) state.exportThread(); }, 600);
+      } });
+      if (!isMain) {
         items.push({ label: "Rename…", icon: ICONS.file, run: function(){ renameChat(pid, cid, c.title); } });
         items.push({ sep: true });
         items.push({ label: "Forget this chat", icon: ICONS.trash, danger: true, run: function(){ forgetChat(pid, cid); } });
       }
       openMenu(x, y, items);
+    }
+
+    /** Which sidebar groups you folded, kept on this device. */
+    function foldShut(key){
+      try { return !!JSON.parse(localStorage.getItem("loomFolds") || "{}")[key]; } catch (e) { return false; }
+    }
+    function setFoldShut(key, shut){
+      try {
+        var m = JSON.parse(localStorage.getItem("loomFolds") || "{}");
+        if (shut) m[key] = 1; else delete m[key];
+        localStorage.setItem("loomFolds", JSON.stringify(m));
+      } catch (e) {}
+    }
+    function moveToFolder(p, c){
+      var names = [];
+      (p.chats || []).forEach(function(x){ if (x.folder && names.indexOf(x.folder) < 0) names.push(x.folder); });
+      askText("Move “" + c.title + "” to a folder", {
+        value: c.folder || "", ok: "Move", required: true, placeholder: "folder name",
+        note: names.length ? "Folders here: " + names.join(", ") + ". A new name makes a new folder." : "A folder exists while something is in it.",
+      }).then(function(name){
+        if (name === null || !name.trim() || name.trim() === c.folder) return;
+        flagChat(p.id, c.id, { folder: name.trim() });
+      });
+    }
+    /** Right-click a folder: rename it (every thread in it moves), or empty it. */
+    function folderMenu(pid, name, x, y){
+      var p = (state.projects || []).filter(function(q){ return q.id === pid; })[0];
+      if (!p) return;
+      var inside = (p.chats || []).filter(function(c){ return c.folder === name; });
+      var each = function(folder, done){
+        Promise.all(inside.map(function(c){
+          return api("/api/projects/" + pid + "/chats/" + encodeURIComponent(c.id), { method: "PATCH", body: JSON.stringify({ folder: folder }) });
+        })).then(function(){ refresh(); toast(done); }).catch(function(err){ toast(err.message); });
+      };
+      openMenu(x, y, [
+        { head: name + " · " + inside.length },
+        { label: "Rename folder…", icon: ICONS.file, run: function(){
+            askText("Rename folder", { value: name, ok: "Rename", required: true }).then(function(next){
+              if (next === null || !next.trim() || next.trim() === name) return;
+              each(next.trim(), "renamed to " + next.trim());
+            });
+          } },
+        { label: "Ungroup", icon: ICONS.folder, hint: "threads stay", run: function(){ each(null, "folder removed · its threads are back in the list"); } },
+      ]);
+    }
+
+    function flagChat(pid, cid, flags){
+      api("/api/projects/" + pid + "/chats/" + encodeURIComponent(cid), { method: "PATCH", body: JSON.stringify(flags) })
+        .then(function(){
+          if (flags.archived && currentChat() === cid) setChat(pid, "main");
+          refresh();
+          toast(flags.folder ? "moved to " + flags.folder : flags.folder === null ? "out of the folder" : flags.pinned ? "pinned to the top" : flags.pinned === false ? "unpinned" : flags.archived ? "archived · under Archived in the sidebar" : "back in the list");
+        })
+        .catch(function(err){ toast(err.message); });
     }
 
     function bindChat(pid, cid, agentId){
@@ -556,13 +726,14 @@ import { THEME_BTN,bindTheme } from './theme.js';
     }
 
     function renameChat(pid, cid, was){
-      var next = window.prompt("Rename this chat", was || "");
-      if (next === null) return;
-      next = next.trim();
-      if (!next || next === was) return;
-      api("/api/projects/" + pid + "/chats/" + cid + "/rename", { method: "POST", body: JSON.stringify({ title: next }) })
-        .then(function(){ refresh(); })
-        .catch(function(err){ toast(err.message); });
+      askText("Rename this chat", { value: was || "", ok: "Rename" }).then(function(next){
+        if (next === null) return;
+        next = next.trim();
+        if (!next || next === was) return;
+        api("/api/projects/" + pid + "/chats/" + cid + "/rename", { method: "POST", body: JSON.stringify({ title: next }) })
+          .then(function(){ refresh(); })
+          .catch(function(err){ toast(err.message); });
+      });
     }
 
     function forgetChat(pid, cid){
@@ -577,13 +748,14 @@ import { THEME_BTN,bindTheme } from './theme.js';
 
     /** Rename in place, from the menu — the same call the settings pane makes. */
     function renameProject(pid, was){
-      var next = window.prompt("Rename this project", was || "");
-      if (next === null) return;
-      next = next.trim();
-      if (!next || next === was) return;
-      api("/api/projects/" + pid, { method: "PATCH", body: JSON.stringify({ name: next }) })
-        .then(function(){ refresh(); toast("renamed"); })
-        .catch(function(err){ toast(err.message); });
+      askText("Rename this project", { value: was || "", ok: "Rename" }).then(function(next){
+        if (next === null) return;
+        next = next.trim();
+        if (!next || next === was) return;
+        api("/api/projects/" + pid, { method: "PATCH", body: JSON.stringify({ name: next }) })
+          .then(function(){ refresh(); toast("renamed"); })
+          .catch(function(err){ toast(err.message); });
+      });
     }
 
     /**
@@ -592,22 +764,50 @@ import { THEME_BTN,bindTheme } from './theme.js';
      * asking "are you sure?" about something it hasn't described.
      */
     function forgetProject(pid, name){
-      if (!window.confirm('Remove "' + name + '" from Loom?\n\nIts folder, its history and its .loom directory stay on disk. Add the folder again to bring it back.')) return;
-      api("/api/projects/" + pid, { method: "DELETE" })
-        .then(function(){
-          if (pid === cur) { cur = null; try { localStorage.removeItem("loomProject"); } catch (e) {} }
-          refresh();
-          toast("removed from Loom — the folder is untouched");
-        })
-        .catch(function(err){ toast(err.message); });
+      askConfirm('Remove "' + name + '" from Loom?\n\nIts folder, its history and its .loom directory stay on disk. Add the folder again to bring it back.', { ok: "Remove", danger: true }).then(function(ok){
+        if (!ok) return;
+        api("/api/projects/" + pid, { method: "DELETE" })
+          .then(function(){
+            if (pid === cur) { cur = null; try { localStorage.removeItem("loomProject"); } catch (e) {} }
+            refresh();
+            toast("removed from Loom — the folder is untouched");
+          })
+          .catch(function(err){ toast(err.message); });
+      });
     }
 
     function select(pid){
       cur = pid;
+      try { localStorage.setItem("loomProject", pid); } catch (e) {}
       wanted = null; // whatever the URL wanted, this is a real choice now
       history.replaceState(null, "", "#p/" + pid);
+      var info = (state.projects || []).filter(function(q){ return q.id === pid; })[0];
+      if (info && info.error) { drawUnavailable(info); drawList(); return; }
       renderProject(pid, dmain, true);
       drawList();
+    }
+    /**
+     * A project Loom can't open — its folder gone, or never initialised — is
+     * one clear page with the way out, not an error in every tab.
+     */
+    function drawUnavailable(info){
+      clearTimers();
+      state.project = null;
+      dmain.innerHTML = '<div class="unavail">' + emptyArt("orch") +
+        '<div class="uat">' + (info.missing ? "This project’s folder is gone" : "Loom can’t open this project") + "</div>" +
+        '<div class="uab">' + (info.missing
+          ? "<code>" + esc(info.dir) + "</code> doesn’t exist any more — it was moved, deleted, or it was a temporary folder a restart cleared. Its history went with it."
+          : esc(info.error || "") + ".") + "</div>" +
+        '<div class="uaa">' +
+          '<button type="button" class="btn primary" id="uaforget">' + ICONS.trash + "Remove from Loom</button>" +
+          (info.missing ? "" : '<button type="button" class="btn outline" id="uacopy">' + ICONS.copy + "Copy <code>loom init</code></button>") +
+        "</div>" +
+        '<div class="uah">' + (info.missing ? "Moved it? Remove it here, then add the folder where it lives now with New project." : "Run it in that folder, then come back — the project opens as usual.") + "</div></div>";
+      var f = document.getElementById("uaforget");
+      if (f) f.onclick = function(){ forgetProject(info.id, info.name); };
+      var c = document.getElementById("uacopy");
+      if (c) c.onclick = function(){ copyText("cd " + JSON.stringify(info.dir) + " && loom init"); };
+      drawStatusbar();
     }
     state.selectProject = select;
     state.setChat = setChat; // the palette jumps to a conversation by id
@@ -624,6 +824,8 @@ import { THEME_BTN,bindTheme } from './theme.js';
       drawList();
     }
     state.currentChat = currentChat;
+    // so a view can ask the sidebar to re-read (new threads from Ask several)
+    state.refreshShell = function(){ refresh(); };
     function refresh(){
       api("/api/projects").then(function(j){
         state.projects = j.projects || [];

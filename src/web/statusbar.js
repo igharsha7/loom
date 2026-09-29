@@ -4,9 +4,10 @@ import { api } from './connection.js';
 import { clog } from './console.js';
 import { esc,money,pageGone } from './format.js';
 import { ICONS,LOADER } from './icons.js';
-import { announce,toast } from './notifications.js';
+import { announce,toast,updateAmbient } from './notifications.js';
 import { openSettingsModal } from './settings.js';
 import { state } from './state.js';
+import { railOpen,toggleRail } from './layout.js';
 
 
   // ---- git delivery (per project; the status bar's toggle) -----------------
@@ -121,6 +122,7 @@ import { state } from './state.js';
       total += pr.costUsd > 0 ? pr.costUsd : 0;
       (pr.agents || []).forEach(function(a){ if (a.busy) busy++; });
     });
+    updateAmbient(busy, (state.projects || []).some(function(pr){ return pr.needsInput; }));
     var share = p && p.costUsd > 0 && total > 0 ? Math.min(100, Math.round((p.costUsd / total) * 100)) : 0;
     // GitHub connection — the whole PR/Projects/review half rides on gh being
     // logged in, so it lives in the corner you glance at, with a one-click
@@ -172,6 +174,7 @@ import { state } from './state.js';
         ? '<button class="sit updready" id="updready" title="Loom ' + esc(state.update.latest) + ' is out — open Updates">' + ICONS.up + " " + esc(state.update.latest) + "</button>"
         : "") +
       lpSeg +
+      branchSeg() +
       gdSeg +
       ghSeg +
       (busy ? '<span class="sit" style="color:var(--live)">' + busy + " working</span>" : "") +
@@ -187,7 +190,39 @@ import { state } from './state.js';
     if (upill) upill.onclick = openUsage;
     var gdb = document.getElementById("gitdel");
     if (gdb) gdb.onclick = function(){ openGitDeliveryMenu(gdb); };
+    var brb = document.getElementById("branchpill");
+    if (brb) brb.onclick = function(){
+      if (!state.showRail) { toast("open a project to see its changes"); return; }
+      if (!railOpen()) toggleRail(); // the panel is closed on laptop widths: open it
+      state.showRail("scm");
+    };
   }
+  /**
+   * The open project's branch, where it stands against its upstream, and how
+   * many files are changed — Loom's own .loom/ bookkeeping not counted.
+   * Polled gently (git status in a big repo isn't free) and after each turn.
+   */
+  function branchSeg(){
+    var g = state.gitStat, p = state.project;
+    if (!g || !p || g.pid !== p.id || !g.branch) return "";
+    var bits = (g.ahead ? " ↑" + g.ahead : "") + (g.behind ? " ↓" + g.behind : "");
+    return '<button class="sit branchpill' + (g.changed ? " dirty" : "") + '" id="branchpill" type="button" title="' +
+      esc(g.branch + (g.changed ? " · " + g.changed + " changed file" + (g.changed === 1 ? "" : "s") : " · clean") + (g.upstream ? " · tracking " + g.upstream : "") + " — open Source Control") + '">' +
+      ICONS.branch + esc(g.branch) + esc(bits) + (g.changed ? '<span class="bpn">' + g.changed + "</span>" : "") + "</button>";
+  }
+  function loadGitStat(){
+    var p = state.project; if (!state.token || !p || !p.id) return;
+    var pid = p.id;
+    api("/api/projects/" + pid + "/git/status").then(function(s){
+      var mine = function(f){ var n = typeof f === "string" ? f : (f && (f.path || f.file)) || ""; return n.indexOf(".loom/") !== 0; };
+      var changed = (s.staged || []).concat(s.unstaged || [], s.untracked || []).filter(mine);
+      var seen = {}; changed.forEach(function(f){ seen[typeof f === "string" ? f : (f.path || f.file)] = 1; });
+      state.gitStat = { pid: pid, branch: s.branch || "", ahead: s.ahead || 0, behind: s.behind || 0, upstream: s.upstream || null, changed: Object.keys(seen).length };
+      drawStatusbar();
+    }).catch(function(){ state.gitStat = { pid: pid, branch: "" }; drawStatusbar(); });
+  }
+  state.loadGitStat = loadGitStat;
+  if (!window.__gitPoll) window.__gitPoll = setInterval(function(){ if (!document.hidden) loadGitStat(); }, 15000);
 
 
   // GitHub connection, fetched once and after a connect. Machine-wide (gh auth

@@ -2,10 +2,12 @@ import { brandMark,kindOf } from '../agents.js';
 import { api } from '../connection.js';
 import { esc,rel } from '../format.js';
 import { ICONS,LOADER } from '../icons.js';
-import { toast } from '../notifications.js';
+import { askText,toast } from '../notifications.js';
 import { openSettingsModal } from '../settings.js';
 import { teamShareHtml,wireTeamShare } from '../team.js';
 import { showContinuityOverflow } from './continuity.js';
+import { emptyArt } from '../transcript.js';
+import { state } from '../state.js';
 
 /** brain behavior for one mounted project.
  * view contains live accessors to the owning project view's state and callbacks.
@@ -23,8 +25,10 @@ export function createBrain(view) {
       Promise.all([
         api("/api/projects/" + view.pid + "/brain?limit=200"),
         api("/api/projects/" + view.pid + "/memory").catch(function(){ return { memory: {} }; }),
+        api("/api/projects/" + view.pid + "/brain/usage").catch(function(){ return { usage: {} }; }),
         api("/api/projects/" + view.pid + "/brain/continuity").catch(function(){ return { enabled: false }; }),
       ]).then(function(r){
+        var usage = (r[2] && r[2].usage) || {};
         el = document.getElementById("pane-brain"); if (!el || view.brainView !== "mine") return;
         var memories = (r[0] && r[0].memories) || [];
         var stats = (r[0] && r[0].stats) || { total: 0, byKind: {} };
@@ -39,16 +43,28 @@ export function createBrain(view) {
           if (!n && view.brainKind !== k) return; // hide empty kinds unless selected
           chips += '<button class="bkind bk-' + k + (view.brainKind === k ? " on" : "") + '" data-kind="' + k + '">' + k + ' <span class="kn">' + n + "</span></button>";
         });
-        var head = '<div class="bhead">' + brainSwitchHtml() + '<div class="bkinds">' + chips + "</div></div>";
+        var head = '<div class="bhead">' + brainSwitchHtml() + '<div class="bkinds">' + chips + "</div>" +
+          '<div class="bio"><button type="button" class="btn xs ghost" id="bexport" title="download what this project knows, as JSON">' + ICONS.download + "Export</button>" +
+          '<button type="button" class="btn xs ghost" id="bimport" title="bring in a brain exported from Loom (duplicates are skipped)">' + ICONS.plus + "Import</button>" +
+          '<input type="file" id="bimportf" accept="application/json,.json" hidden></div></div>' +
+          '<div class="bsort"><span>Sort</span><button type="button" data-bsort="new" class="' + (state.brainSort !== "used" ? "on" : "") + '">Newest</button>' +
+          '<button type="button" data-bsort="used" class="' + (state.brainSort === "used" ? "on" : "") + '" title="how often each memory reached an agent’s prompt">Most used</button>' +
+          '<span style="margin-left:auto">View</span><button type="button" data-bgv="list" class="' + (!state.brainGraph ? "on" : "") + '">List</button>' +
+          '<button type="button" data-bgv="graph" class="' + (state.brainGraph ? "on" : "") + '" title="memories joined by the files and symbols they share">Graph</button></div>';
         if (continuity.enabled) head += '<div class="bsec">Native continuity <button class="lnk" id="continuity-inspect">Inspect packets and delivery</button></div><div class="bsec">Legacy memories below are retained for compatibility and are not injected by native continuity.</div>';
 
         // The memory list — the learned units. This is what phase 2 fills.
         var shown = view.brainKind ? memories.filter(function(x){ return x.kind === view.brainKind; }) : memories;
+        if (state.brainSort === "used") {
+          shown = shown.slice().sort(function(a, b){ return ((usage[b.id] || {}).n || 0) - ((usage[a.id] || {}).n || 0); });
+        }
         var list;
         if (!shown.length) {
-          list = '<div class="bempty">' + (memories.length
+          list = '<div class="bempty">' + (memories.length ? "" : emptyArt("brain")) + (memories.length
             ? "No " + esc(view.brainKind) + " memories yet."
             : continuity.enabled ? "Your original user messages are protected automatically. Review packets and source-backed checkpoints through native continuity diagnostics." : "Nothing learned yet. As agents finish turns, Loom reads each one and records what's worth keeping — constraints, decisions, and the failures worth not repeating. Add a decision below to seed it, or let an agent take a turn.") + "</div>";
+        } else if (state.brainGraph) {
+          list = '<div class="bgraph" id="bgraph"></div>';
         } else {
           list = '<div class="bmems">' + shown.map(function(x){
             var ents = (x.entities || []).slice(0, 6).map(function(e){ return '<span class="bent">' + esc(e) + "</span>"; }).join("");
@@ -59,11 +75,13 @@ export function createBrain(view) {
             return '<div class="bmem' + (low ? " low" : "") + '" data-mid="' + esc(x.id) + '">' +
               '<div class="bmrow"><span class="bbadge bk-' + esc(x.kind) + '">' + esc(x.kind) + "</span>" +
               '<span class="bmtext">' + esc(x.text) + "</span>" +
+              '<button class="bedit iconbtn xs" data-medit="' + esc(x.id) + '" title="correct this" aria-label="edit this memory">' + ICONS.pencil + "</button>" +
               '<button class="bforget iconbtn xs" data-forget="' + esc(x.id) + '" title="forget this" aria-label="forget this memory">' + ICONS.x + "</button></div>" +
               (ents ? '<div class="bents">' + ents + "</div>" : "") +
               '<div class="bmmeta">' + brandMark(kindOf(who)) + esc(who) +
               (when ? ' <span class="dim">\u00b7 ' + esc(when) + "</span>" : "") +
-              (low ? ' <span class="dim">\u00b7 ' + conf + '% \u2014 shown, not injected</span>' : "") +
+              (low ? ' <span class="dim">· ' + conf + '% — shown, not injected</span>' : "") +
+              (usage[x.id] ? ' <span class="bused" title="reached an agent’s prompt ' + usage[x.id].n + " time" + (usage[x.id].n === 1 ? "" : "s") + ", last " + esc(rel(usage[x.id].at)) + '">used ' + usage[x.id].n + "×</span>" : "") +
               "</div></div>";
           }).join("") + "</div>";
         }
@@ -88,6 +106,10 @@ export function createBrain(view) {
 
         el.innerHTML = '<div class="pane-inner brain">' + head + seed + '<div id="bconflicts"></div>' + list + src + "</div>";
         wireBrainSwitch(el);
+        if (state.brainGraph && shown.length) view.drawMemGraph(document.getElementById("bgraph"), shown, usage);
+        Array.prototype.forEach.call(el.querySelectorAll("[data-bgv]"), function(b){
+          b.onclick = function(){ state.brainGraph = b.getAttribute("data-bgv") === "graph"; refreshBrain(); };
+        });
         var inspect = el.querySelector("#continuity-inspect");
         if(inspect) inspect.onclick = function(){
           var scrim = document.createElement("div"); scrim.className = "scrim";
@@ -134,15 +156,61 @@ export function createBrain(view) {
         Array.prototype.forEach.call(el.querySelectorAll(".bkind"), function(b){
           b.onclick = function(){ view.brainKind = b.getAttribute("data-kind"); refreshBrain(); };
         });
+        Array.prototype.forEach.call(el.querySelectorAll("[data-bsort]"), function(b){
+          b.onclick = function(){ state.brainSort = b.getAttribute("data-bsort"); refreshBrain(); };
+        });
+        Array.prototype.forEach.call(el.querySelectorAll("[data-medit]"), function(b){
+          b.onclick = function(ev){
+            ev.stopPropagation();
+            var id = b.getAttribute("data-medit");
+            var cur = memories.filter(function(m){ return m.id === id; })[0];
+            if (!cur) return;
+            askText("Correct this memory", { value: cur.text, multiline: true, required: true, note: "Agents get the new wording from their next turn. The old one stays in its history.", ok: "Save" }).then(function(text){
+              if (text === null || !text.trim() || text.trim() === cur.text) return;
+              api("/api/projects/" + view.pid + "/brain/" + encodeURIComponent(id), { method: "PATCH", body: JSON.stringify({ text: text.trim() }) })
+                .then(function(){ toast("updated · the old wording stays in its history"); refreshBrain(); })
+                .catch(function(err){ toast(err.message); });
+            });
+          };
+        });
+        var bex = document.getElementById("bexport");
+        if (bex) bex.onclick = function(){
+          api("/api/projects/" + view.pid + "/brain/export").then(function(dump){
+            var blob = new Blob([JSON.stringify(dump, null, 2)], { type: "application/json" });
+            var a = document.createElement("a");
+            a.href = URL.createObjectURL(blob);
+            a.download = String((state.project && state.project.name) || "loom").replace(/[^\w.-]+/g, "-") + "-brain.json";
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(function(){ URL.revokeObjectURL(a.href); }, 4000);
+            toast("exported " + ((dump && dump.memories && dump.memories.length) || 0) + " memories");
+          }).catch(function(err){ toast(err.message); });
+        };
+        var bim = document.getElementById("bimport"), bif = document.getElementById("bimportf");
+        if (bim && bif) {
+          bim.onclick = function(){ bif.value = ""; bif.click(); };
+          bif.onchange = function(){
+            var f = bif.files && bif.files[0]; if (!f) return;
+            if (f.size > 1900000) { toast("that file is over 2 MB — too big to import in one go"); return; }
+            f.text().then(function(txt){
+              var body;
+              try { body = JSON.parse(txt); } catch (e) { throw new Error("that isn’t a JSON file"); }
+              return api("/api/projects/" + view.pid + "/brain/import", { method: "POST", body: JSON.stringify(body) });
+            }).then(function(r){
+              toast("imported " + (r.added || 0) + " new · " + (r.known || 0) + " already known");
+              refreshBrain();
+            }).catch(function(err){ toast(err.message); });
+          };
+        }
         Array.prototype.forEach.call(el.querySelectorAll("[data-forget]"), function(b){
           b.onclick = function(ev){
             ev.stopPropagation();
             var id = b.getAttribute("data-forget");
-            var reason = window.prompt("Forget this memory — why? (kept in history)", "no longer true");
-            if (reason === null) return;
-            api("/api/projects/" + view.pid + "/brain/" + id + "?reason=" + encodeURIComponent(reason.trim() || "forgotten"), { method: "DELETE" })
-              .then(function(){ toast("forgotten \u00b7 its history stays"); refreshBrain(); })
-              .catch(function(err){ toast(err.message); });
+            askText("Forget this memory — why?", { value: "no longer true", note: "It leaves the brain; its history stays.", ok: "Forget" }).then(function(reason){
+              if (reason === null) return;
+              api("/api/projects/" + view.pid + "/brain/" + id + "?reason=" + encodeURIComponent(reason.trim() || "forgotten"), { method: "DELETE" })
+                .then(function(){ toast("forgotten · its history stays"); refreshBrain(); })
+                .catch(function(err){ toast(err.message); });
+            });
           };
         });
         var reimp = document.getElementById("reimport");
@@ -151,14 +219,22 @@ export function createBrain(view) {
             .then(function(rr){ toast(rr.imported ? "imported " + rr.imported + " source(s)" : "already current"); refreshBrain(); })
             .catch(function(err){ toast(err.message); });
         };
+        // Add is live only when there's something to add — an Add that did
+        // nothing on an empty box looked broken.
+        var decBtn = document.querySelector("#decform button[type=submit]");
+        var decBox = document.getElementById("decbox");
+        var decSync = function(){ if (decBtn) decBtn.disabled = !(decBox.value || "").trim(); };
+        decBox.addEventListener("input", decSync); decSync();
         document.getElementById("decform").onsubmit = function(ev){
           ev.preventDefault();
-          var box = document.getElementById("decbox");
+          var box = decBox;
           var text = (box.value || "").trim();
-          if (!text) return;
+          if (!text || (decBtn && decBtn.getAttribute("data-busy"))) return;
+          if (decBtn) { decBtn.setAttribute("data-busy", "1"); decBtn.disabled = true; }
           api("/api/projects/" + view.pid + "/decisions", { method: "POST", body: JSON.stringify({ text: text }) })
-            .then(function(){ box.value = ""; refreshBrain(); })
-            .catch(function(err){ toast(err.message); });
+            .then(function(){ box.value = ""; toast("saved to memory"); refreshBrain(); })
+            .catch(function(err){ toast(err.message); })
+            .then(function(){ if (decBtn) decBtn.removeAttribute("data-busy"); decSync(); });
         };
       }).catch(function(err){ toast(err.message); });
     }
@@ -273,13 +349,19 @@ export function createBrain(view) {
           var action = b.getAttribute("data-tbact"), body = JSON.parse(b.getAttribute("data-tbbody") || "{}");
           if (action === "correct") {
             var cur = mems.filter(function(m){ return m.id === body.id; })[0];
-            var text = window.prompt("Correct this memory \u2014 what\u2019s true instead? (theirs stays in history)", cur ? cur.text : "");
-            if (text === null || !text.trim()) return;
-            body.text = text.trim();
+            askText("Correct this memory — what’s true instead?", { value: cur ? cur.text : "", note: "Theirs stays in history.", multiline: true, required: true, ok: "Correct" }).then(function(text){
+              if (text === null || !text.trim()) return;
+              body.text = text.trim();
+              teamBrainAct(action, body, b);
+            });
+            return;
           } else if (action === "resolve") {
-            var why = window.prompt("Why keep this one? (the other stays in history)", "");
-            if (why === null) return;
-            body.reason = why.trim();
+            askText("Why keep this one?", { note: "The other stays in history.", ok: "Keep this one" }).then(function(why){
+              if (why === null) return;
+              body.reason = why.trim();
+              teamBrainAct(action, body, b);
+            });
+            return;
           }
           teamBrainAct(action, body, b);
         };

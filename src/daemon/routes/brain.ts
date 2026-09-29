@@ -181,6 +181,34 @@ export function registerBrainRoutes(app: Express, withRuntime: WithRuntime): voi
     }),
   );
 
+  // The event log on disk: how big, and a VACUUM to give back free pages.
+  app.get(
+    "/api/projects/:id/log/size",
+    withRuntime(async (rt, _req, res) => {
+      res.json(rt.log.size());
+    }),
+  );
+  app.post(
+    "/api/projects/:id/log/compact",
+    withRuntime(async (rt, _req, res) => {
+      const before = rt.log.size();
+      try {
+        rt.log.compact();
+      } catch (err) {
+        return void res.status(409).json({ error: `couldn't compact the log right now: ${err instanceof Error ? err.message : String(err)}` });
+      }
+      res.json({ before, after: rt.log.size() });
+    }),
+  );
+
+  // How often each memory reached an agent's prompt.
+  app.get(
+    "/api/projects/:id/brain/usage",
+    withRuntime(async (rt, _req, res) => {
+      res.json({ usage: rt.memoryUsage() });
+    }),
+  );
+
   // Likely contradictions between units, heuristically flagged for a human
   // to resolve — each flag names the signal that tripped it.
   app.get(

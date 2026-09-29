@@ -15,6 +15,56 @@ export function registerTeamRoutes(app: Express, ctx: Pick<RouteContext, "auth" 
     res.json(ctx.team.status());
   });
 
+  /**
+   * Sign in to the hosted Team Hub with GitHub, from the app.
+   *
+   * It only existed in the CLI, so the app's Team screen offered a
+   * self-hosted form and nothing for the hub most people use. The daemon runs
+   * the same loopback sign-in the CLI does and answers with GitHub's
+   * authorize URL for the app to open; when GitHub sends the browser back,
+   * the session lands here and the team connects. The app watches /api/team.
+   */
+  let hostedPending: { startedAt: number; error?: string } | null = null;
+  app.post("/api/team/hosted-signin", (req, res) => {
+    if (!(req as Request & { isAdmin?: boolean }).isAdmin) {
+      return void res.status(403).json({ error: "admin only" });
+    }
+    void (async () => {
+      try {
+        const { hostedHubUrl, hostedSupabaseUrl, publishableKeyFor } = await import("../../core/hosted.js");
+        const { hostedSignIn } = await import("../../hub/supabase-client.js");
+        const supabaseUrl = hostedSupabaseUrl("hosted");
+        if (!supabaseUrl) throw new Error("no hosted hub is configured for this build");
+        let answered = false;
+        hostedPending = { startedAt: Date.now() };
+        const done = hostedSignIn({
+          supabaseUrl,
+          publishableKey: publishableKeyFor(supabaseUrl),
+          timeoutMs: 10 * 60 * 1000,
+          openBrowser: (url) => {
+            answered = true;
+            res.json({ url });
+          },
+        });
+        done
+          .then(async (session) => {
+            await ctx.team.signIn(hostedHubUrl(supabaseUrl), { token: session.refreshToken });
+            await ctx.team.connect();
+            hostedPending = null;
+          })
+          .catch((err: Error) => {
+            hostedPending = { startedAt: Date.now(), error: err.message };
+            if (!answered) res.status(400).json({ error: err.message });
+          });
+      } catch (err) {
+        res.status(400).json({ error: (err as Error).message });
+      }
+    })();
+  });
+  app.get("/api/team/hosted-signin", (_req, res) => {
+    res.json({ pending: Boolean(hostedPending && !hostedPending.error), error: hostedPending?.error ?? null });
+  });
+
   app.post("/api/team/:action", (req, res) => {
     if (!(req as Request & { isAdmin?: boolean }).isAdmin) {
       return void res.status(403).json({ error: "admin only" });

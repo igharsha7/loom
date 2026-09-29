@@ -35,7 +35,16 @@ export class EventLog implements EventJournal {
         sqlite = await import("node:sqlite");
       } catch {
         // No node:sqlite in this runtime — the JSONL store is the whole point
-        // of the fallback. This is the ONLY thing it catches.
+        // of the fallback. This is the ONLY thing it catches. But not beside a
+        // log.db: an older Node (a shell that put nvm's 20 first after a
+        // reboot) opened an EMPTY jsonl log next to the real history, and the
+        // app showed every thread blank, which reads exactly like data loss.
+        if (fs.existsSync(path.join(loomDir, "log.db"))) {
+          throw new Error(
+            `this project's history is in ${path.join(loomDir, "log.db")}, which needs node:sqlite — ` +
+              `run Loom on Node 22.5 or newer (this is Node ${process.versions.node})`,
+          );
+        }
         return new EventLog(new JsonlStore(path.join(loomDir, "log.jsonl")));
       }
       // Deliberately outside the catch. If node:sqlite exists but the log won't
@@ -100,6 +109,19 @@ export class EventLog implements EventJournal {
     // Capture and its idempotency row commit together before clients see either.
     if (result.created) this.emitter.emit("event", result.event);
     return result;
+  }
+
+  lastReplyIds(): Map<string, number> {
+    if (this.closed) throw new Error("event log is closed");
+    return this.store.lastReplyIds();
+  }
+
+  size(): { bytes: number; events: number } {
+    return this.store.size();
+  }
+
+  compact(): void {
+    this.store.compact();
   }
 
   /** Live subscription to appended events; returns unsubscribe. */

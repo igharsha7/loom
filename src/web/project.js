@@ -19,7 +19,7 @@ import { api,clearTimers } from './connection.js';
 import { bindConsole } from './console.js';
 import { renderDiffLines } from './diff.js';
 import { maybeDigest } from './digest.js';
-import { esc } from './format.js';
+import { drawMermaid,esc,money,pageGone,rel } from './format.js';
 import { ICONS,LOADER } from './icons.js';
 import { applyRail,makeResizer,toggleRail } from './layout.js';
 import { toast } from './notifications.js';
@@ -29,6 +29,10 @@ import { root,state } from './state.js';
 import { loadGitDelivery } from './statusbar.js';
 import { loadTeam,loadTeamRunners,runnerHooks,teamEditing,teamHooks } from './team.js';
 import { bindTheme } from './theme.js';
+import { agentGlyph,agentLabel,labelOf } from './agents.js';
+import { durfmt } from './transcript.js';
+import { openBoardTaskModal } from './tasks.js';
+import { openMenu } from './menus.js';
 
 
   // ---- project view (mobile: sheets · desktop: Orca workspace tabs) -------
@@ -57,6 +61,7 @@ import { bindTheme } from './theme.js';
       get BROWSER_TAB() { return BROWSER_TAB; },
     });
     var { refreshBrain, refreshTeamBrain } = createBrain({
+      get drawMemGraph() { return drawMemGraph; },
       get brainView() { return brainView; }, set brainView(value) { brainView = value; },
       get pid() { return pid; },
       get brainKind() { return brainKind; }, set brainKind(value) { brainKind = value; },
@@ -78,6 +83,8 @@ import { bindTheme } from './theme.js';
       get OWN_STATE() { return OWN_STATE; },
     });
     var { openFileFromTree, drawRail, loadDir, drawExplorer } = createExplorer({
+      get jumpToMessage() { return jumpToMessage; },
+      get loadEarlier() { return loadEarlier; },
       get refresh() { return refresh; },
       get openChangesDock() { return openChangesDock; },
       get openFileDock() { return openFileDock; },
@@ -86,8 +93,12 @@ import { bindTheme } from './theme.js';
       get refreshTree() { return refreshTree; },
       get drawStatus() { return drawStatus; }
     });
-    var { drawStatus, refresh, loadHistory, connect } = createThread({
+    var { drawStatus, refresh, loadHistory, connect, drawEmpty, threadScroller, wantScroll, stickOrFlag, toBottom, liveFor, nearBottom, loadEarlier } = createThread({
       get loadQueue() { return loadQueue; },
+      get autosizeBox() { return autosizeBox; },
+      get jumpToMessage() { return jumpToMessage; },
+      get markDays() { return markDays; },
+      get syncStars() { return syncStars; },
       get orchRunForChat() { return orchRunForChat; },
       get planState() { return planState; },
       get orchTerminal() { return orchTerminal; },
@@ -106,7 +117,23 @@ import { bindTheme } from './theme.js';
       get onApprovalEvent() { return onApprovalEvent; },
       get onFleetEvent() { return onFleetEvent; }
     });
-    var { autosizeBox, drawAttach, closeMenu, menuAway, openModelMenu, bindComposer, updateModelLabel, openPermMenu, composerPlaceholder } = createComposer({
+    var { autosizeBox, drawAttach, closeMenu, menuAway, openModelMenu, bindComposer, updateModelLabel, openPermMenu, composerPlaceholder, send } = createComposer({
+      get historyLoaded() { return historyLoaded; },
+      get clearDraft() { return clearDraft; },
+      get drawEmpty() { return drawEmpty; },
+      get drawLengthPill() { return drawLengthPill; },
+      get exportThread() { return exportThread; },
+      get holdForReconnect() { return holdForReconnect; },
+      get liveFor() { return liveFor; },
+      get myPrompts() { return myPrompts; },
+      get openFind() { return openFind; },
+      get recall() { return recall; },
+      get replyLength() { return replyLength; },
+      get restoreDraft() { return restoreDraft; },
+      get saveDraft() { return saveDraft; },
+      get setReplyLength() { return setReplyLength; },
+      get stickOrFlag() { return stickOrFlag; },
+      get wantScroll() { return wantScroll; },
       get sendOrchestra() { return sendOrchestra; },
       get attach() { return attach; }, set attach(value) { attach = value; },
       get planState() { return planState; }, set planState(value) { planState = value; },
@@ -141,6 +168,9 @@ import { bindTheme } from './theme.js';
       get chatId() { return chatId; },
     });
     var { orchRoster, orchCfg, orchTerminal, findOrchRun, orchRunForChat, mergeOrchRun, setComposerMode, drawOrchControls, sendOrchestra, needsInputClick, answerAgent, askRewind, openRewindMenu, openOrchChat, loadOrch, onOrchEvent, drawOrchTabDot, orchEl, openOrchSheet, closeOrchSheet, orchPill, drawOrch, redeliverOrch, applyOrch } = createOrchestra({
+      get draftKey() { return draftKey; },
+      get openPatchDock() { return openPatchDock; },
+      get saveDraft() { return saveDraft; },
       get orch() { return orch; },
       get chatId() { return chatId; },
       get composerPlaceholder() { return composerPlaceholder; },
@@ -251,29 +281,35 @@ import { bindTheme } from './theme.js';
       '<div class="corch" id="corch" style="display:none"></div>' +
       '<div class="crow">' +
       '<div class="cmode" id="cmode" role="tablist" aria-label="composer mode">' +
-      '<button type="button" role="tab" data-cmode="chat" title="talk to one agent">Chat</button>' +
-      '<button type="button" role="tab" data-cmode="orch" title="one agent plans, many work in parallel">Orchestrate</button></div>' +
+      '<button type="button" role="tab" data-cmode="chat" title="talk to one agent">' + ICONS.chat + "Chat</button>" +
+      '<button type="button" role="tab" data-cmode="orch" title="one agent plans, many work in parallel">' + ICONS.orchestra + "Orchestrate</button></div>" +
       '<button class="ctool iconly" id="attach" type="button" title="attach an image or file" aria-label="attach a file">' + ICONS.plus + '</button>' +
+      // Who and on what, as one joined control: the agent half opens the
+      // agent picker, the model half the model picker. Two pills side by side
+      // used to read as two unrelated settings.
+      '<span class="cpick" id="cpick">' +
       '<button class="cagent" id="cagent" type="button" title="who runs this turn \u2014 AUTO routes it, or pick an agent" aria-label="who runs this turn"><span class="cadot" id="cadot"></span><span class="can">agent</span><span class="cchev">' + ICONS.chevron + "</span></button>" +
+      '<button class="ctool" id="modelpick" type="button" title="pick a model" aria-label="pick a model">' + '<span class="cmodel" id="cmodellabel">model</span>' + '<span class="cchev">' + ICONS.updown + "</span></button>" +
+      "</span>" +
       // What the chosen agent may do without asking. Drawn by drawPermChip().
       '<button class="cperm" id="cperm" type="button" aria-haspopup="menu" style="display:none"></button>' +
-      '<button class="ctool" id="modelpick" type="button" title="pick a model" aria-label="pick a model">' + '<span class="cmodel" id="cmodellabel">model</span>' + '<span class="cchev">' + ICONS.chevron + "</span></button>" +
       // The chosen agent's context meter and usage limits (usage.js).
       '<span class="cctx" id="cctx" style="display:none"></span>' +
-      '<span class="cdiv"></span>' +
       // MCPs and Skills live behind this rather than beside it: they are
       // occasional settings, and the row they were on has to hold the model,
       // the agent, the permission chip, prompts and send — on a narrow window
       // it wrapped. The count badge stays on the outside, because "two skills
       // are on" is the part you need without opening anything.
       '<button class="cslot" id="morebtn" type="button" aria-haspopup="menu" aria-expanded="false" title="MCPs, skills and more"><span class="cslotico">' + ICONS.dots + '</span><span class="cslotlbl">More</span><span class="skcount" id="skcount" style="display:none">0</span></button>' +
-      '<button class="cslot" id="micbtn" type="button" title="hold to talk — needs LOOM_STT_CMD on the daemon"><span class="cslotico">' + ICONS.mic + "</span></button>" +
+      '<button class="cslot" id="micbtn" type="button" title="hold to talk — transcribed by LOOM_STT_CMD on the daemon, or by this browser when that isn’t set"><span class="cslotico">' + ICONS.mic + "</span></button>" +
       // Saved and recent prompts, a clipboard manager's worth (⌘⇧V).
       '<button class="cprompt" id="promptbtn" type="button" aria-haspopup="dialog" title="prompts \u2014 saved and recent (' + KMOD + '\u21e7V)">' +
         ICONS.clipboard + '<span class="cslotlbl">Prompts</span><kbd>' + KMOD + "\u21e7V</kbd></button>" +
       '<span style="flex:1"></span>' +
       // Plan and send travel together: when a narrow row wraps, the switch that
       // changes what send does never ends up a line away from send.
+      '<span class="ctok" id="ctok" aria-live="off"></span>' +
+      '<span class="ckhint" aria-hidden="true"><kbd>⏎</kbd> send · <kbd>⇧⏎</kbd> new line</span>' +
       '<span class="csend">' +
       // Plan: a switch, not a mode tab — it changes what either send does.
       '<button class="cplan" id="planbtn" type="button" role="switch" aria-checked="false" title="plan mode \u2014 write a plan, change no code">' +
@@ -291,7 +327,10 @@ import { bindTheme } from './theme.js';
       mount.innerHTML =
         '<div class="panel">' +
         // Orca chrome: the strip is the window top — context, tabs, actions.
-        '<div class="tabstrip" id="tabstrip">' +
+          '<div class="tabstrip" id="tabstrip">' +
+        // Only shown on a narrow window, where the sidebar slides in instead
+        // of taking a third of the width.
+        '<button id="sbbtn" class="iconbtn sbbtn" type="button" title="projects and threads" aria-label="show projects and threads">' + ICONS.panelRight + "</button>" +
         // No project title here. The sidebar already names every project and
         // highlights the open one, so this printed it a second time three
         // inches away — and for a project called "loom" that's the word "loom"
@@ -319,7 +358,8 @@ import { bindTheme } from './theme.js';
         "</div>" +
         '<div class="paneswrap">' +
         '<div class="mainpane" id="mainpane">' +
-        '<div class="pane scroll" id="pane-thread"><div id="agenthead" class="agenthead" style="display:none"></div><div id="routebar"></div><div id="feed">' + LOADER + "</div></div>" +
+        '<div class="pane scroll" id="pane-thread"><div id="agenthead" class="agenthead" style="display:none"></div><div id="routebar"></div><div id="feed">' + LOADER + '</div><div id="feedlive" aria-live="polite"></div>' +
+        '<button type="button" class="jumpnew" id="jumpnew">' + ICONS.arrowDown + "Latest</button></div>" +
         '<div class="pane scroll" id="pane-brain" style="display:none">' + LOADER + "</div>" +
         '<div class="pane scroll" id="pane-observatory" style="display:none">' + LOADER + "</div>" +
         '<div class="pane scroll" id="pane-board" style="display:none"></div>' +
@@ -340,6 +380,9 @@ import { bindTheme } from './theme.js';
         '<div class="termtabs"><span id="termtabs" style="display:contents"></span>' +
         '<button id="termadd" class="iconbtn" title="new terminal">' + ICONS.plus + "</button>" +
         '<span class="spacer"></span>' +
+        '<span class="termfind" id="termfind" hidden><input id="termq" placeholder="Find in terminal" spellcheck="false" autocomplete="off" aria-label="find in terminal"><span id="termqn" class="termqn"></span></span>' +
+        '<button id="termsearch" class="iconbtn" title="Find in this terminal">' + ICONS.search + "</button>" +
+        '<button id="termclear" class="iconbtn" title="Clear this terminal">' + ICONS.trash + "</button>" +
         '<button id="termhide" class="iconbtn" title="hide terminal">' + ICONS.x + "</button></div>" +
         '<div class="termpanes" id="termpanes">' +
         '<div class="conwrap" id="conwrap">' +
@@ -426,7 +469,8 @@ import { bindTheme } from './theme.js';
         '<div class="ptitle"><span class="nm" id="pname">&hellip;</span><span class="st" id="pstat"></span></div>' +
         '<span class="spacer"></span>' + headerActions + "</header>" +
         '<div class="chips" id="chips"></div>' +
-        '<div class="scroll" id="pane-thread"><div id="routesheet"></div><div id="routebar"></div><div id="feed">' + LOADER + "</div></div>" +
+        '<div class="scroll" id="pane-thread"><div id="routesheet"></div><div id="routebar"></div><div id="feed">' + LOADER + '</div><div id="feedlive" aria-live="polite"></div>' +
+        '<button type="button" class="jumpnew" id="jumpnew">' + ICONS.arrowDown + "Latest</button></div>" +
         composerHtml +
         "</div>";
     }
@@ -454,17 +498,43 @@ import { bindTheme } from './theme.js';
       // asked of every agent in every open project, not one run's workers.
       tabs.splice(2, 0, "fleet");
       if (tabs.indexOf(state.tab) < 0) state.tab = "thread";
-      var LBL = { thread: [ICONS.thread, "Thread"], orchestra: [ICONS.orchestra, "Orchestra"], fleet: [ICONS.fleet, "Fleet"], board: [ICONS.board, "Board"],
-                  brain: [ICONS.memory, "Brain"], observatory: [ICONS.telescope, "Observatory"] };
+      // Plain words, each with a line saying what's behind it: "Brain",
+      // "Fleet" and "Observatory" were names you had to learn before you
+      // could guess what they did.
+      var LBL = { thread: [ICONS.thread, "Chat", "talk to an agent in this thread"],
+                  orchestra: [ICONS.orchestra, "Orchestra", "one agent plans, a team builds in parallel"],
+                  fleet: [ICONS.fleet, "Agents", "what every agent is doing right now"],
+                  board: [ICONS.board, "Board", "issues, PRs and tasks"],
+                  brain: [ICONS.memory, "Memory", "what every agent here remembers"],
+                  observatory: [ICONS.telescope, "Insights", "time, tokens and cost"] };
       box.innerHTML = tabs.map(function(tb){
-        return '<button class="tab' + (state.tab === tb ? " active" : "") + '" data-tab="' + tb + '">' +
-          LBL[tb][0] + LBL[tb][1] + (tb === "orchestra" ? '<span class="tdot" id="orchtdot" style="display:none"></span>' : "") + "</button>";
+        return '<button class="tab' + (state.tab === tb ? " active" : "") + '" data-tab="' + tb + '" title="' + LBL[tb][1] + " — " + LBL[tb][2] + '">' +
+          LBL[tb][0] + '<span class="tl">' + LBL[tb][1] + "</span>" + (tb === "orchestra" ? '<span class="tdot" id="orchtdot" style="display:none"></span>' : "") + "</button>";
       }).join("");
       Array.prototype.forEach.call(box.querySelectorAll(".tab"), function(tb){
         tb.onclick = function(){ showTab(tb.getAttribute("data-tab")); };
       });
     }
     function showTab(name){
+      // a quick crossfade between workspace tabs, where the browser can
+      var still = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      if (document.startViewTransition && state.tab && state.tab !== name && !still && !showTab.inTransition) {
+        showTab.inTransition = true;
+        try {
+          var vt = document.startViewTransition(function(){ showTabNow(name); });
+          // A transition skipped (hidden tab, a second one on top) rejects
+          // ready and updateCallbackDone too; the tab still switches, so
+          // those are nothing to report.
+          var quiet = function(){};
+          if (vt.ready) vt.ready.catch(quiet);
+          if (vt.updateCallbackDone) vt.updateCallbackDone.catch(quiet);
+          vt.finished.then(function(){ showTab.inTransition = false; }, function(){ showTab.inTransition = false; });
+          return;
+        } catch (e) { showTab.inTransition = false; }
+      }
+      showTabNow(name);
+    }
+    function showTabNow(name){
       state.tab = name;
       ["thread", "orchestra", "fleet", "board", "brain", "observatory"].forEach(function(t){
         var p = document.getElementById("pane-" + t);
@@ -527,6 +597,17 @@ import { bindTheme } from './theme.js';
     if (desktop) {
       document.getElementById("dockclose").onclick = closeDock;
       document.getElementById("railbtn").onclick = toggleRail;
+      // Narrow window: the sidebar slides in over the thread, and goes away
+      // again on a pick (this view is re-rendered then) or a click outside it.
+      var shellEl = document.querySelector(".dshell");
+      if (shellEl) shellEl.classList.remove("sbopen");
+      var sbb = document.getElementById("sbbtn");
+      if (sbb) sbb.onclick = function(ev){ ev.stopPropagation(); var sh = document.querySelector(".dshell"); if (sh) sh.classList.toggle("sbopen"); };
+      var dm = document.getElementById("dmain");
+      if (dm && !dm._sbClose) {
+        dm._sbClose = true;
+        dm.addEventListener("mousedown", function(){ var sh = document.querySelector(".dshell"); if (sh) sh.classList.remove("sbopen"); });
+      }
       // The terminal button wants the terminal. If the console tab is the active
       // pane, switch to a terminal rather than closing the dock out from under it.
       document.getElementById("termbtn").onclick = function(){
@@ -587,6 +668,38 @@ import { bindTheme } from './theme.js';
     if (desktop) {
       document.getElementById("termhide").onclick = function(){ localStorage.setItem(TERM_KEY, "0"); applyTerm(); };
       document.getElementById("termadd").onclick = function(){ addTerm(); };
+      var tclr = document.getElementById("termclear");
+      if (tclr) tclr.onclick = function(){ var t = curTerm(); if (t && t.xterm) { t.xterm.clear(); focusTerm(); } else toast("open a terminal first"); };
+      var tsr = document.getElementById("termsearch"), tf = document.getElementById("termfind"), tq = document.getElementById("termq");
+      if (tsr && tf && tq) {
+        var tfind = { q: "", at: -1 };
+        tsr.onclick = function(){ tf.hidden = !tf.hidden; if (!tf.hidden) { tq.focus(); tq.select(); } };
+        // no search addon ships: read the buffer, newest match first, and select it
+        var termFind = function(dir){
+          var t = curTerm(), n = document.getElementById("termqn");
+          if (!t || !t.xterm) { if (n) n.textContent = ""; return; }
+          var q = tq.value.trim().toLowerCase(), buf = t.xterm.buffer.active;
+          if (!q) { t.xterm.clearSelection(); if (n) n.textContent = ""; return; }
+          var hits = [];
+          for (var y = 0; y < buf.length; y++) {
+            var line = buf.getLine(y); if (!line) continue;
+            var s = line.translateToString(true).toLowerCase(), k = -1;
+            while ((k = s.indexOf(q, k + 1)) >= 0) hits.push([y, k]);
+          }
+          if (!hits.length) { t.xterm.clearSelection(); if (n) n.textContent = "no match"; return; }
+          if (q !== tfind.q) { tfind.q = q; tfind.at = hits.length; }
+          tfind.at = (tfind.at + dir + hits.length) % hits.length;
+          var h = hits[tfind.at];
+          t.xterm.select(h[1], h[0], q.length);
+          t.xterm.scrollToLine(Math.max(0, h[0] - Math.floor(t.xterm.rows / 2)));
+          if (n) n.textContent = (tfind.at + 1) + "/" + hits.length;
+        };
+        tq.addEventListener("keydown", function(e){
+          if (e.key === "Enter") { e.preventDefault(); termFind(e.shiftKey ? 1 : -1); }
+          else if (e.key === "Escape") { e.preventDefault(); tf.hidden = true; var t = curTerm(); if (t && t.xterm) t.xterm.clearSelection(); focusTerm(); }
+        });
+        tq.addEventListener("input", function(){ tfind.q = ""; termFind(-1); });
+      }
       var tin = document.getElementById("terminput");
       tin.addEventListener("keydown", function(e){
         var t = curTerm(); if (!t) return;
@@ -689,6 +802,88 @@ import { bindTheme } from './theme.js';
       if (rw) { ev.preventDefault(); ev.stopPropagation(); askRewind(rw.getAttribute("data-rewind"), rw); return; }
       var go = ev.target.closest && ev.target.closest("[data-gochat]");
       if (go) { ev.preventDefault(); openOrchChat(go.getAttribute("data-gochat")); return; }
+      // A message's own actions: the ⋯ menu, your prompt's edit/copy/star,
+      // and Continue on a reply you stopped.
+      var rb = ev.target.closest && ev.target.closest(".msgrate");
+      if (rb) {
+        ev.preventDefault(); ev.stopPropagation();
+        var rmsg = rb.closest(".msg"), rid = Number(rmsg.getAttribute("data-id")) || 0, ragent = rmsg.getAttribute("data-agent");
+        var want = Number(rb.getAttribute("data-rate")), had = state.rateMap && state.rateMap[rid] ? state.rateMap[rid].v : 0;
+        var val = had === want ? 0 : want;
+        api("/api/projects/" + pid + "/chats/" + encodeURIComponent(chatId) + "/rate", { method: "POST", body: JSON.stringify({ eventId: rid, agentId: ragent, value: val }) })
+          .then(function(j){
+            state.rateMap = j.ratings || {};
+            Array.prototype.forEach.call(rmsg.querySelectorAll(".msgrate"), function(x){
+              var on = Number(x.getAttribute("data-rate")) === val;
+              x.classList.toggle("on", on); x.classList.toggle("down", on && val === -1); x.setAttribute("aria-pressed", on ? "true" : "false");
+            });
+            toast(val === 1 ? "noted — a good one from " + labelOf(ragent) : val === -1 ? "noted — " + labelOf(ragent) + " missed on this one" : "rating cleared");
+          })
+          .catch(function(err){ toast(err.message); });
+        return;
+      }
+      var mm = ev.target.closest && ev.target.closest(".msgmore");
+      if (mm) { ev.preventDefault(); ev.stopPropagation(); msgMenu(mm.closest(".msg"), mm); return; }
+      var ua = ev.target.closest && ev.target.closest(".uact");
+      if (ua) {
+        ev.preventDefault(); ev.stopPropagation();
+        var um = ua.closest(".msg"), raw = decodeURIComponent((um && um.getAttribute("data-raw")) || "");
+        if (ua.classList.contains("uedit")) composeFor(raw, null, false);
+        else if (ua.classList.contains("ucopy")) copyText(raw);
+        else if (ua.classList.contains("ustar")) toggleStar(Number(um.getAttribute("data-id")) || 0);
+        return;
+      }
+      var eo = ev.target.closest && ev.target.closest("[data-errother]");
+      if (eo) {
+        ev.preventDefault(); ev.stopPropagation();
+        var card = eo.closest(".errcard"), failed = eo.getAttribute("data-errother");
+        var ask = promptFor(card);
+        if (!ask) { toast("couldn’t find the prompt this error answered — scroll up and use Retry on it"); return; }
+        var alts = ((state.project && state.project.agents) || []).filter(function(a){ return a.tier === "adapter" && a.enabled !== false && a.id !== failed; });
+        if (!alts.length) { toast("no other agent is switched on in this project"); return; }
+        var rr = eo.getBoundingClientRect();
+        openMenu(Math.round(rr.left), Math.round(rr.bottom + 4), [{ head: "Send the same prompt to" }].concat(alts.map(function(a){
+          return { label: agentLabel(a.kind, a.id), icon: agentGlyph(a.kind, a.id), hint: a.busy ? "busy" : "", run: function(){ composeFor(ask, a.id, true); } };
+        })));
+        return;
+      }
+      var ew = ev.target.closest && ev.target.closest("[data-errwait]");
+      if (ew) {
+        ev.preventDefault(); ev.stopPropagation();
+        var wcard = ew.closest(".errcard"), wprompt = promptFor(wcard), wagent = ew.getAttribute("data-errwait");
+        var wuntil = Number(ew.getAttribute("data-until")) || 0;
+        if (!wprompt) { toast("couldn’t find the prompt this error answered"); return; }
+        if (wuntil <= Date.now()) { composeFor(wprompt, wagent, true); return; }
+        if (ew.getAttribute("data-armed")) { ew.removeAttribute("data-armed"); clearTimeout(ew._t); toast("won’t retry"); ew.classList.remove("armed"); return; }
+        ew.setAttribute("data-armed", "1"); ew.classList.add("armed");
+        toast("will retry when the limit lifts — click again to cancel");
+        ew._t = setTimeout(function(){ if (!pageGone() && ew.getAttribute("data-armed")) composeFor(wprompt, wagent, true); }, wuntil - Date.now() + 500);
+        return;
+      }
+      var ec = ev.target.closest && ev.target.closest("[data-errcopy]");
+      if (ec) {
+        ev.preventDefault(); ev.stopPropagation();
+        var ecard = ec.closest(".errcard");
+        var head = ecard.querySelector(".errh") ? ecard.querySelector(".errh").innerText.trim() : "";
+        var det = ecard.querySelector(".errd pre") ? ecard.querySelector(".errd pre").textContent : "";
+        var when = new Date(Number(ecard.getAttribute("data-ts")) || Date.now()).toISOString();
+        copyText(["Loom error", "project: " + ((state.project && state.project.name) || pid), "chat: " + chatId,
+          "agent: " + (ecard.getAttribute("data-agent") || "loom"), "at: " + when, "", head, det ? "\n" + det : ""].join("\n").trim());
+        return;
+      }
+      var cn = ev.target.closest && ev.target.closest("[data-continue]");
+      if (cn) { ev.preventDefault(); ev.stopPropagation(); composeFor("Continue from exactly where you stopped.", cn.getAttribute("data-continue"), true); return; }
+      // Copy a whole reply — the words, not the markup around them.
+      var mc = ev.target.closest && ev.target.closest(".msgcopy");
+      if (mc) {
+        ev.preventDefault(); ev.stopPropagation();
+        var mb = mc.closest(".msg"); var body = mb && mb.querySelector(".bubble");
+        var txt = body ? body.innerText : "";
+        if (navigator.clipboard && txt) navigator.clipboard.writeText(txt).then(function(){ toast("copied"); }, function(){ toast("couldn’t copy"); });
+        return;
+      }
+      var dr = ev.target.closest && ev.target.closest(".mddraw");
+      if (dr) { ev.preventDefault(); ev.stopPropagation(); drawMermaid(dr.parentNode, dr); return; }
       var cp = ev.target.closest && ev.target.closest(".mdcopy");
       if (cp) {
         ev.preventDefault(); ev.stopPropagation();
@@ -698,6 +893,16 @@ import { bindTheme } from './theme.js';
       }
       var ap = ev.target.closest && ev.target.closest("[data-orch-apply]");
       if (ap) { applyOrch(ap.getAttribute("data-orch-apply"), ap); return; }
+      var cmp = ev.target.closest && ev.target.closest("[data-orch-compare]");
+      if (cmp) { ev.preventDefault(); orch.sel = cmp.getAttribute("data-orch-compare"); showTab("orchestra"); return; }
+      var rsm = ev.target.closest && ev.target.closest("[data-orch-resume]");
+      if (rsm) {
+        rsm.disabled = true;
+        api("/api/projects/" + pid + "/orchestra/" + encodeURIComponent(rsm.getAttribute("data-orch-resume")) + "/resume", { method: "POST", body: "{}" })
+          .then(function(j){ if (j && j.run) mergeOrchRun(j.run); rsm.remove(); })
+          .catch(function(err){ toast(err.message); rsm.disabled = false; });
+        return;
+      }
       var rd = ev.target.closest && ev.target.closest("[data-orch-deliver]");
       if (rd) { redeliverOrch(rd.getAttribute("data-orch-deliver"), rd); return; }
       if (approvalClick(ev)) return;
@@ -708,7 +913,7 @@ import { bindTheme } from './theme.js';
       if (ev.target.closest && ev.target.closest(".tcdiff")) return; // let diff text select/scroll
       var enc = t.getAttribute("data-patch"); if (!enc) return;
       var patch = decodeURIComponent(enc);
-      if (desktop) { openPatchDock(patch, t.getAttribute("data-label") || "changes"); return; }
+      if (desktop) { var rwb = t.querySelector("[data-rewind]"); openPatchDock(patch, t.getAttribute("data-label") || "changes", rwb ? rwb.getAttribute("data-rewind") : null); return; }
       var d = t.querySelector(".tcdiff"); if (!d) return;
       var open = d.style.display !== "none" && d.innerHTML;
       if (open) { d.style.display = "none"; }
@@ -739,6 +944,101 @@ import { bindTheme } from './theme.js';
     // Which kind of memory the Brain tab is filtered to ("" = all).
     var brainKind = "";
     var BRAIN_KINDS = ["constraint", "failure", "decision", "convention", "fact", "task"];
+
+    /**
+     * What this project knows, as a map: each memory a dot (coloured by kind,
+     * bigger the more it's been used), joined to the files and symbols it's
+     * about. Only entities two or more memories share get a node — the rest
+     * connect nothing. Laid out once with a small force simulation, seeded by
+     * id so the same brain draws the same way every time.
+     */
+    function drawMemGraph(host, mems, usage){
+      if (!host) return;
+      mems = mems.slice(0, 150);
+      var count = {};
+      mems.forEach(function(m){ (m.entities || []).forEach(function(e){ count[e] = (count[e] || 0) + 1; }); });
+      var ents = Object.keys(count).filter(function(e){ return count[e] > 1; })
+        .sort(function(a, b){ return count[b] - count[a]; }).slice(0, 60);
+      var eset = {}; ents.forEach(function(e){ eset[e] = 1; });
+      var nodes = [], idx = {}, links = [];
+      function seed(s){ var h = 0; for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return h; }
+      function add(id, kind, data){
+        var h = seed(id);
+        idx[id] = nodes.length;
+        nodes.push({ id: id, t: kind, d: data, x: (h % 400) / 2, y: ((h >> 9) % 400) / 2, vx: 0, vy: 0 });
+      }
+      mems.forEach(function(m){ add("m:" + m.id, "m", m); });
+      ents.forEach(function(e){ add("e:" + e, "e", e); });
+      mems.forEach(function(m){ (m.entities || []).forEach(function(e){ if (eset[e]) links.push([idx["m:" + m.id], idx["e:" + e]]); }); });
+      var n = nodes.length;
+      for (var it = 0; it < 260; it++) {
+        var alpha = 1 - it / 260;
+        for (var i = 0; i < n; i++) {
+          var a = nodes[i];
+          for (var j = i + 1; j < n; j++) {
+            var b = nodes[j], dx = a.x - b.x, dy = a.y - b.y, d2 = dx * dx + dy * dy + 0.01;
+            if (d2 > 40000) continue;
+            var f = 260 / d2;
+            a.vx += dx * f; a.vy += dy * f; b.vx -= dx * f; b.vy -= dy * f;
+          }
+          a.vx -= a.x * 0.012; a.vy -= a.y * 0.012;
+        }
+        links.forEach(function(l){
+          var a = nodes[l[0]], b = nodes[l[1]], dx = b.x - a.x, dy = b.y - a.y, d = Math.sqrt(dx * dx + dy * dy) || 1;
+          var f = (d - 46) * 0.05 / d;
+          a.vx += dx * f; a.vy += dy * f; b.vx -= dx * f; b.vy -= dy * f;
+        });
+        nodes.forEach(function(o){
+          o.vx = Math.max(-12, Math.min(12, o.vx)); o.vy = Math.max(-12, Math.min(12, o.vy));
+          o.x += o.vx * alpha; o.y += o.vy * alpha; o.vx *= 0.6; o.vy *= 0.6;
+        });
+      }
+      var x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      nodes.forEach(function(o){ x0 = Math.min(x0, o.x); y0 = Math.min(y0, o.y); x1 = Math.max(x1, o.x); y1 = Math.max(y1, o.y); });
+      var pad = 40, w = Math.max(200, x1 - x0 + pad * 2), h = Math.max(160, y1 - y0 + pad * 2);
+      var svg = '<svg class="bgsvg" viewBox="' + (x0 - pad) + " " + (y0 - pad) + " " + w + " " + h + '" role="img" aria-label="memory graph">' +
+        links.map(function(l, k){
+          var a = nodes[l[0]], b = nodes[l[1]];
+          return '<line class="bgl" data-a="' + l[0] + '" data-b="' + l[1] + '" x1="' + a.x.toFixed(1) + '" y1="' + a.y.toFixed(1) + '" x2="' + b.x.toFixed(1) + '" y2="' + b.y.toFixed(1) + '"/>';
+        }).join("") +
+        nodes.map(function(o, i){
+          if (o.t === "e") {
+            var label = o.d.length > 22 ? "…" + o.d.slice(-21) : o.d;
+            return '<g class="bge" data-i="' + i + '" tabindex="0"><title>' + esc(o.d) + " · " + count[o.d] + " memories</title>" +
+              '<rect x="' + (o.x - 3).toFixed(1) + '" y="' + (o.y - 3).toFixed(1) + '" width="6" height="6" rx="1.5"/>' +
+              '<text x="' + (o.x + 6).toFixed(1) + '" y="' + (o.y + 3).toFixed(1) + '">' + esc(label) + "</text></g>";
+          }
+          var used = (usage[o.d.id] || {}).n || 0;
+          var r = 4.5 + Math.min(6, Math.sqrt(used) * 1.5);
+          return '<g class="bgm bk-' + esc(o.d.kind) + '" data-i="' + i + '" tabindex="0"><title>' + esc(o.d.kind + ": " + o.d.text) + "</title>" +
+            '<circle cx="' + o.x.toFixed(1) + '" cy="' + o.y.toFixed(1) + '" r="' + r.toFixed(1) + '"/></g>';
+        }).join("") + "</svg>";
+      var lonely = mems.filter(function(m){ return !(m.entities || []).some(function(e){ return eset[e]; }); }).length;
+      host.innerHTML = '<div class="bgcap">' + mems.length + " memor" + (mems.length === 1 ? "y" : "ies") + " · " + ents.length + " shared file" + (ents.length === 1 ? "" : "s") + " or symbol" + (ents.length === 1 ? "" : "s") + " joining them" +
+        (lonely ? " · " + lonely + " stand alone" : "") + '<span class="dim"> · click a dot or a name</span></div>' + svg + '<div class="bgpick" id="bgpick"></div>';
+      var svgEl = host.querySelector("svg"), pick = host.querySelector("#bgpick");
+      function focus(i){
+        var near = {}; near[i] = 1;
+        links.forEach(function(l){ if (l[0] === i) near[l[1]] = 1; if (l[1] === i) near[l[0]] = 1; });
+        svgEl.classList.add("focus");
+        Array.prototype.forEach.call(svgEl.querySelectorAll("[data-i]"), function(g){ g.classList.toggle("near", !!near[+g.getAttribute("data-i")]); });
+        Array.prototype.forEach.call(svgEl.querySelectorAll(".bgl"), function(l){ l.classList.toggle("near", +l.getAttribute("data-a") === i || +l.getAttribute("data-b") === i); });
+        var o = nodes[i];
+        if (o.t === "m") {
+          pick.innerHTML = '<span class="bbadge bk-' + esc(o.d.kind) + '">' + esc(o.d.kind) + "</span> " + esc(o.d.text) +
+            ((o.d.entities || []).length ? '<div class="bents">' + o.d.entities.slice(0, 8).map(function(e){ return '<span class="bent">' + esc(e) + "</span>"; }).join("") + "</div>" : "");
+        } else {
+          var about = mems.filter(function(m){ return (m.entities || []).indexOf(o.d) >= 0; });
+          pick.innerHTML = '<b class="mono">' + esc(o.d) + "</b> · " + about.length + " memor" + (about.length === 1 ? "y" : "ies") + "<ul>" +
+            about.slice(0, 8).map(function(m){ return '<li><span class="bbadge bk-' + esc(m.kind) + '">' + esc(m.kind) + "</span> " + esc(m.text) + "</li>"; }).join("") + "</ul>";
+        }
+      }
+      Array.prototype.forEach.call(svgEl.querySelectorAll("[data-i]"), function(g){
+        g.onclick = function(ev){ ev.stopPropagation(); focus(+g.getAttribute("data-i")); };
+        g.onkeydown = function(ev){ if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); focus(+g.getAttribute("data-i")); } };
+      });
+      svgEl.onclick = function(){ svgEl.classList.remove("focus"); pick.innerHTML = ""; };
+    }
 
     // ---- brain pane · Team view (Phase 3: one brain) -------------------------
     // Mine is this machine's brain, above. Team is the team's: canon from
@@ -880,6 +1180,58 @@ import { bindTheme } from './theme.js';
     // The transcript-level menu lives in the shell's scope, and this doesn't.
     state.redrawFeed = loadHistory;
     loadHistory();
+    if (chatId === "main") showRecap();
+
+    /**
+     * Back after a while (a new day, or eight hours on): what happened while
+     * you were away, in one strip over Main — turns, who took them, what
+     * failed, what it cost. From the log's own turn rows; shown once per
+     * return, gone when you close it.
+     */
+    function showRecap(){
+      var key = "loomLastVisit:" + pid, now = Date.now(), last = 0;
+      try { last = Number(localStorage.getItem(key)) || 0; localStorage.setItem(key, String(now)); } catch (e) { return; }
+      if (!last) return;
+      var away = now - last, newDay = new Date(last).toDateString() !== new Date(now).toDateString();
+      if (away < 8 * 3600 * 1000 && !newDay) return;
+      if (away < 20 * 60 * 1000) return;
+      api("/api/projects/" + pid + "/insights/turns?since=" + last).then(function(j){
+        var rows = (j && j.leaderboard) || [];
+        var turns = 0, errs = 0, cost = 0;
+        rows.forEach(function(a){ turns += a.turns || 0; errs += a.errors || 0; cost += a.totalCostUsd || 0; });
+        if (!turns || pageGone()) return;
+        var host = document.getElementById("pane-thread"), feed = document.getElementById("feed");
+        if (!host || !feed || document.getElementById("recap")) return;
+        var who = rows.slice().sort(function(a, b){ return b.turns - a.turns; }).slice(0, 3).map(function(a){ return esc(labelOf(a.agentId)) + " " + a.turns; }).join(", ");
+        var el = document.createElement("div");
+        el.id = "recap";
+        el.className = "recap";
+        el.setAttribute("role", "status");
+        el.innerHTML = '<span class="recapi">' + ICONS.clock + "</span>" +
+          '<span class="recapt"><b>Since you were here</b> <span class="dim">' + esc(newDay ? relDay(last) : rel(last)) + "</span> · " +
+          turns + " turn" + (turns === 1 ? "" : "s") + " (" + who + ")" +
+          (errs ? ' · <span class="recaperr">' + errs + " failed</span>" : "") +
+          (cost > 0 ? " · " + money(cost) : "") + "</span>" +
+          '<button type="button" class="btn xs ghost" id="recapgo">Insights</button>' +
+          '<button type="button" class="iconbtn xs" id="recapx" aria-label="dismiss" title="dismiss">' + ICONS.x + "</button>";
+        host.insertBefore(el, feed);
+        el.querySelector("#recapx").onclick = function(){ el.remove(); };
+        el.querySelector("#recapgo").onclick = function(){ el.remove(); showTab("observatory"); };
+      }).catch(function(){});
+    }
+    function relDay(ts){
+      var d = new Date(ts), y = new Date(); y.setDate(y.getDate() - 1);
+      var hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      return (d.toDateString() === y.toDateString() ? "yesterday " : d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" }) + " ") + hm;
+    }
+    (function(){
+      var j = document.getElementById("jumpnew"), sc = threadScroller();
+      if (j) j.onclick = toBottom;
+      if (sc) sc.addEventListener("scroll", function(){
+        if (!nearBottom()) return;
+        var jj = document.getElementById("jumpnew"); if (jj) jj.classList.remove("show");
+      }, { passive: true });
+    })();
     refresh();
     state.timers.push(setInterval(refresh, 4000));
     if (desktop) {
@@ -893,6 +1245,471 @@ import { bindTheme } from './theme.js';
     // in the outgoing message — the CLIs take text, not blobs, so the path IS
     // the attachment. Cleared after each send.
     var attach = [];
+    /** Brief / Normal / Detailed — how long replies should be, per project, on this device. */
+    function replyLength(){ try { var v = localStorage.getItem("loomLength:" + pid); return v === "brief" || v === "detailed" ? v : ""; } catch (e) { return ""; } }
+    function setReplyLength(v){
+      try { if (v) localStorage.setItem("loomLength:" + pid, v); else localStorage.removeItem("loomLength:" + pid); } catch (e) {}
+      drawLengthPill();
+      toast(v === "brief" ? "replies will be brief" : v === "detailed" ? "replies will be detailed" : "replies back to normal length");
+    }
+    function drawLengthPill(){
+      var old = document.getElementById("lenpill"); if (old) old.remove();
+      var v = replyLength(); if (!v) return;
+      var plan = document.getElementById("planbtn"); if (!plan || !plan.parentNode) return;
+      var b = document.createElement("button");
+      b.type = "button"; b.id = "lenpill"; b.className = "lenpill";
+      b.title = "reply length for this project — click for normal";
+      b.textContent = v === "brief" ? "Brief" : "Detailed";
+      b.onclick = function(){ setReplyLength(""); };
+      plan.parentNode.insertBefore(b, plan);
+    }
+    /** A prompt waiting for the daemon to come back, shown above the composer. */
+    function holdForReconnect(full){
+      state.heldSend = { pid: pid, chat: chatId, text: full, agent: (!state.auto && state.selected) || null };
+      saveDraft();
+      var old = document.getElementById("heldnote"); if (old) old.remove();
+      var form = document.getElementById("cform"); if (!form) return;
+      var n = document.createElement("div");
+      n.id = "heldnote"; n.className = "heldnote"; n.setAttribute("role", "status");
+      n.innerHTML = '<span class="obspin"></span><span>Loom isn’t answering — this sends as soon as it’s back.</span><button type="button" class="linkbtn" id="heldcancel">Don’t send</button>';
+      form.parentNode.insertBefore(n, form);
+      document.getElementById("heldcancel").onclick = function(){ state.heldSend = null; n.remove(); toast("kept in the composer — it won’t send by itself"); };
+    }
+    state.onReconnect = function(){
+      var h = state.heldSend; if (!h || h.pid !== pid || h.chat !== chatId) return;
+      state.heldSend = null;
+      var n = document.getElementById("heldnote"); if (n) n.remove();
+      setTimeout(function(){ if (!pageGone()) { composeFor(h.text, h.agent, true); toast("sent — Loom is back"); } }, 700);
+    };
+
+    // ---- message actions ------------------------------------------------------
+    /** The prompt behind an agent's reply: the nearest of your messages above it. */
+    function promptFor(msgEl){
+      for (var n = msgEl && msgEl.previousElementSibling; n; n = n.previousElementSibling) {
+        if (n.classList && n.classList.contains("msg") && n.classList.contains("user")) return decodeURIComponent(n.getAttribute("data-raw") || "");
+      }
+      return "";
+    }
+    function bubbleText(msgEl){
+      var b = msgEl && msgEl.querySelector(".bubble");
+      return b ? (b.innerText || b.textContent || "").trim() : "";
+    }
+    /**
+     * Put text in the composer, for an agent, and send it — or leave it there
+     * to edit. The one path Retry, Edit, Continue and Quote all take, so a
+     * resend follows every rule a typed prompt does (the queue, plan mode,
+     * the handoff to a different agent).
+     */
+    function composeFor(text, agentId, go){
+      var box = document.getElementById("box"); if (!box) return;
+      if (state.cmode === "orch" && !orchRunForChat()) setComposerMode("chat");
+      var roster = (state.project && state.project.agents) || [];
+      if (agentId && roster.some(function(a){ return a.id === agentId; })) { state.auto = false; state.selected = agentId; drawStatus(); }
+      box.value = text; autosizeBox(); saveDraft();
+      var form = document.getElementById("cform"); if (form) form.classList.toggle("hastext", !!box.value.trim());
+      if (go) { send(); return; }
+      box.focus(); box.setSelectionRange(box.value.length, box.value.length);
+    }
+    function quoteIntoComposer(text){
+      var box = document.getElementById("box"); if (!box || !text) return;
+      var q = String(text).trim().split("\n").slice(0, 12).map(function(l){ return "> " + l; }).join("\n");
+      var cur = box.value.replace(/\s+$/, "");
+      box.value = (cur ? cur + "\n\n" : "") + q + "\n\n";
+      autosizeBox(); saveDraft(); box.focus(); box.setSelectionRange(box.value.length, box.value.length);
+      var form = document.getElementById("cform"); if (form) form.classList.add("hastext");
+    }
+    function msgMenu(msgEl, anchor){
+      if (!msgEl) return;
+      var id = Number(msgEl.getAttribute("data-id")) || 0, agentId = msgEl.getAttribute("data-agent");
+      var prompt = promptFor(msgEl);
+      var others = ((state.project && state.project.agents) || []).filter(function(a){
+        return a.tier === "adapter" && a.enabled !== false && a.id !== agentId;
+      });
+      var starred = !!(state.starSet && state.starSet[id]);
+      var r = anchor.getBoundingClientRect();
+      var items = [{ head: agentId ? labelOf(agentId) : "Message" }];
+      if (prompt) {
+        items.push({ label: "Retry", icon: ICONS.refresh, hint: "same prompt", run: function(){ composeFor(prompt, agentId, true); } });
+        if (others.length) items.push({ label: "Retry with\u2026", icon: ICONS.agents, hint: others.length + " agents", run: function(){
+          openMenu(Math.round(r.left), Math.round(r.bottom + 4), [{ head: "Send the same prompt to" }].concat(others.map(function(a){
+            return { label: agentLabel(a.kind, a.id), icon: agentGlyph(a.kind, a.id), hint: a.busy ? "busy" : "", run: function(){ composeFor(prompt, a.id, true); } };
+          })));
+        } });
+        items.push({ sep: true });
+      }
+      items.push({ label: starred ? "Unstar" : "Star", icon: ICONS.star, run: function(){ toggleStar(id); } });
+      items.push({ label: "Quote in reply", icon: ICONS.quote, run: function(){ quoteIntoComposer(bubbleText(msgEl)); } });
+      items.push({ label: "Make a card", icon: ICONS.board, hint: "on the board", run: function(){
+        openBoardTaskModal(pid, "working", function(){ if (state.reloadBoard) state.reloadBoard(); }, bubbleText(msgEl).split("\n")[0].slice(0, 200));
+      } });
+      items.push({ label: "Copy link", icon: ICONS.link, run: function(){ copyText(messageLink(id)); } });
+      if (window.speechSynthesis && window.SpeechSynthesisUtterance) {
+        var reading = window.speechSynthesis.speaking;
+        items.push({ label: reading ? "Stop reading" : "Read aloud", icon: ICONS.play, run: function(){
+          window.speechSynthesis.cancel();
+          if (reading) return;
+          var u = new SpeechSynthesisUtterance(bubbleText(msgEl).replace(/\s+/g, " ").slice(0, 8000));
+          u.rate = 1.05;
+          window.speechSynthesis.speak(u);
+        } });
+      }
+      items.push({ label: "Branch from here", icon: ICONS.branch, hint: "new chat", run: function(){ branchFrom(msgEl); } });
+      openMenu(Math.round(r.right - 220), Math.round(r.bottom + 4), items);
+    }
+    /** A link that opens this project, this chat, this message. */
+    function messageLink(id){
+      return location.origin + location.pathname + "#p/" + encodeURIComponent(pid) + "/c/" + encodeURIComponent(chatId) + "/m/" + id;
+    }
+    /** Stars live with the chat on the daemon, so every device sees them. */
+    function syncStars(){
+      var c = ((state.project && state.project.chats) || []).filter(function(q){ return q.id === chatId; })[0];
+      var set = {};
+      ((c && c.starred) || []).forEach(function(n){ set[n] = true; });
+      state.starSet = set;
+      state.rateMap = (c && c.ratings) || {};
+    }
+    function toggleStar(id){
+      if (!id) return;
+      var on = !(state.starSet && state.starSet[id]);
+      api("/api/projects/" + pid + "/chats/" + encodeURIComponent(chatId) + "/star", { method: "POST", body: JSON.stringify({ eventId: id, on: on }) })
+        .then(function(j){
+          var set = {}; (j.starred || []).forEach(function(n){ set[n] = true; }); state.starSet = set;
+          var el = document.querySelector('#feed .msg[data-id="' + id + '"]');
+          if (el) {
+            var old = el.querySelector(".wstar"); if (old) old.remove();
+            if (on) {
+              var host = el.querySelector(".who .msgcopy") || el.querySelector(".mt .ustar");
+              if (host) host.insertAdjacentHTML("beforebegin", '<span class="wstar" title="starred">' + ICONS.star + "</span>");
+              el.classList.add("flash"); setTimeout(function(){ el.classList.remove("flash"); }, 900);
+            }
+          }
+          toast(on ? "starred · ⋯ beside the composer → Starred messages" : "unstarred");
+          if (state.refreshShell) state.refreshShell();
+        })
+        .catch(function(err){ toast(err.message); });
+    }
+    state.showStarred = function(){
+      var ids = Object.keys(state.starSet || {}).map(Number).sort(function(a, b){ return b - a; });
+      if (!ids.length) { toast("nothing starred in this chat yet \u2014 \u22ef on a message \u2192 Star"); return; }
+      var items = [{ head: "Starred in this chat" }].concat(ids.slice(0, 30).map(function(id){
+        var el = document.querySelector('#feed .msg[data-id="' + id + '"]');
+        var t = el ? bubbleText(el).split("\n")[0].slice(0, 70) : "message #" + id + " (earlier \u2014 load earlier messages)";
+        return { label: t || "message #" + id, icon: ICONS.star, run: function(){ jumpToMessage(id); } };
+      }));
+      openMenu(Math.round(window.innerWidth / 2 - 180), 90, items);
+    };
+    /** Scroll to a message and flash it; page back for it when it's older than what's loaded. */
+    function jumpToMessage(id, tries){
+      var el = document.querySelector('#feed .msg[data-id="' + id + '"]');
+      if (el) {
+        el.scrollIntoView({ block: "center", behavior: "smooth" });
+        el.classList.add("flash"); setTimeout(function(){ el.classList.remove("flash"); }, 1600);
+        return;
+      }
+      tries = tries || 0;
+      if (tries < 8 && document.getElementById("loadearlier") && state.firstId && id < state.firstId) {
+        loadEarlier().then(function(){ jumpToMessage(id, tries + 1); });
+        return;
+      }
+      toast("that message isn\u2019t in this chat any more");
+    }
+    state.jumpToMessage = jumpToMessage;
+    /**
+     * Start a new chat that carries this one up to a message — for trying a
+     * different direction without losing the one you're on.
+     */
+    function branchFrom(msgEl){
+      var feed = document.getElementById("feed"); if (!feed || !msgEl) return;
+      var lines = [], budget = 6000;
+      var all = Array.prototype.slice.call(feed.querySelectorAll(":scope > .msg:not(.thinking)"));
+      var upto = all.indexOf(msgEl);
+      all.slice(0, upto + 1).reverse().some(function(n){
+        var who = n.classList.contains("user") ? "Me" : labelOf(n.getAttribute("data-agent") || "agent");
+        var t = n.classList.contains("user") ? decodeURIComponent(n.getAttribute("data-raw") || "") : bubbleText(n);
+        var chunk = who + ": " + t.trim();
+        if (chunk.length > budget) chunk = chunk.slice(0, budget) + "\u2026";
+        lines.unshift(chunk); budget -= chunk.length;
+        return budget <= 0;
+      });
+      var c = ((state.project && state.project.chats) || []).filter(function(q){ return q.id === chatId; })[0];
+      var title = "Branch of " + ((c && c.title) || "Main");
+      api("/api/projects/" + pid + "/chats", { method: "POST", body: JSON.stringify({ title: title.slice(0, 60) }) })
+        .then(function(j){
+          var draft = "Earlier, in \u201c" + ((c && c.title) || "Main") + "\u201d:\n\n" + lines.map(function(l){ return l.split("\n").map(function(x){ return "> " + x; }).join("\n"); }).join("\n>\n") + "\n\n";
+          try { localStorage.setItem(draftKey(j.chat.id), draft); } catch (e) {}
+          if (state.setChat) state.setChat(pid, j.chat.id);
+          toast("branched \u2014 the conversation so far is in the composer; add where to go next");
+        })
+        .catch(function(err){ toast(err.message); });
+    }
+
+    // ---- drafts and recall ------------------------------------------------------
+    function draftKey(cid){ return "loomDraft:" + pid + ":" + (cid || chatId); }
+    var draftTimer = null;
+    function saveDraft(){
+      clearTimeout(draftTimer);
+      draftTimer = setTimeout(function(){
+        if (pageGone()) return;
+        var box = document.getElementById("box"); if (!box) return;
+        try {
+          if (box.value.trim()) localStorage.setItem(draftKey(), box.value);
+          else localStorage.removeItem(draftKey());
+        } catch (e) {}
+      }, 250);
+    }
+    function clearDraft(){ clearTimeout(draftTimer); try { localStorage.removeItem(draftKey()); } catch (e) {} }
+    function restoreDraft(){
+      var box = document.getElementById("box"); if (!box || box.value) return;
+      var d = null;
+      try { d = localStorage.getItem(draftKey()); } catch (e) {}
+      if (!d) return;
+      box.value = d; autosizeBox();
+      var form = document.getElementById("cform"); if (form) form.classList.toggle("hastext", !!d.trim());
+    }
+    var recall = { i: -1, shown: "" };
+    function myPrompts(){
+      return Array.prototype.map.call(document.querySelectorAll("#feed .msg.user[data-raw]"), function(n){
+        return decodeURIComponent(n.getAttribute("data-raw") || "");
+      }).filter(function(t, i, all){ return t.trim() && t !== all[i + 1]; }).reverse();
+    }
+
+    // ---- find in thread --------------------------------------------------------
+    var find = { hits: [], i: -1, q: "" };
+    function clearFind(){
+      Array.prototype.forEach.call(document.querySelectorAll("#feed mark.fhit"), function(m){
+        var parent = m.parentNode; if (!parent) return;
+        parent.replaceChild(document.createTextNode(m.textContent), m);
+        parent.normalize();
+      });
+      find.hits = []; find.i = -1;
+    }
+    function runFind(q){
+      clearFind(); find.q = q;
+      var feed = document.getElementById("feed");
+      if (!q || !feed) return drawFindCount();
+      var ql = q.toLowerCase(), nodes = [];
+      Array.prototype.forEach.call(feed.querySelectorAll(".bubble, .sys, .tool .tx, .turncard .tcf, .plancard"), function(root){
+        var w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+        for (var t = w.nextNode(); t; t = w.nextNode()) if (t.nodeValue && t.nodeValue.toLowerCase().indexOf(ql) >= 0) nodes.push(t);
+      });
+      var total = 0;
+      nodes.forEach(function(t){
+        if (total >= 500) return;
+        var text = t.nodeValue.toLowerCase(), at = [], from = 0, k;
+        while ((k = text.indexOf(ql, from)) >= 0 && total + at.length < 500) { at.push(k); from = k + ql.length; }
+        for (var j = at.length - 1; j >= 0; j--) {
+          var mid = t.splitText(at[j]); mid.splitText(q.length);
+          var m = document.createElement("mark"); m.className = "fhit";
+          mid.parentNode.replaceChild(m, mid); m.appendChild(mid);
+        }
+        total += at.length;
+      });
+      find.hits = Array.prototype.slice.call(feed.querySelectorAll("mark.fhit"));
+      find.i = find.hits.length ? find.hits.length - 1 : -1; // newest first: you usually want the latest
+      showFindHit();
+    }
+    function showFindHit(){
+      find.hits.forEach(function(m, i){ m.classList.toggle("cur", i === find.i); });
+      var m = find.hits[find.i];
+      if (m) {
+        for (var d = m.parentNode; d && d.id !== "feed"; d = d.parentNode) {
+          if (d.tagName === "DETAILS") d.open = true;
+          if (d.classList && d.classList.contains("clamped")) { d.classList.remove("clamped"); var sm = d.querySelector(".showmore"); if (sm) sm.textContent = "Show less"; }
+        }
+        m.scrollIntoView({ block: "center" });
+      }
+      drawFindCount();
+    }
+    function drawFindCount(){
+      var c = document.getElementById("findcount"); if (!c) return;
+      var more = document.getElementById("loadearlier");
+      c.innerHTML = !find.q ? "" : find.hits.length
+        ? (find.i + 1) + " of " + find.hits.length + (find.hits.length >= 500 ? "+" : "")
+        : "No matches" + (more ? ' \u00b7 <button type="button" class="linkbtn" id="findearlier">search earlier</button>' : "");
+      var fe = document.getElementById("findearlier");
+      if (fe) fe.onclick = function(){ loadEarlier().then(function(){ runFind(find.q); }); };
+    }
+    function stepFind(dir){
+      if (!find.hits.length) return;
+      find.i = (find.i + dir + find.hits.length) % find.hits.length;
+      showFindHit();
+    }
+    function closeFind(){
+      clearFind(); find.q = "";
+      var b = document.getElementById("findbar"); if (b) b.remove();
+    }
+    function openFind(){
+      if (state.showTab) state.showTab("thread");
+      var sc = threadScroller(); if (!sc || !sc.parentNode) return;
+      var bar = document.getElementById("findbar");
+      if (!bar) {
+        var host = sc.parentNode;
+        if (getComputedStyle(host).position === "static") host.style.position = "relative";
+        bar = document.createElement("div");
+        bar.id = "findbar"; bar.className = "findbar"; bar.setAttribute("role", "search");
+        bar.innerHTML = ICONS.search + '<input id="findq" placeholder="Find in this chat" spellcheck="false" autocomplete="off" aria-label="find in this chat">' +
+          '<span class="findcount" id="findcount" aria-live="polite"></span>' +
+          '<button type="button" class="iconbtn" id="findprev" title="Previous (\u21e7Enter)" aria-label="previous match">' + ICONS.up + "</button>" +
+          '<button type="button" class="iconbtn" id="findnext" title="Next (Enter)" aria-label="next match">' + ICONS.arrowDown + "</button>" +
+          '<button type="button" class="iconbtn" id="findx" title="Close (Esc)" aria-label="close find">' + ICONS.x + "</button>";
+        host.appendChild(bar);
+        var qi = document.getElementById("findq"), t = null;
+        qi.addEventListener("input", function(){ clearTimeout(t); var v = qi.value; t = setTimeout(function(){ runFind(v.trim()); }, 120); });
+        qi.addEventListener("keydown", function(e){
+          if (e.key === "Enter") { e.preventDefault(); stepFind(e.shiftKey ? 1 : -1); }
+          else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeFind(); var bx = document.getElementById("box"); if (bx) bx.focus(); }
+        });
+        document.getElementById("findprev").onclick = function(){ stepFind(-1); };
+        document.getElementById("findnext").onclick = function(){ stepFind(1); };
+        document.getElementById("findx").onclick = closeFind;
+      }
+      var inp = document.getElementById("findq");
+      var sel = String(window.getSelection ? window.getSelection() : "").trim();
+      if (sel && sel.length < 80 && sel.indexOf("\n") < 0) { inp.value = sel; runFind(sel); }
+      inp.focus(); inp.select();
+    }
+    state.openFind = openFind;
+    /** [ and ]: to your previous or next prompt in this chat. */
+    state.jumpPrompt = function(dir){
+      var sc = threadScroller(); if (!sc) return;
+      var top = sc.getBoundingClientRect().top;
+      var mine = Array.prototype.slice.call(document.querySelectorAll("#feed > .msg.user"));
+      if (!mine.length) return;
+      var pick = null;
+      if (dir < 0) { for (var i = mine.length - 1; i >= 0; i--) if (mine[i].getBoundingClientRect().top < top - 6) { pick = mine[i]; break; } }
+      else { for (var j = 0; j < mine.length; j++) if (mine[j].getBoundingClientRect().top > top + 24) { pick = mine[j]; break; } }
+      if (!pick) { toast(dir < 0 ? "that’s your first prompt here" : "that’s your last prompt here"); return; }
+      sc.scrollTop += pick.getBoundingClientRect().top - top - 12;
+      pick.classList.add("flash"); setTimeout(function(){ pick.classList.remove("flash"); }, 900);
+    };
+
+    // Select words in a reply → a small Quote button beside them.
+    (function(){
+      var feed = document.getElementById("feed"); if (!feed) return;
+      function hide(){ var q = document.getElementById("quotebtn"); if (q) q.remove(); }
+      feed.addEventListener("mouseup", function(){
+        setTimeout(function(){
+          if (pageGone()) return;
+          hide();
+          var sel = window.getSelection && window.getSelection();
+          var text = sel ? String(sel).trim() : "";
+          if (!text || !sel.rangeCount) return;
+          var a = sel.anchorNode, host = a && (a.nodeType === 1 ? a : a.parentNode);
+          if (!host || !host.closest || !host.closest("#feed .bubble")) return;
+          var r = sel.getRangeAt(0).getBoundingClientRect();
+          var b = document.createElement("button");
+          b.type = "button"; b.id = "quotebtn"; b.className = "quotebtn";
+          b.innerHTML = ICONS.quote + "Quote";
+          b.style.left = Math.max(8, Math.min(window.innerWidth - 100, r.left + r.width / 2 - 38)) + "px";
+          b.style.top = Math.max(8, r.top - 38) + "px";
+          b.onmousedown = function(ev){ ev.preventDefault(); };
+          b.onclick = function(){ quoteIntoComposer(text); hide(); if (sel.removeAllRanges) sel.removeAllRanges(); };
+          document.body.appendChild(b);
+        }, 0);
+      });
+      if (!state.quoteHideBound) {
+        state.quoteHideBound = true;
+        document.addEventListener("mousedown", function(ev){ if (!ev.target.closest || !ev.target.closest("#quotebtn")) { var q = document.getElementById("quotebtn"); if (q) q.remove(); } }, true);
+      }
+      var sc = threadScroller(); if (sc) sc.addEventListener("scroll", hide, { passive: true });
+    })();
+
+    // ---- day separators ----------------------------------------------------------
+    function dayLabel(ts){
+      var d = new Date(ts), t = new Date();
+      var d0 = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+      var t0 = new Date(t.getFullYear(), t.getMonth(), t.getDate()).getTime();
+      var diff = Math.round((t0 - d0) / 86400000);
+      if (diff === 0) return "Today";
+      if (diff === 1) return "Yesterday";
+      if (diff > 1 && diff < 7) return d.toLocaleDateString([], { weekday: "long" });
+      var o = { weekday: "short", month: "short", day: "numeric" };
+      if (d.getFullYear() !== t.getFullYear()) o.year = "numeric";
+      return d.toLocaleDateString([], o);
+    }
+    var daysQueued = false;
+    function markDays(){
+      if (daysQueued) return;
+      daysQueued = true;
+      setTimeout(function(){
+        daysQueued = false;
+        if (pageGone()) return;
+        var feed = document.getElementById("feed"); if (!feed) return;
+        Array.prototype.forEach.call(feed.querySelectorAll(":scope > .daysep"), function(n){ n.remove(); });
+        var last = "";
+        Array.prototype.forEach.call(feed.querySelectorAll(":scope > .msg[data-ts]"), function(n){
+          var ts = Number(n.getAttribute("data-ts")); if (!ts) return;
+          var key = new Date(ts).toDateString();
+          if (key === last) return;
+          last = key;
+          var sep = document.createElement("div");
+          sep.className = "daysep"; sep.setAttribute("role", "separator");
+          sep.innerHTML = "<span>" + esc(dayLabel(ts)) + "</span>";
+          feed.insertBefore(sep, n);
+          n.classList.remove("cont"); // a new day gets its byline back
+        });
+        clampLong(feed);
+      }, 0);
+    }
+    /** A reply taller than a screen folds behind Show more. */
+    function clampLong(feed){
+      Array.prototype.forEach.call(feed.querySelectorAll(":scope > .msg.agent:not(.live):not([data-ck])"), function(m){
+        m.setAttribute("data-ck", "1");
+        var b = m.querySelector(".bubble");
+        if (!b || b.scrollHeight < 760) return;
+        m.classList.add("clamped");
+        var btn = document.createElement("button");
+        btn.type = "button"; btn.className = "showmore";
+        btn.textContent = "Show more";
+        btn.onclick = function(ev){
+          ev.stopPropagation();
+          var open = m.classList.toggle("clamped");
+          btn.textContent = open ? "Show more" : "Show less";
+          if (open) m.scrollIntoView({ block: "nearest" });
+        };
+        b.insertAdjacentElement("afterend", btn);
+      });
+    }
+
+    // ---- export ----------------------------------------------------------------
+    /** The whole chat as Markdown: prompts, replies, what was done, what changed. */
+    function exportThread(){
+      toast("gathering the whole chat\u2026");
+      var all = [], pages = 0;
+      function page(before){
+        return api("/api/projects/" + pid + "/events?limit=500&chat=" + encodeURIComponent(chatId) + (before ? "&before=" + before : ""))
+          .then(function(j){
+            var evs = j.events || [];
+            all = evs.concat(all); pages++;
+            if (evs.length >= 500 && pages < 20) return page(evs[0].id);
+          });
+      }
+      return page(0).then(function(){
+        var c = ((state.project && state.project.chats) || []).filter(function(q){ return q.id === chatId; })[0];
+        var title = ((state.project && state.project.name) || "Loom") + " \u2014 " + ((c && c.title) || "Main");
+        var out = ["# " + title, "", "_Exported from Loom " + new Date().toLocaleString() + " \u00b7 " + all.length + " events_", ""];
+        var day = "";
+        all.forEach(function(e){
+          var p = e.payload || {}, when = new Date(Number(e.ts) || 0);
+          var d = when.toDateString(); if (d !== day) { day = d; out.push("", "---", "", "*" + dayLabel(Number(e.ts)) + "*", ""); }
+          var hm = when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+          if (e.kind === "message" && !e.agentId && p.author !== "loom") out.push("", "### You \u00b7 " + hm, "", String(p.text || ""));
+          else if (e.kind === "message" && e.agentId && !p.reasoning) out.push("", "### " + labelOf(e.agentId) + (p.model ? " (" + p.model + ")" : "") + " \u00b7 " + hm + (p.partial ? " \u00b7 stopped" : ""), "", String(p.text || ""));
+          else if (e.kind === "tool_call") out.push("- \u2699 " + String(p.summary || p.tool || p.name || "tool").split("\n")[0]);
+          else if (e.kind === "turn_diff") out.push("", "> Edited " + (p.files || []).length + " file(s) \u00b7 +" + Number(p.added || 0) + " \u2212" + Number(p.removed || 0) + ": " + (p.files || []).map(function(f){ return f.path; }).slice(0, 12).join(", "));
+          else if (e.kind === "error") out.push("", "> **Error** (" + (e.agentId || "loom") + "): " + String(p.message || p.error || "").split("\n")[0]);
+          else if (e.kind === "run_complete") out.push("", "_" + (e.agentId || "agent") + " finished" + (p.durationMs ? " in " + durfmt(p.durationMs) : "") + (p.costUsd ? " \u00b7 $" + Number(p.costUsd).toFixed(4) : "") + "_");
+        });
+        var blob = new Blob([out.join("\n") + "\n"], { type: "text/markdown" });
+        var a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = title.replace(/[^\w.-]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "").toLowerCase() + ".md";
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function(){ URL.revokeObjectURL(a.href); }, 4000);
+        toast("exported " + a.download);
+      }).catch(function(err){ toast(err.message); });
+    }
+    state.exportThread = exportThread;
 
     // ---- the prompt queue --------------------------------------------------
     // What you've lined up while something else is running. Yours until it's

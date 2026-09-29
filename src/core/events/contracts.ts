@@ -2,6 +2,8 @@ import type { EventKind, LoomEvent, NewEvent } from "../../types.js";
 
 export interface ListOpts {
   since?: number; // exclusive event id
+  /** Only events older than this id (exclusive) — paging a thread backwards. */
+  before?: number;
   limit?: number;
   kinds?: EventKind[];
   /**
@@ -21,6 +23,12 @@ export interface EventStore {
   ): LoomEvent;
   list(opts?: ListOpts): LoomEvent[];
   lastId(): number;
+  /** The newest agent message id per chat (a missing chat is main's). */
+  lastReplyIds(): Map<string, number>;
+  /** Bytes on disk and events held. */
+  size(): { bytes: number; events: number };
+  /** Reclaim free space (SQLite VACUUM). Never drops an event. */
+  compact(): void;
   close(): void;
 }
 

@@ -2,7 +2,7 @@ import { labelOf } from '../agents.js';
 import { api } from '../connection.js';
 import { esc,pageGone } from '../format.js';
 import { ICONS } from '../icons.js';
-import { toast } from '../notifications.js';
+import { askConfirm,toast } from '../notifications.js';
 import { state } from '../state.js';
 
 /** queue behavior for one mounted project.
@@ -167,8 +167,8 @@ export function createQueue(view) {
         qAct("/pause", { method: "POST", body: JSON.stringify({ paused: !view.queue.paused }) });
       };
       el.querySelector('[data-q="clear"]').onclick = function(){
-        if (view.queue.items.length > 1 && !window.confirm("Drop all " + view.queue.items.length + " queued prompts?")) return;
-        qAct("", { method: "DELETE" });
+        (view.queue.items.length > 1 ? askConfirm("Drop all " + view.queue.items.length + " queued prompts?", { ok: "Drop them", danger: true }) : Promise.resolve(true))
+          .then(function(ok){ if (ok) qAct("", { method: "DELETE" }); });
       };
       Array.prototype.forEach.call(el.querySelectorAll(".cqitem"), function(row){
         var id = row.getAttribute("data-qid");

@@ -5,6 +5,7 @@ import { clearShell } from './shell.js';
 import { CLIENT_ID_KEY,TOKEN_KEY,root,state } from './state.js';
 import { drawStatusbar } from './statusbar.js';
 import { isElectron } from './theme.js';
+import { pageGone } from './format.js';
 
 
   /**
@@ -15,6 +16,7 @@ import { isElectron } from './theme.js';
    */
   function checkBuild(){
     fetch("/api/health").then(function(r){ return r.json(); }).then(function(h){
+      if (h && typeof h.stt === "boolean") state.stt = h.stt;
       if (!h.rev || h.rev === window.__loomPageRev) return;
       if (document.getElementById("revbanner")) return;
       var b = document.createElement("div");
@@ -70,7 +72,13 @@ import { isElectron } from './theme.js';
     opts.headers = opts.headers || {};
     opts.headers["Authorization"] = "Bearer " + state.token;
     if (opts.body) opts.headers["Content-Type"] = "application/json";
-    return fetch(path, opts).catch(function(err){ daemonReached(false); throw err; }).then(function(r){
+    return fetch(path, opts).catch(function(err){
+      daemonReached(false);
+      // "Failed to fetch" is the browser's words, not ours: say what happened.
+      var e = new Error("Can’t reach Loom — is the daemon running? (loom up)");
+      e.offline = true; e.cause = err;
+      throw e;
+    }).then(function(r){
       daemonReached(true);
       if (r.status === 401 && !retried) {
         return reauth().then(function(ok){
@@ -89,8 +97,32 @@ import { isElectron } from './theme.js';
   /** Whether the daemon answered the last request — the status bar's "live" when no project socket is open. */
   function daemonReached(up){
     if (state.daemonUp === up) return;
+    var wasDown = state.daemonUp === false;
     state.daemonUp = up;
     if (typeof drawStatusbar === "function") drawStatusbar();
+    offlineBanner(!up);
+    // Back after an outage: re-read what the view missed while it was gone,
+    // and send whatever was typed while it was down.
+    if (up && wasDown) {
+      if (state.refreshShell) state.refreshShell();
+      if (state.redrawFeed) state.redrawFeed();
+      if (state.onReconnect) state.onReconnect();
+    }
+  }
+  /**
+   * One calm line when the daemon stops answering, instead of a toast per
+   * failed poll ("Failed to fetch", every few seconds, for as long as it's
+   * down). It goes away on its own when the daemon is back.
+   */
+  function offlineBanner(show){
+    if (pageGone()) return;
+    var b = document.getElementById("offbanner");
+    if (!show) { if (b) b.remove(); return; }
+    if (b) return;
+    b = document.createElement("div");
+    b.id = "offbanner"; b.setAttribute("role", "status");
+    b.innerHTML = '<span class="obspin"></span><span><b>Loom isn’t answering</b> — reconnecting… If it doesn’t come back, run <code>loom up</code>.</span>';
+    document.body.appendChild(b);
   }
 
   function logout(){ state.token = ""; state.clientId = ""; localStorage.removeItem(TOKEN_KEY); localStorage.removeItem(CLIENT_ID_KEY); route(); }

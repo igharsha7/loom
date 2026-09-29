@@ -1,15 +1,16 @@
-import { BRAND_TITLES,brandMark,hasBrand,labelOf } from '../agents.js';
+import { agentGlyph,agentLabel,BRAND_TITLES,brandMark,hasBrand,labelOf } from '../agents.js';
 import { settleApprovalCards } from '../approvals.js';
 import { api,checkBuild } from '../connection.js';
 import { addLogRecord } from '../console.js';
-import { esc,hue,money } from '../format.js';
-import { notifyNeedsInput,toast } from '../notifications.js';
+import { esc,hue,mdToHtml,money,pageGone } from '../format.js';
+import { notifyDone,notifyNeedsInput,toast } from '../notifications.js';
 import { maybeReloadPreview,onServerFrame,onSpecFrame } from '../preview.js';
 import { state } from '../state.js';
 import { drawStatusbar } from '../statusbar.js';
 import { onTeamFrame } from '../team.js';
-import { lineFor } from '../transcript.js';
+import { actSummary,avatarFor,durfmt,lineFor,relClock,untilText,whoHtml } from '../transcript.js';
 import { observeUsage,usageMeter } from '../usage.js';
+import { ICONS } from '../icons.js';
 
 /** thread behavior for one mounted project.
  * view contains live accessors to the owning project view's state and callbacks.
@@ -24,11 +25,13 @@ export function createThread(view) {
       var chips = document.getElementById("chips");
       if (!chips) return;
       var adapters = p.agents.filter(function(a){ return a.tier === "adapter"; });
-      if (state.selected === null) state.selected = p.holder || (adapters[0] && adapters[0].id) || null;
-      chips.innerHTML = adapters.map(function(a){
-        var sel = a.id === state.selected;
+      pickDefaultAgent(p, adapters);
+      chips.innerHTML = adapters.filter(function(a){ return a.enabled !== false; }).map(function(a){
+        var sel = a.id === state.selected, lbl = agentLabel(a.kind, a.id);
+        // the role only when it says something the name doesn't
+        var role = a.role && a.role !== a.id && a.role !== a.kind ? a.role : "";
         return '<button class="chip' + (sel ? " sel" : "") + '" data-id="' + esc(a.id) + '">' +
-          brandMark(a.kind) + esc(a.id) + ' <span class="role">' + esc(a.role) + (a.id === p.holder ? " \u2190" : "") + "</span>" +
+          agentGlyph(a.kind, a.id) + esc(lbl) + (role || a.id === p.holder ? ' <span class="role">' + esc(role) + (a.id === p.holder ? " \u2190" : "") + "</span>" : "") +
           (a.busy ? ' <span class="busy"></span>' : "") + usageMeter(a) + "</button>";
       }).join("");
       Array.prototype.forEach.call(chips.querySelectorAll(".chip"), function(chip){
@@ -36,10 +39,42 @@ export function createThread(view) {
       });
     }
 
+    /**
+     * Aim at the baton holder by default — unless that agent is switched off
+     * for this project, which would make the first send a refusal.
+     */
+    function pickDefaultAgent(p, adapters){
+      var usable = adapters.filter(function(a){ return a.enabled !== false; });
+      var ok = function(id){ return usable.some(function(a){ return a.id === id; }); };
+      var off = (p.agents || []).some(function(a){ return a.id === state.selected && a.enabled === false; });
+      if (state.selected === null || off) {
+        // A thread with an agent of its own (pinned when it was made, or a
+        // task's worker) is talked to through that agent — not whoever the
+        // last thread you were in happened to be aimed at.
+        var own = chatOwnAgent(p);
+        state.selected = (own && ok(own) ? own : null) ||
+          (ok(p.holder) ? p.holder : (usable[0] && usable[0].id)) || p.holder || (adapters[0] && adapters[0].id) || null;
+      }
+    }
+    function chatOwnAgent(p){
+      if (!view.chatId || view.chatId === "main") return null;
+      var agents = (p && p.agents) || [];
+      var resolve = function(want){
+        if (!want) return null;
+        for (var k = 0; k < agents.length; k++) if (agents[k].id === want) return agents[k].id;
+        for (var m = 0; m < agents.length; m++) if (agents[m].kind === want) return agents[m].id;
+        return null;
+      };
+      var threads = (p && p.orchestra && p.orchestra.threads) || [];
+      for (var i = 0; i < threads.length; i++) if (threads[i] && threads[i].chat === view.chatId) return resolve(threads[i].agent);
+      var chats = (p && p.chats) || [];
+      for (var j = 0; j < chats.length; j++) if (chats[j].id === view.chatId && chats[j].agentId) return resolve(chats[j].agentId);
+      return null;
+    }
     function drawStatus(){
       var p = state.project; if (!p) return;
       var adapters = p.agents.filter(function(a){ return a.tier === "adapter"; });
-      if (state.selected === null) state.selected = p.holder || (adapters[0] && adapters[0].id) || null;
+      pickDefaultAgent(p, adapters);
       var nm = document.getElementById("pname"); if (nm) nm.textContent = p.name;
       var stat = document.getElementById("pstat");
       if (stat) stat.textContent = p.needsInput ? "needs input" : p.costUsd > 0 ? money(p.costUsd) : "";
@@ -71,9 +106,10 @@ export function createThread(view) {
         ? "this orchestra has finished \u00b7 sending reopens it with its orchestrator"
         : view.planState
         ? "plan mode \u00b7 agent writes a plan to plans/\u2026, no code changes"
-        : state.selected && state.selected !== p.holder
-        ? "send will shift the baton to " + labelOf(state.selected)
-        : (view.desktop ? "click the agent to switch \u00b7 baton: " : "tap a chip to shift agents \u00b7 baton: ") + (p.holder || "\u2014");
+        // The resting state says nothing: who you're talking to is on the
+        // composer's own button, and repeating it underneath was noise.
+        : "";
+      reconcileLive(p);
       view.drawOrchTabDot(p.orchestra);
       view.updateModelLabel(); // the picker button reflects whoever's selected now
       if (!view.desktop) drawChips();
@@ -173,51 +209,357 @@ export function createThread(view) {
       // Returned, so a caller that changed the roster can wait for the answer
       // before redrawing off it.
       return api("/api/projects/" + view.pid).then(function(j){
+        var first = !state.project || !state.project.agents;
         state.project = j.project;
+        view.syncStars();
+        // the empty thread drew before the project arrived ("Ready in this
+        // project", no agent) — draw it again now that it knows both
         drawStatus();
+        if (first) { var h = document.getElementById("threadempty"); if (h) { h.remove(); drawEmpty(); } }
       }).catch(function(err){ toast(err.message); });
     }
 
 
     // ---- feed + live websocket ----------------------------------------------
+    // ---- scrolling ------------------------------------------------------------
+    // New content pulls the view down only if you were already at the bottom.
+    // Someone scrolled up to read shouldn't be yanked away mid-sentence; they
+    // get a "new messages" pill instead. Your own send always goes to the end.
+    var forceScroll = false;
+    /** The next thing appended scrolls into view, wherever you'd scrolled to. */
+    function wantScroll(){ forceScroll = true; }
+    function threadScroller(){ var f = document.getElementById("feed"); return f ? f.parentNode : null; }
+    function nearBottom(){
+      var sc = threadScroller();
+      return !sc || !sc.scrollHeight || sc.scrollHeight - sc.scrollTop - sc.clientHeight < 140;
+    }
+    function toBottom(){
+      var sc = threadScroller();
+      if (sc && sc.scrollHeight) sc.scrollTop = sc.scrollHeight;
+      var j = document.getElementById("jumpnew"); if (j) j.classList.remove("show");
+    }
+    function stickOrFlag(wasNear){
+      if (wasNear || forceScroll) { forceScroll = false; toBottom(); return; }
+      var j = document.getElementById("jumpnew"); if (j) j.classList.add("show");
+    }
+
+    // ---- the feed -------------------------------------------------------------
+    /** Who wrote the last thing in the feed, if it was an agent still mid-turn. */
+    function lastAuthor(feed){
+      for (var n = feed.lastElementChild; n; n = n.previousElementSibling) {
+        var c = n.classList;
+        if (c.contains("tool") || c.contains("acts") || c.contains("thinking") || c.contains("turncard")) continue;
+        if (c.contains("msg") && c.contains("agent")) return n.getAttribute("data-agent");
+        return null;
+      }
+      return null;
+    }
+    function updateActs(g){
+      var rows = g.querySelectorAll(".actlist > .tool");
+      var s = g.querySelector(".as"), l = g.querySelector(".al");
+      if (s) s.textContent = actSummary(Array.prototype.slice.call(rows));
+      var last = rows[rows.length - 1];
+      if (l) l.textContent = last ? (last.querySelector(".tx") || last).textContent : "";
+    }
+    /**
+     * Put one rendered line into the feed. Two things happen on the way in: a
+     * run of tool rows folds into one "activity" line you can open, and an
+     * agent continuing its own turn doesn't get a second byline.
+     */
+    function placeLine(feed, html, before){
+      var tmp = document.createElement("div");
+      tmp.innerHTML = html;
+      Array.prototype.slice.call(tmp.children).forEach(function(n){
+        var last = before ? before.previousElementSibling : feed.lastElementChild;
+        if (n.classList.contains("tool")) {
+          if (last && last.classList.contains("acts")) {
+            last.querySelector(".actlist").appendChild(n); updateActs(last); return;
+          }
+          if (last && last.classList.contains("tool")) {
+            var g = document.createElement("details");
+            g.className = "acts";
+            g.innerHTML = '<summary><span class="ai">' + ICONS.chevron + '</span><span class="as"></span><span class="al"></span></summary><div class="actlist"></div>';
+            feed.insertBefore(g, last);
+            g.querySelector(".actlist").appendChild(last);
+            g.querySelector(".actlist").appendChild(n);
+            updateActs(g);
+            return;
+          }
+        }
+        // A task's status line updates where the task first appeared, rather
+        // than adding a line per state (pending, running, done…) — three rows
+        // per task read as noise, one row that changes reads as progress.
+        var tk = !before && n.getAttribute && n.getAttribute("data-otask");
+        if (tk) {
+          var olds = feed.querySelectorAll('[data-otask="' + tk.replace(/"/g, "") + '"]');
+          if (olds.length) {
+            var old = olds[olds.length - 1];
+            old.parentNode.replaceChild(n, old);
+            n.classList.add("bump");
+            return;
+          }
+        }
+        if (n.classList.contains("msg") && n.classList.contains("agent") && !n.classList.contains("thinking")) {
+          var who = n.getAttribute("data-agent");
+          var prev = before ? null : lastAuthor(feed);
+          if (who && prev === who) n.classList.add("cont");
+        }
+        if (before) feed.insertBefore(n, before); else feed.appendChild(n);
+      });
+    }
     function append(events){
       var feed = document.getElementById("feed"); if (!feed) return;
       // only the loading placeholder gets cleared — never real history
       if (feed.firstChild && feed.firstChild.className === "loader") feed.innerHTML = "";
-      var html = "", added = false, meters = false;
+      var wasNear = nearBottom(), added = false, meters = false;
       events.forEach(function(e){
         if (e.id <= state.lastId) return;
         state.lastId = e.id;
+        if (!state.firstId || e.id < state.firstId) state.firstId = e.id;
         if (e.kind === "needs_input" && e.payload) state.lastQuestion = e.payload.question || null;
         // An answered approval folds the card it answers. Only when that card
-        // is out of the loaded window does it need a line of its own — and
-        // the card may be in the html not yet inserted, so flush first.
+        // is out of the loaded window does it need a line of its own.
         if (observeUsage(state.project, e)) meters = true;
         // A compaction that ended folds its "compacting…" row; flush first,
         // since the row may be in the html not yet inserted.
         var pl = e.payload || {};
         if (e.agentId && (pl.state === "native_compacted" || pl.state === "interrupted" || e.kind === "run_complete" || e.kind === "error")) {
-          if (html) { feed.insertAdjacentHTML("beforeend", html); html = ""; added = true; }
           Array.prototype.forEach.call(feed.querySelectorAll(".sys.compacting"), function(row){
             if (row.getAttribute("data-agent") === e.agentId) row.parentNode.removeChild(row);
           });
         }
-        // The finished reply replaces what streamed in while it was written.
+        // A tool still showing as running goes when the turn does.
         if (e.agentId && ((e.kind === "message" && !pl.reasoning) || pl.state === "interrupted" || e.kind === "run_complete" || e.kind === "error")) {
-          if (html) { feed.insertAdjacentHTML("beforeend", html); html = ""; added = true; }
           clearStreaming(feed, e.agentId);
         }
         if (e.kind === "approval" && e.payload && e.payload.phase === "decided") {
-          if (html) { feed.insertAdjacentHTML("beforeend", html); html = ""; added = true; }
           if (settleApprovalCards(e.payload.approvalId, e.payload.behavior, e.payload.message)) return;
         }
-        html += lineFor(e);
+        noteLive(e);
+        var html = lineFor(e);
+        if (!html) return;
+        placeLine(feed, html);
+        added = true;
       });
       if (meters) { drawChips(); view.updateModelLabel(); }
-      if (html || added) { if (html) feed.insertAdjacentHTML("beforeend", html);
-        var sc = feed.parentNode;
-        if (sc && sc.scrollHeight) sc.scrollTop = sc.scrollHeight;
-        else window.scrollTo(0, document.body.scrollHeight); }
+      drawEmpty();
+      if (added) { view.markDays(); markSeen(); if (state.railView === "outline") view.drawRail(); }
+      if (added) stickOrFlag(wasNear);
+      // A day-long live session piles thousands of nodes into one page. Once
+      // it's that big and you're reading the newest part, start again from the
+      // newest page — Load earlier still reaches everything, and a reply being
+      // written carries on from the snapshot.
+      if (added && view.historyLoaded && !trimQueued && feed.childElementCount > 1200 && nearBottom()) {
+        trimQueued = true;
+        setTimeout(function(){ if (!pageGone()) loadHistory().then(function(){ trimQueued = false; }, function(){ trimQueued = false; }); }, 0);
+      }
+    }
+    var trimQueued = false;
+    /** What this device has read in this chat — the sidebar's unread dots. */
+    function markSeen(){
+      var m = {};
+      try { m = JSON.parse(localStorage.getItem("loomSeen") || "{}") || {}; } catch (e) {}
+      var k = view.pid + ":" + view.chatId;
+      if ((m[k] || 0) >= state.lastId) return;
+      m[k] = state.lastId;
+      try { localStorage.setItem("loomSeen", JSON.stringify(m)); } catch (e) {}
+    }
+
+    // ---- live: a reply being written, and who is working ----------------------
+    // The daemon streams replies as they're typed (a "stream" frame, never
+    // logged) and the finished message lands as an event afterwards. Between
+    // your send and that message, the thread shows who's on it, for how long,
+    // and what they're doing — instead of fifteen seconds of nothing.
+    var live = {};
+    var TERMINAL = { run_complete: 1, error: 1 };
+    function liveHost(){ return document.getElementById("feedlive"); }
+    function liveFor(agentId){
+      var L = live[agentId];
+      if (L && L.el && L.el.parentNode) return L;
+      var host = liveHost(); if (!host) return null;
+      var el = document.createElement("div");
+      el.className = "livebox";
+      el.setAttribute("data-live", agentId);
+      host.appendChild(el);
+      L = live[agentId] = { el: el, text: "", think: "", act: "", since: Date.now(), touched: Date.now(), raf: 0 };
+      paintLive(agentId);
+      return L;
+    }
+    function endLive(agentId){
+      var L = live[agentId];
+      if (L) { if (L.el && L.el.parentNode) L.el.parentNode.removeChild(L.el); if (L.raf) cancelAnimationFrame(L.raf); }
+      delete live[agentId];
+    }
+    function clearLive(){ Object.keys(live).forEach(endLive); var h = liveHost(); if (h) h.innerHTML = ""; }
+    function paintLiveState(agentId){
+      var L = live[agentId]; if (!L) return;
+      var st = L.el.querySelector(".lstate"); if (!st) return;
+      var secs = Math.floor((Date.now() - L.since) / 1000);
+      var what = L.text ? "Writing" : L.think ? "Thinking" : L.act ? L.act : "Working";
+      // how fast it's coming: words so far, and words a second since the first one
+      var pace = "";
+      if (L.text && L.firstTextAt) {
+        var words = (L.text.match(/\S+/g) || []).length;
+        var dt = (Date.now() - L.firstTextAt) / 1000;
+        pace = '<span class="lpace">' + words + " word" + (words === 1 ? "" : "s") + (dt >= 1.5 ? " · " + (words / dt).toFixed(1) + " w/s" : "") + "</span>";
+      }
+      st.innerHTML = '<span class="shimmer">' + esc(what) + "</span>" + (secs >= 1 ? '<span class="lsecs">' + durfmt(secs * 1000) + "</span>" : "") + pace;
+    }
+    function paintLive(agentId){
+      var L = live[agentId]; if (!L) return;
+      var feed = document.getElementById("feed");
+      if (!L.text) {
+        // Nothing written yet: one quiet line, not an empty message.
+        if (L.el.className !== "livebox bar") {
+          L.el.className = "livebox bar";
+          L.el.innerHTML = '<span class="lav">' + avatarFor(agentId) + '<i class="lring"></i></span><span class="lname">' + esc(labelOf(agentId)) + '</span><span class="lstate"></span>';
+        }
+        paintLiveState(agentId);
+        return;
+      }
+      if (L.el.className.indexOf("livebox msgmode") !== 0) {
+        L.el.className = "livebox msgmode";
+        L.el.innerHTML = '<div class="msg agent live' + (feed && lastAuthor(feed) === agentId ? " cont" : "") + '" data-agent="' + esc(agentId) + '">' +
+          whoHtml({ agentId: agentId, ts: Date.now(), payload: {} }, '<span class="lstate"></span>') +
+          '<div class="bubble md lbody"></div></div>';
+      }
+      var body = L.el.querySelector(".lbody");
+      body.innerHTML = mdToHtml(L.text);
+      // the caret sits at the end of the last line written, not below it
+      var tail = body;
+      while (tail.lastElementChild && !/^(PRE|CODE|TABLE|svg)$/.test(tail.lastElementChild.tagName)) tail = tail.lastElementChild;
+      tail.insertAdjacentHTML("beforeend", '<span class="caret"></span>');
+      paintLiveState(agentId);
+    }
+    function schedulePaint(agentId, wasNear){
+      var L = live[agentId]; if (!L || L.raf) return;
+      L.raf = requestAnimationFrame(function(){ L.raf = 0; paintLive(agentId); stickOrFlag(wasNear); });
+    }
+    /** Keep the live view in step with the logged events as they arrive. */
+    // Turns the history replay saw start and not end. Replay never draws a
+    // live line itself: whether a turn is STILL running is a question for the
+    // agent's busy flag (or the run's state), answered once replay is done.
+    var openTurns = {};
+    function noteLive(e){
+      if (!e.agentId) return;
+      var p = e.payload || {}, id = e.agentId;
+      var ends = TERMINAL[e.kind] || e.kind === "needs_input" || (e.kind === "status" && (p.state === "interrupted" || p.state === "stopped"));
+      var starts = (e.kind === "status" && p.state === "turn_started") || e.kind === "tool_call" || e.kind === "file_edit" || e.kind === "message";
+      if (!view.historyLoaded) {
+        if (ends) delete openTurns[id];
+        else if (starts) openTurns[id] = { since: Number(e.ts) || Date.now(), act: e.kind === "tool_call" ? String(p.summary || p.tool || "") : "" };
+        return;
+      }
+      if (ends) {
+        endLive(id);
+        // Stop turns back into Send the moment the turn ends, not a poll later.
+        clearTimeout(state.endRefresh);
+        state.endRefresh = setTimeout(function(){ if (state.pid === view.pid) refresh(); }, 150);
+        return;
+      }
+      if (!starts) return;
+      var L = liveFor(id); if (!L) return;
+      L.touched = Date.now();
+      if (e.kind === "message") { if (p.reasoning) L.think = ""; else L.text = ""; L.synced = false; }
+      if (e.kind === "tool_call") L.act = String(p.summary || p.tool || p.name || "Working").replace(/\s+/g, " ").slice(0, 80);
+      if (e.kind === "file_edit") L.act = "Editing " + String(p.path || "").split("/").pop();
+      paintLive(id);
+    }
+    function onStreamFrame(f){
+      if ((f.chat || "main") !== view.chatId || !f.agentId || !f.text) return;
+      var wasNear = nearBottom();
+      var L = liveFor(f.agentId); if (!L) return;
+      var key = f.reasoning ? "think" : "text", have = L[key];
+      if (key === "text" && !L.firstTextAt) L.firstTextAt = Date.now();
+      // Seeded from the snapshot of a reply already under way, pieces carry
+      // their offset: skip what the snapshot already had, stitch the rest.
+      if (L.synced && typeof f.off === "number") {
+        if (f.off + f.text.length <= have.length) return;
+        L[key] = have + (f.off <= have.length ? f.text.slice(have.length - f.off) : f.text);
+      } else L[key] = have + f.text;
+      L.touched = Date.now();
+      schedulePaint(f.agentId, wasNear);
+    }
+    /**
+     * Drop live lines the log will never close: an agent that died with the
+     * daemon, or a turn whose end arrived while this view was elsewhere. Only
+     * for plain threads — an orchestra worker runs as a copy of its roster
+     * agent, so the roster's busy flag says nothing about it.
+     */
+    /**
+     * Is this thread an orchestra's, and is its work going right now? The
+     * run's own thread is going while the orchestrator plans or reviews; a
+     * task thread while its task runs. null: not an orchestra thread at all.
+     */
+    function orchThreadGoing(p){
+      var s = p && p.orchestra;
+      if (!s) return null;
+      if (s.chat === view.chatId) return /^(starting|planning|reviewing|running)$/.test(String(s.status || ""));
+      var t = (s.threads || []).filter(function(x){ return x && x.chat === view.chatId; })[0];
+      return t ? t.status === "running" : null;
+    }
+    function reconcileLive(p){
+      var now = Date.now(), agents = (p && p.agents) || [];
+      var og = orchThreadGoing(p), orchThread = og !== null;
+      // Turns the replay left open become live lines only if they really are
+      // still going: the agent says it's busy, or this thread's run is live.
+      Object.keys(openTurns).forEach(function(id){
+        var a = agents.filter(function(x){ return x.id === id; })[0];
+        var going = orchThread ? og : !!(a && a.busy);
+        if (going && !live[id]) {
+          var L = liveFor(id);
+          if (L) { L.since = openTurns[id].since; L.act = openTurns[id].act.slice(0, 80); paintLive(id); }
+        }
+        delete openTurns[id];
+      });
+      Object.keys(live).forEach(function(id){
+        var L = live[id], a = agents.filter(function(x){ return x.id === id; })[0];
+        if (orchThread ? (og === false && now - L.touched > 6000) : (a && !a.busy && now - L.touched > 6000)) endLive(id);
+        else if (now - L.touched > 20 * 60 * 1000) endLive(id);
+      });
+    }
+    state.timers.push(setInterval(function(){
+      Object.keys(live).forEach(paintLiveState);
+      Array.prototype.forEach.call(document.querySelectorAll("#feed .errcd[data-until]"), function(n){ n.textContent = untilText(Number(n.getAttribute("data-until"))); });
+      Array.prototype.forEach.call(document.querySelectorAll("[data-oel]"), function(n){ n.textContent = durfmt(Math.max(0, Date.now() - Number(n.getAttribute("data-oel")))); });
+      // "just now" → "3m ago" → the clock: once every ~30s is plenty
+      if (Date.now() - (state.relTick || 0) > 30000) {
+        state.relTick = Date.now();
+        Array.prototype.forEach.call(document.querySelectorAll("#feed .wt[data-rel]"), function(n){
+          var t = Number(n.getAttribute("data-rel")); if (!t) return;
+          var v = relClock(t); if (n.textContent !== v) n.textContent = v;
+          if (Date.now() - t > 3600000) n.removeAttribute("data-rel"); // settled: it's a clock now
+        });
+      }
+    }, 1000));
+
+    // ---- empty thread ---------------------------------------------------------
+    var SUGGEST = [
+      ["Explain this codebase", "Give me a tour of this codebase: what it does, how it\u2019s organised, and where the important parts live."],
+      ["Find a bug", "Look through the code for a real bug, explain it, and fix it with a test."],
+      ["Write tests", "Find the least-tested important code and write good tests for it."],
+      ["Review my changes", "Review the uncommitted changes in this project and tell me what you\u2019d change."],
+    ];
+    function drawEmpty(){
+      var feed = document.getElementById("feed"); if (!feed) return;
+      var has = feed.querySelector(".msg,.sys,.tool,.acts,.turncard,.nicard,.apcard,.handoff,.turnend,.orchbrief,.plancard");
+      var hero = document.getElementById("threadempty");
+      if (has || (feed.firstChild && feed.firstChild.className === "loader") || Object.keys(live).length) { if (hero) hero.remove(); return; }
+      if (hero) return;
+      var p = state.project || {};
+      var who = state.selected || p.holder || "";
+      feed.insertAdjacentHTML("beforeend",
+        '<div class="threadempty" id="threadempty"><div class="teav">' + (who ? avatarFor(who) : '<span class="av">' + ICONS.chat + "</span>") + "</div>" +
+        '<div class="tet">What should we work on?</div>' +
+        '<div class="tes">' + (who ? esc(labelOf(who)) + " is ready in " : "Ready in ") + "<b>" + esc(p.name || "this project") + "</b>. Every agent here shares one memory.</div>" +
+        '<div class="tesug">' + SUGGEST.map(function(s, i){ return '<button type="button" class="tesb" data-sug="' + i + '">' + esc(s[0]) + "</button>"; }).join("") + "</div></div>");
+      Array.prototype.forEach.call(feed.querySelectorAll("[data-sug]"), function(b){
+        b.onclick = function(){
+          var box = document.getElementById("box"); if (!box) return;
+          box.value = SUGGEST[Number(b.getAttribute("data-sug"))][1];
+          view.autosizeBox(); box.focus();
+        };
+      });
     }
 
     // ---- streamed text: shown while the reply is written, never stored -------
@@ -227,8 +569,12 @@ export function createThread(view) {
       });
     }
 
+    // A provider agent's text reaches the thread as "stream" frames (the same
+    // live reply every agent gets — see onStreamFrame), so a delta frame's
+    // text is not drawn a second time. Kept for clients that only see deltas.
     function onDelta(frame){
       if (frame.streamKind !== "assistant_text" || !frame.agentId || !view.historyLoaded) return;
+      if (typeof onStreamFrame === "function") return;
       if ((frame.chat || "main") !== view.chatId) return;
       var feed = document.getElementById("feed"); if (!feed) return;
       var key = String(frame.itemId || frame.turnId || "");
@@ -270,9 +616,51 @@ export function createThread(view) {
       if (sc && sc.scrollHeight) sc.scrollTop = sc.scrollHeight;
     }
 
-    function flushPending(){
+    var pendingStream = [];
+    function flushPending(snap){
       view.historyLoaded = true;
       if (view.pendingWs.length) { append(view.pendingWs); view.pendingWs = []; }
+      // A reply already being typed when this thread opened (a reload
+      // mid-answer): show what it has said so far, then the pieces that came
+      // in while the history loaded, deduped by offset.
+      (snap || []).forEach(function(x){
+        if (!x || !x.agentId || (x.chat || "main") !== view.chatId) return;
+        var L = liveFor(x.agentId); if (!L) return;
+        L.text = String(x.text || ""); L.think = String(x.think || ""); L.synced = true;
+        L.touched = Date.now(); paintLive(x.agentId);
+      });
+      var q = pendingStream; pendingStream = [];
+      q.forEach(onStreamFrame);
+    }
+    var PAGE = 80;
+    function drawEarlier(more){
+      var feed = document.getElementById("feed"); if (!feed) return;
+      var old = document.getElementById("loadearlier"); if (old) old.remove();
+      if (!more) return;
+      feed.insertAdjacentHTML("afterbegin", '<button type="button" class="loadearlier" id="loadearlier">Load earlier messages</button>');
+      document.getElementById("loadearlier").onclick = loadEarlier;
+    }
+    /** Page the thread backwards, keeping what you were looking at in place. */
+    function loadEarlier(){
+      var feed = document.getElementById("feed"), btn = document.getElementById("loadearlier");
+      if (!feed || !state.firstId) return Promise.resolve();
+      if (btn) { btn.disabled = true; btn.textContent = "Loading…"; }
+      return api("/api/projects/" + view.pid + "/events?limit=" + PAGE + "&before=" + state.firstId + "&chat=" + encodeURIComponent(view.chatId))
+        .then(function(j){
+          var evs = j.events || [], sc = threadScroller();
+          var fromBottom = sc ? sc.scrollHeight - sc.scrollTop : 0;
+          var anchor = btn ? btn.nextElementSibling : feed.firstElementChild;
+          var hero = document.getElementById("threadempty"); if (hero) hero.remove();
+          evs.forEach(function(e){
+            if (!state.firstId || e.id < state.firstId) state.firstId = e.id;
+            var html = lineFor(e);
+            if (html) placeLine(feed, html, anchor);
+          });
+          drawEarlier(evs.length >= PAGE);
+          view.markDays();
+          if (sc) sc.scrollTop = sc.scrollHeight - fromBottom;
+        })
+        .catch(function(err){ toast(err.message); if (btn) { btn.disabled = false; btn.textContent = "Load earlier messages"; } });
     }
 
     // Reading the thread again from scratch. Changing the transcript level
@@ -281,9 +669,26 @@ export function createThread(view) {
     function loadHistory(){
       var feed = document.getElementById("feed");
       if (feed) feed.innerHTML = '<div class="loader"></div>';
-      state.lastId = 0;
-      return api("/api/projects/" + view.pid + "/events?limit=60&chat=" + encodeURIComponent(view.chatId))
-        .then(function(j){ append(j.events || []); flushPending(); })
+      state.lastId = 0; state.firstId = 0;
+      clearLive();
+      openTurns = {};
+      view.historyLoaded = false; pendingStream = [];
+      view.syncStars();
+      if (state.loadGitStat && (!state.gitStat || state.gitStat.pid !== view.pid)) setTimeout(function(){ if (!pageGone() && state.loadGitStat) state.loadGitStat(); }, 300);
+      return api("/api/projects/" + view.pid + "/events?limit=" + PAGE + "&chat=" + encodeURIComponent(view.chatId))
+        .then(function(j){
+          var evs = j.events || [];
+          forceScroll = true;
+          append(evs);
+          if (!evs.length) { var f = document.getElementById("feed"); if (f && f.firstChild && f.firstChild.className === "loader") f.innerHTML = ""; drawEmpty(); }
+          drawEarlier(evs.length >= PAGE);
+          flushPending(j.live);
+          view.markDays(); markSeen();
+          var go = state.pendingGo;
+          if (go && go.pid === view.pid && go.chat === view.chatId) { state.pendingGo = null; setTimeout(function(){ if (!pageGone()) view.jumpToMessage(go.id); }, 60); }
+          if (state.project) reconcileLive(state.project);
+          toBottom();
+        })
         .catch(function(err){ toast(err.message); flushPending(); });
     }
 
@@ -322,6 +727,8 @@ export function createThread(view) {
           if (frame.type === "team") { onTeamFrame(frame); return; }
           // the prompt queue changed — sent, edited, reordered, paused
           if (frame.type === "queue") { view.onQueueFrame(frame); return; }
+          // a reply as it's being written (not logged; the message follows)
+          if (frame.type === "stream") { if (view.historyLoaded) onStreamFrame(frame); else if (pendingStream.length < 2000) pendingStream.push(frame); return; }
           // a dev server started, stopped, crashed, or printed a line
           if (frame.type === "server") { onServerFrame(frame); return; }
           // a reply being written, a few words at a time
@@ -329,7 +736,7 @@ export function createThread(view) {
           // a tool starting, or finishing, while the turn runs
           if (frame.type === "item") { onItem(frame); return; }
           // an agent changed files while a preview is open: show the new page
-          if (frame.type === "event" && frame.event && frame.event.kind === "turn_diff") maybeReloadPreview();
+          if (frame.type === "event" && frame.event && frame.event.kind === "turn_diff") { maybeReloadPreview(); if (state.loadGitStat) state.loadGitStat(); }
           if (frame.type === "event" && frame.event) {
             // "an agent needs you" is the whole reason Loom exists, so it must
             // reach you even when this isn't the chat you're looking at, or the
@@ -337,6 +744,7 @@ export function createThread(view) {
             // permitted) raise an OS notification. Deliberately above the
             // per-chat filter below, which would otherwise swallow it.
             if (frame.event.kind === "needs_input") notifyNeedsInput(frame.event);
+            if (frame.event.kind === "run_complete") notifyDone(frame.event, state.project && state.project.name);
             // An orchestra spans many chats — its run's and one per task — so
             // the view listens above the per-chat filter too.
             view.onOrchEvent(frame.event);
@@ -349,6 +757,9 @@ export function createThread(view) {
             if ((frame.event.chat || "main") !== view.chatId) return;
             if (view.historyLoaded) append([frame.event]);
             else view.pendingWs.push(frame.event);
+            if (view.historyLoaded && frame.event.kind === "orchestra" && frame.event.payload && frame.event.payload.phase === "completed") {
+              var dn = document.querySelectorAll("#feed .odone"); if (dn.length) dn[dn.length - 1].classList.add("celebrate");
+            }
           }
         } catch (e) {}
       };
@@ -357,5 +768,5 @@ export function createThread(view) {
         if (state.pid === view.pid) state.timers.push(setTimeout(connect, 3000));
       };
     }
-return { drawStatus, refresh, loadHistory, connect };
+return { drawStatus, refresh, loadHistory, connect, drawEmpty, threadScroller, wantScroll, stickOrFlag, toBottom, liveFor, nearBottom, loadEarlier };
 }

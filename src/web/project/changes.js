@@ -1,8 +1,8 @@
 import { api } from '../connection.js';
-import { isLoomInternal,renderDiffFiles,renderDiffLines,splitPatch } from '../diff.js';
+import { diffBody,diffToggle,isLoomInternal,renderDiffFiles,renderDiffLines,splitPatch } from '../diff.js';
 import { esc } from '../format.js';
 import { ICONS,LOADER } from '../icons.js';
-import { toast } from '../notifications.js';
+import { askConfirm,toast } from '../notifications.js';
 import { state } from '../state.js';
 
 /** changes behavior for one mounted project.
@@ -119,19 +119,36 @@ export function createChanges(view) {
     }
 
     // Show a turn's combined patch (from a turn_diff card in the thread).
-    function openPatchDock(patch, label){
+    function openPatchDock(patch, label, cp){
       openDock();
       dockTitle(ICONS.tree, label || "changes");
       var el = document.getElementById("pane-changes");
       var files = splitPatch(patch);
-      el.innerHTML = '<div class="diffwrap">' + (files.length
+      el.innerHTML = diffToggle() + '<div class="diffwrap">' + (files.length
         ? files.map(function(f, i){
             return '<div class="dfile" id="df-' + i + '"><div class="dfh">' + ICONS.tree +
               '<span class="p">' + esc(f.path || "patch") + "</span>" +
-              '<span class="cadd">+' + f.add + '</span><span class="cdel">\u2212' + f.del + "</span></div>" +
-              '<div class="dcode">' + renderDiffLines(f.lines, f.path) + "</div></div>";
+              '<span class="cadd">+' + f.add + '</span><span class="cdel">−' + f.del + "</span>" +
+              (cp && f.path ? '<button type="button" class="btn xs ghost dfrevert" data-rvfile="' + esc(f.path) + '" title="put just this file back the way it was before this turn">' + ICONS.rewind + "Revert file</button>" : "") +
+              "</div>" +
+              '<div class="dcode">' + diffBody(f.lines, f.path) + "</div></div>";
           }).join("")
-        : '<div class="dcode">' + renderDiffLines(String(patch).split("\n")) + "</div>") + "</div>";
+        : '<div class="dcode">' + diffBody(String(patch).split("\n")) + "</div>") + "</div>";
+      Array.prototype.forEach.call(el.querySelectorAll("[data-dv]"), function(b){
+        b.onclick = function(){ try { localStorage.setItem("loomDiffView", b.getAttribute("data-dv")); } catch (e) {} openPatchDock(patch, label, cp); };
+      });
+      Array.prototype.forEach.call(el.querySelectorAll("[data-rvfile]"), function(b){
+        b.onclick = function(){
+          var file = b.getAttribute("data-rvfile");
+          askConfirm("Put " + file + " back the way it was before this turn?\n\nOnly this file changes. The version it replaces is saved first, so this can be undone from Rewind.", { ok: "Revert file" }).then(function(yes){
+            if (!yes) return;
+            b.disabled = true;
+            api("/api/projects/" + view.pid + "/checkpoints/" + encodeURIComponent(cp) + "/rewind-file", { method: "POST", body: JSON.stringify({ path: file }) })
+              .then(function(r){ b.textContent = r.removed ? "Removed" : "Reverted"; b.classList.add("done"); toast(file + (r.removed ? " removed — this turn created it" : " is back to how it was before this turn")); if (state.loadGitStat) state.loadGitStat(); })
+              .catch(function(err){ b.disabled = false; toast(err.message); });
+          });
+        };
+      });
       var sc = el; if (sc) sc.scrollTop = 0;
     }
 

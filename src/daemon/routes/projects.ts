@@ -30,6 +30,7 @@ export function registerProjectsRoutes(app: Express, ctx: Pick<RouteContext, "ru
             lastEvent: null,
             needsInput: false,
             error: String(err instanceof Error ? err.message : err),
+            ...(fs.existsSync(info.dir) ? {} : { missing: true }),
           });
         }
       }

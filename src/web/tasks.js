@@ -1,9 +1,9 @@
 /** Browser tasks module. See README.md for ownership and startup. */
-import { brandMark } from './agents.js';
+import { agentGlyph,agentLabel,brandMark } from './agents.js';
 import { api } from './connection.js';
 import { esc } from './format.js';
 import { ICONS } from './icons.js';
-import { toast } from './notifications.js';
+import { modalErr,toast } from './notifications.js';
 import { state } from './state.js';
 
 
@@ -16,7 +16,8 @@ import { state } from './state.js';
     var pid = prefillPid || state.pid || projects[0].id;
     var picked = (prefillAgents || []).slice();
     function proj(id){ for (var i = 0; i < projects.length; i++) if (projects[i].id === id) return projects[i]; return null; }
-    function agentsFor(id){ var p = proj(id); return p ? p.agents.filter(function(a){ return a.tier === "adapter"; }) : []; }
+    // switched-off agents can't take a task, so they aren't offered one
+    function agentsFor(id){ var p = proj(id); return p ? p.agents.filter(function(a){ return a.tier === "adapter" && a.enabled !== false; }) : []; }
     function routesFor(id){ var p = proj(id); return (p && p.routeNames) || ["auto"]; }
     function projOpts(){ return projects.map(function(p){ return '<option value="' + esc(p.id) + '"' + (p.id === pid ? " selected" : "") + ">" + esc(p.name) + "</option>"; }).join(""); }
     function routeOpts(id){ return '<option value="">\u2014 use the agents above \u2014</option>' + routesFor(id).map(function(n){ return '<option value="' + esc(n) + '">' + esc(n === "auto" ? "auto \u2014 LLM picks each hop" : n) + "</option>"; }).join(""); }
@@ -55,8 +56,8 @@ import { state } from './state.js';
         var order = picked.indexOf(a.id);
         return '<button type="button" class="agchip' + (order >= 0 ? " sel" : "") + '" data-id="' + esc(a.id) + '">' +
           '<span class="num">' + (order >= 0 ? order + 1 : "") + "</span>" +
-          brandMark(a.kind) + esc(a.id) +
-          '<span class="role">' + esc(a.role) + "</span></button>";
+          agentGlyph(a.kind, a.id) + esc(agentLabel(a.kind, a.id)) +
+          (a.role && a.role !== a.id && a.role !== a.kind ? '<span class="role">' + esc(a.role) + "</span>" : "") + "</button>";
       }).join("") || '<span class="hintx">no agents configured for this project</span>';
       Array.prototype.forEach.call(box.querySelectorAll(".agchip"), function(ch){
         ch.onclick = function(){
@@ -71,8 +72,8 @@ import { state } from './state.js';
       if (hint) hint.textContent = picked.length > 1
         ? "runs as a pipeline: " + picked.join(" \u2192 ")
         : picked.length === 1
-          ? "one ADE runs the whole task"
-          : "pick one ADE \u2014 or several to run them in order";
+          ? "one agent runs the whole task"
+          : "pick one agent \u2014 or several to run them in order";
     }
     // The roles you can hand out. Only the first three carry distinct prompt
     // behaviour today (plan / execute / review); the rest are honest labels the
@@ -132,9 +133,13 @@ import { state } from './state.js';
       var mproj = document.getElementById("mproj").value;
       var task = (document.getElementById("mtask").value || "").trim();
       var pipeline = document.getElementById("mroute").value;
-      if (!task) return toast("describe the task first");
-      if (!pipeline && !picked.length) return toast("pick at least one agent");
-      var btn = document.getElementById("mcreate"); btn.disabled = true;
+      if (!task) return modalErr(scrim, "Describe the task first.", document.getElementById("mtask"));
+      if (!pipeline && !picked.length) return modalErr(scrim, "Pick at least one agent.");
+      modalErr(scrim, "");
+      var btn = document.getElementById("mcreate");
+      if (btn.disabled) return;
+      btn.disabled = true;
+      var btnWas = btn.innerHTML; btn.textContent = "Starting\u2026";
       var work, note;
       // The spec carries each step's assigned role, so a route can say "this one
       // plans, that one executes" without touching either agent's own role.
@@ -173,7 +178,7 @@ import { state } from './state.js';
         toast(note);
         if (state.selectProject) state.selectProject(mproj);
         else location.hash = "#p/" + mproj;
-      }).catch(function(err){ btn.disabled = false; toast(err.message); });
+      }).catch(function(err){ btn.disabled = false; btn.innerHTML = btnWas; modalErr(scrim, err.message); });
     }
     document.getElementById("mcreate").onclick = create;
     function onKey(e){
@@ -190,7 +195,7 @@ import { state } from './state.js';
    * "Create & start" hands the text to the agent and drops the card in
    * Working, which is where that work actually is.
    */
-  function openBoardTaskModal(pid, column, onDone){
+  function openBoardTaskModal(pid, column, onDone, prefill){
     if (document.querySelector(".scrim")) return;
     var p = state.project;
     var adapters = (p && p.agents ? p.agents : []).filter(function(a){ return a.tier === "adapter"; });
@@ -208,6 +213,8 @@ import { state } from './state.js';
           cols.map(function(c){
             return '<option value="' + c[0] + '"' + (c[0] === column ? " selected" : "") + ">" + c[1] + "</option>";
           }).join("") + "</select></div>" +
+        '<div class="field bmmeta"><div><label>Priority <span class="opt">optional</span></label><select id="bmprio"><option value="">None</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></div>' +
+          '<div><label>Due <span class="opt">optional</span></label><input type="date" id="bmdue"></div></div>' +
         '<div class="field"><label>For <span class="opt">optional</span></label>' +
           '<div class="agsel" id="bmagsel"></div>' +
           '<span class="hintx" id="bmhint">just a note to yourself unless you pick someone</span></div>' +
@@ -221,13 +228,15 @@ import { state } from './state.js';
     scrim.addEventListener("click", function(ev){ if (ev.target === scrim) close(); });
     document.getElementById("bmclose").onclick = close;
     document.getElementById("bmcancel").onclick = close;
+    if (prefill) { var bmt = document.getElementById("bmtitle"); if (bmt) bmt.value = prefill; }
 
     function drawChips(){
       var box = document.getElementById("bmagsel"); if (!box) return;
       box.innerHTML = adapters.length
         ? adapters.map(function(a){
             return '<button type="button" class="agchip' + (picked === a.id ? " sel" : "") + '" data-id="' + esc(a.id) + '">' +
-              brandMark(a.kind) + esc(a.id) + '<span class="role">' + esc(a.role || "") + "</span></button>";
+              agentGlyph(a.kind, a.id) + esc(agentLabel(a.kind, a.id)) +
+              (a.role && a.role !== a.id && a.role !== a.kind ? '<span class="role">' + esc(a.role) + "</span>" : "") + "</button>";
           }).join("")
         : '<span class="hintx">no agents configured for this project</span>';
       Array.prototype.forEach.call(box.querySelectorAll(".agchip"), function(ch){
@@ -249,11 +258,14 @@ import { state } from './state.js';
 
     function create(alsoStart){
       var title = (document.getElementById("bmtitle").value || "").trim();
-      if (!title) return toast("what needs doing?");
+      if (!title) return modalErr(document.querySelector(".scrim"), "Say what needs doing.", document.getElementById("bmtitle"));
       var col = document.getElementById("bmcol").value;
       // starting it means an agent is on it now, so the card belongs in Working
       var body = { title: title, column: alsoStart ? "working" : col };
       if (picked) body.agent = picked;
+      var bprio = document.getElementById("bmprio"), bdue = document.getElementById("bmdue");
+      if (bprio && bprio.value) body.priority = bprio.value;
+      if (bdue && bdue.value) body.due = bdue.value;
       document.getElementById("bmcreate").disabled = true;
       api("/api/projects/" + pid + "/board/tasks", { method: "POST", body: JSON.stringify(body) })
         .then(function(){

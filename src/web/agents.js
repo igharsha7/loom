@@ -4,6 +4,7 @@ import { api } from './connection.js';
 import { esc,hue } from './format.js';
 import { toast } from './notifications.js';
 import { state } from './state.js';
+import { shortModel } from './permissions.js';
 
 
   // ---- ADE brand marks -----------------------------------------------------
@@ -35,10 +36,29 @@ import { state } from './state.js';
   var AGENT_LABELS = { "codex": "Codex (ChatGPT)", "antigravity-cli": "Antigravity", "antigravity": "Antigravity",
     "claude-code": "Claude Code", "grok-code": "Grok", "opencode": "OpenCode" };
 
-  function agentLabel(kind, id){ return (kind && AGENT_LABELS[kind]) || id || kind || "agent"; }
+  function agentLabel(kind, id){
+    // A model agent left with its generic id ("model", "model-2") is better
+    // named by the model it runs: "gemma-4-31b-it" says which one it is.
+    if (kind === "model" && /^model(-\d+)?$/.test(String(id || ""))) {
+      var list = (state.project && state.project.agents) || [];
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].id === id && list[i].model) return shortModel(list[i].model).replace(/:free$/, "");
+      }
+    }
+    return (kind && AGENT_LABELS[kind]) || id || kind || "agent";
+  }
 
-  /** A roster id's label, resolving its kind from the open project. */
-  function labelOf(id){ return agentLabel(kindOf(id), id); }
+  /**
+   * A roster id's label, resolving its kind from the open project. Before the
+   * project has loaded, an id that IS a kind (the default roster's are) still
+   * reads as its product, rather than flashing "claude-code" for a beat.
+   */
+  function labelOf(id){
+    var s = String(id || "");
+    // an ask-several thread's agent is the model it asked
+    if (s.indexOf("ask:") === 0) return shortModel(s.slice(4));
+    return agentLabel(kindOf(id) || (AGENT_LABELS[s] ? s : null), id);
+  }
 
   /** The quiet second line of a picker row: id and role, each only if it adds something. */
   function agentSub(a, lbl){
@@ -51,6 +71,8 @@ import { state } from './state.js';
 
   /** The brand mark, or a hue monogram for a kind that has none — never blank. */
   function agentGlyph(kind, id, cls){
+    var pic = id && state.project && (state.project.agents || []).filter(function(a){ return a.id === id && a.avatar; })[0];
+    if (pic && /^data:image\/(png|jpeg|webp);base64,/.test(pic.avatar)) return '<img class="agpic' + (cls ? " " + cls : "") + '" src="' + pic.avatar + '" alt="">';
     if (hasBrand(kind)) return brandMark(kind, cls);
     var h = hue(String(id || kind || "?"));
     return '<span class="agmono" style="background:color-mix(in srgb, hsl(' + h + ',60%,50%) 20%, transparent);color:hsl(' + h + ',60%,var(--agent-l))">' +

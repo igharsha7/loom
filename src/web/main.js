@@ -4,7 +4,7 @@ import { api,pairFromHash } from './connection.js';
 import { clog } from './console.js';
 import { labelIcons } from './icons.js';
 import { closeMenu } from './menus.js';
-import { bootstrapAdmin,route,typingInField } from './navigation.js';
+import { bootstrapAdmin,openShortcuts,route,setFocusMode,takePermalink,typingInField } from './navigation.js';
 import { stopTitleFlash,toast } from './notifications.js';
 import { openPalette } from './palette.js';
 import { onPreviewMessage } from './preview.js';
@@ -75,6 +75,8 @@ import { openTaskModal } from './tasks.js';
   }
 
   window.addEventListener("hashchange", function(){
+    var go = takePermalink();
+    if (go && state.setChat && isDesktop()) { state.setChat(go.pid, go.chat); return; }
     if (!isDesktop()) return route();
     // The desktop shell navigates with replaceState, so this only fires for a
     // hash someone typed or pasted — honour it instead of ignoring the URL.
@@ -91,6 +93,22 @@ import { openTaskModal } from './tasks.js';
     if ((e.metaKey || e.ctrlKey) && !e.altKey && (e.key === "k" || e.key === "K")) {
       if (state.token && !document.querySelector(".scrim")) { e.preventDefault(); openPalette(); }
       return;
+    }
+    // ⌘F — find in this chat (the browser's own find can't see folded tool groups)
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && (e.key === "f" || e.key === "F")) {
+      if (state.openFind && state.token && !document.querySelector(".scrim")) { e.preventDefault(); state.openFind(); }
+      return;
+    }
+    // ⌘. — focus mode
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key === ".") {
+      if (state.token && isDesktop()) { e.preventDefault(); setFocusMode(!document.documentElement.classList.contains("focusmode")); }
+      return;
+    }
+    if ((e.key === "[" || e.key === "]") && !e.metaKey && !e.ctrlKey && !e.altKey && state.jumpPrompt && !typingInField(e.target) && !document.querySelector(".scrim")) {
+      e.preventDefault(); state.jumpPrompt(e.key === "[" ? -1 : 1); return;
+    }
+    if (e.key === "?" && !e.metaKey && !e.ctrlKey && !e.altKey && state.token && !typingInField(e.target) && !document.querySelector(".scrim")) {
+      e.preventDefault(); openShortcuts(); return;
     }
     // ⌘⇧V / Ctrl+Shift+V — the prompt manager, even mid-type (that's when you want it)
     if ((e.metaKey || e.ctrlKey) && e.shiftKey && !e.altKey && (e.key === "v" || e.key === "V")) {

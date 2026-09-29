@@ -2,11 +2,11 @@ import { usageMeter } from '../usage.js';
 import { agentGlyph,agentLabel,agentSub,labelOf } from '../agents.js';
 import { api } from '../connection.js';
 import { clog } from '../console.js';
-import { esc,rel } from '../format.js';
+import { esc,pageGone,rel } from '../format.js';
 import { ICONS,LOADER } from '../icons.js';
 import { openMenu } from '../menus.js';
-import { toast } from '../notifications.js';
-import { KMOD,PERM_MODES,PERM_NAMES,PERM_SHORT,loadPermProfiles,permOf,permProfile,permSplit } from '../permissions.js';
+import { askConfirm,askText,fitMenu,toast } from '../notifications.js';
+import { KMOD,loadPermProfiles,PERM_MODES,PERM_NAMES,PERM_SHORT,permOf,permProfile,permSplit,shortModel } from '../permissions.js';
 import { state } from '../state.js';
 import { showContinuityOverflow } from './continuity.js';
 import { openTaskModal } from '../tasks.js';
@@ -36,9 +36,16 @@ export function createComposer(view) {
       });
       var full = refs.length ? refs.join("\n") + (text ? "\n\n" + text : "") : text;
 
-      box.value = ""; autosizeBox(); view.attach = []; drawAttach();
+      // Loom isn't answering: keep the words and send them when it's back,
+      // rather than clearing the box for a request that can't land.
+      if (state.daemonUp === false) { view.holdForReconnect(full); return; }
+
+      box.value = ""; autosizeBox(); view.attach = []; drawAttach(); view.clearDraft(); view.recall.i = -1;
       var p = state.project || {};
       var plan = view.planState;
+      // what you just sent should be on screen, wherever you'd scrolled to
+      view.wantScroll();
+      var hero = document.getElementById("threadempty"); if (hero) hero.remove();
 
       // An orchestra's own thread talks to its orchestrator: a reply answers
       // its question, or steers the run mid-flight (and reopens a finished
@@ -91,7 +98,7 @@ export function createComposer(view) {
       if (view.wouldQueue()) {
         view.queueFromComposer(full, plan).catch(function(err){
           toast(err.message);
-          box.value = full; autosizeBox(); // a refused queue leaves what you wrote where you wrote it
+          box.value = full; autosizeBox(); view.saveDraft(); // a refused queue leaves what you wrote where you wrote it
         });
         return;
       }
@@ -106,7 +113,7 @@ export function createComposer(view) {
       });
       lastSend = chain.then(function(){
         // into the chat you're looking at — the agent's reply comes back here
-        var body = { text: full, agentId: (state.auto ? undefined : state.selected) || undefined, chat: view.chatId, plan: plan || undefined };
+        var body = { text: full, agentId: (state.auto ? undefined : state.selected) || undefined, chat: view.chatId, plan: plan || undefined, length: view.replyLength() || undefined };
         if(p.continuity) {
           var key = JSON.stringify(body);
           if(!pendingSubmission || pendingSubmission.key !== key) pendingSubmission = { key: key, id: crypto.randomUUID() };
@@ -115,10 +122,18 @@ export function createComposer(view) {
         return api("/api/projects/" + view.pid + "/messages", { method: "POST", body: JSON.stringify(body) });
       }).then(function(result){
         pendingSubmission = null;
+        // Show who's on it straight away; the first thing the agent logs or
+        // types takes the line over from here.
+        var who = (!state.auto && state.selected) || (state.project && state.project.holder) || p.holder;
+        if (who && view.historyLoaded && !(result && result.queued)) { view.liveFor(who); view.drawEmpty(); view.stickOrFlag(true); }
         view.refresh();
         if (result && result.continuityStatus === "overflow") showContinuityOverflow(view, result);
         else if (result && result.continuityStatus === "outcome_unknown") toast("Native delivery outcome is uncertain. Review Brain continuity diagnostics before retrying.");
-      }).catch(function(err){ toast(err.message); if(p.continuity && !box.value) { box.value = full; autosizeBox(); } });
+      }).catch(function(err){
+        if (err && err.offline) { var bx = document.getElementById("box"); if (bx && !bx.value) { bx.value = full; autosizeBox(); } view.holdForReconnect(full); return; }
+        toast(err.message);
+        if (p.continuity && !box.value) { box.value = full; autosizeBox(); }
+      });
     }
 
 
@@ -131,6 +146,15 @@ export function createComposer(view) {
       box.style.height = "auto";
       // floor at two lines (48px), grow to a cap, then let it scroll
       box.style.height = Math.max(48, Math.min(200, box.scrollHeight)) + "px";
+      // send lights up only when there's something to send
+      var cf = document.getElementById("cform"); if (cf) cf.classList.toggle("hastext", !!box.value.trim());
+      // a long prompt says roughly how long (about four characters a token)
+      var ct = document.getElementById("ctok");
+      if (ct) {
+        var n = Math.round(box.value.length / 4);
+        ct.textContent = n >= 250 ? "~" + (n >= 1000 ? (n / 1000).toFixed(1) + "k" : n) + " tokens" : "";
+        ct.title = n >= 250 ? "a rough count: about four characters a token" : "";
+      }
     }
 
 
@@ -206,7 +230,7 @@ export function createComposer(view) {
       if (!items.length) { closeMenu(); return; }
       view.menuState.items = items; if (view.menuState.sel == null) view.menuState.sel = 0;
       if (view.menuState.sel >= items.length) view.menuState.sel = items.length - 1;
-      m.style.display = "block"; m.className = "cmenu";
+      m.style.display = "block"; fitMenu(m); m.className = "cmenu";
       m.innerHTML = (head ? '<div class="cmhead">' + esc(head) + "</div>" : "") +
         items.map(function(it, i){
           return '<div class="cmi' + (i === view.menuState.sel ? " sel" : "") + '" data-i="' + i + '">' +
@@ -313,6 +337,28 @@ export function createComposer(view) {
         .catch(function(){ closeMenu(); });
     }
 
+    /**
+     * What a model is for, in a few words — the pickers used to be a column of
+     * bare slugs, and "which one do I want" was left to memory. Only claims we
+     * can stand behind: the families' published positioning, nothing measured.
+     */
+    function modelBlurb(m){
+      var s = String(m || "").toLowerCase();
+      if (/opus/.test(s)) return "most capable \u00b7 deepest reasoning";
+      if (/sonnet/.test(s)) return "balanced \u00b7 fast and capable";
+      if (/haiku/.test(s)) return "fastest \u00b7 lightest";
+      if (/fable/.test(s)) return "frontier \u00b7 long, hard tasks";
+      if (/mini|flash|lite|nano|small/.test(s)) return "fast \u00b7 inexpensive";
+      if (/:free$/.test(s)) return "free tier";
+      if (/codex/.test(s)) return "tuned for coding";
+      if (/pro|max|large|ultra/.test(s)) return "high capability";
+      return "";
+    }
+    /** "anthropic/claude-sonnet-4" → name "claude-sonnet-4", from "anthropic". */
+    function modelParts(m){
+      var v = String(m || ""), cut = v.lastIndexOf("/");
+      return cut > 0 ? { name: v.slice(cut + 1), from: v.slice(0, cut) } : { name: v, from: "" };
+    }
 
     function openModelMenu(who){
       // Orchestrate has no "selected" agent — it has a cast — so the caller
@@ -323,17 +369,37 @@ export function createComposer(view) {
       if (!cur || cur.tier === "bridge") { toast("pick an adapter first \u2014 bridges choose their own model"); return; }
       var m = document.getElementById("cmenu"); if (!m) return;
       view.menuState = { kind: "modelmenu", agent: agentId, at: 0, sel: 0, items: [] };
-      m.style.display = "block"; m.className = "cmenu";
-      m.innerHTML = '<div class="cmhead">model \u00b7 ' + esc(cur.id) + '</div>' +
-        '<input class="cmsearch" id="cmsearch" placeholder="search real models\u2026" spellcheck="false" autocomplete="off">' +
+      m.style.display = "block"; fitMenu(m); m.className = "cmenu picker";
+      m.innerHTML = '<div class="cmhead">' + agentGlyph(cur.kind, cur.id) + "<span>Model for " + esc(agentLabel(cur.kind, cur.id)) + "</span></div>" +
+        '<div class="cmsearchwrap">' + ICONS.search + '<input class="cmsearch" id="cmsearch" placeholder="Search models\u2026" spellcheck="false" autocomplete="off"></div>' +
         '<div class="cmlist" id="cmlist">' + LOADER + '</div>';
       setTimeout(function(){ document.addEventListener("mousedown", menuAway); }, 0);
       var active = cur.model || "";
-      var allModels = [];
+      var allModels = [], rowsNow = [], hi = 0;
       function choose(val){
-        if (val === "__custom__"){ closeMenu(); var typed = window.prompt("Model for " + cur.id + " (blank = default):", active); if (typed === null) return; val = typed.trim(); }
+        if (val === "__custom__"){
+          closeMenu();
+          askText("Model for " + cur.id, { value: active, placeholder: "blank = the agent’s default", ok: "Use this model" }).then(function(typed){
+            if (typed === null) return;
+            choose(typed.trim() || "");
+          });
+          return;
+        }
         else closeMenu();
+        if (val === active || (cur.kind === "model" && active && val.slice(val.indexOf("/") + 1) === active)) return;
+        // A model agent's list spans every provider, each id led by the one
+        // it's from; send that apart, so the provider gets a name it knows.
+        if (cur.kind === "model" && allModels.indexOf(val) >= 0 && val.indexOf("/") > 0) {
+          setModel(agentId, val.slice(val.indexOf("/") + 1), val.slice(0, val.indexOf("/")));
+          return;
+        }
         setModel(agentId, val);
+      }
+      function mark(){
+        var list = document.getElementById("cmlist"); if (!list) return;
+        Array.prototype.forEach.call(list.querySelectorAll("[data-mv]"), function(r, i){ r.classList.toggle("sel", i === hi); });
+        var on = list.querySelectorAll("[data-mv]")[hi];
+        if (on && on.scrollIntoView) on.scrollIntoView({ block: "nearest" });
       }
       // The real models the tool itself reports (opencode ~500 across providers,
       // grok its own); codex/claude are their shipped sets.
@@ -342,20 +408,40 @@ export function createComposer(view) {
         var shown = f ? allModels.filter(function(mm){ return mm.toLowerCase().indexOf(f) >= 0; }) : allModels;
         var cap = 200; // don't paint 500 rows — the search narrows it
         var head = cur.kind === "model" ? []
-          : [{ label: "Default", sub: cur.kind + "'s own choice", value: "" }];
-        if (!f) head.push({ label: "Custom\u2026", value: "__custom__", plus: true });
-        var rows = head.concat(shown.slice(0, cap).map(function(mm){ return { label: mm, value: mm }; }));
+          : [{ label: "Default", sub: "whatever " + agentLabel(cur.kind, cur.id) + " picks", value: "" }];
+        // Free models first: on a provider's free tier they cost nothing, and
+        // "which of these 300 is free" shouldn't take a search to answer.
+        var free = shown.filter(function(mm){ return /:free$/.test(mm); });
+        var paid = shown.filter(function(mm){ return !/:free$/.test(mm); });
+        var ordered = free.concat(paid).slice(0, cap);
+        rowsNow = head.concat(ordered.map(function(mm){ return { label: mm, value: mm, group: /:free$/.test(mm) ? "Free" : (free.length ? "Paid" : "") }; }));
+        if (!f) rowsNow.push({ label: "Custom model\u2026", value: "__custom__", plus: true });
+        // A model agent stores "vendor/model" apart from its provider, while
+        // the list leads with the provider: match either way.
+        var isCur = function(v){ return !!v && (v === active || (cur.kind === "model" && !!active && v.slice(v.indexOf("/") + 1) === active)); };
+        hi = Math.max(0, rowsNow.map(function(r){ return isCur(r.value) || (r.value === "" && active === ""); }).indexOf(true));
+        if (f) hi = 0;
         var list = document.getElementById("cmlist"); if (!list) return;
-        list.innerHTML = rows.map(function(it){
-          var tick = it.value === active;
-          return '<div class="cmi" data-mv="' + esc(String(it.value)) + '"><span class="ic">' + (it.plus ? ICONS.plus : ICONS.gear) + '</span><span>' +
-            esc(it.label) + '</span>' + (tick ? '<span class="tick">' + ICONS.info + '</span>' : (it.sub ? '<span class="sub">' + esc(it.sub) + '</span>' : '')) + '</div>';
+        var lastGroup = "";
+        list.innerHTML = rowsNow.map(function(it){
+          var tick = !it.plus && (isCur(it.value) || (it.value === "" && active === ""));
+          var gh = it.group && it.group !== lastGroup ? '<div class="cmgroup">' + esc(it.group) + "</div>" : "";
+          if (it.group) lastGroup = it.group;
+          var parts = it.plus || it.value === "" ? { name: it.label, from: "" } : modelParts(it.label);
+          var blurb = it.sub || (it.plus ? "type any id the tool accepts" : modelBlurb(it.value));
+          return gh + '<div class="cmi mrow' + (tick ? " cur" : "") + '" data-mv="' + esc(String(it.value)) + '">' +
+            '<span class="ic">' + (it.plus ? ICONS.plus : it.value === "" ? ICONS.sparkles : '<span class="mdot"></span>') + "</span>" +
+            '<span class="mtx"><span class="mnm">' + esc(parts.name) + (parts.from ? '<span class="mfrom">' + esc(parts.from) + "</span>" : "") + "</span>" +
+            (blurb ? '<span class="mbl">' + esc(blurb) + "</span>" : "") + "</span>" +
+            (tick ? '<span class="tick">' + ICONS.check + "</span>" : "") + "</div>";
         }).join("") +
           (shown.length > cap ? '<div class="cmmore">' + (shown.length - cap) + ' more \u2014 keep typing to narrow</div>' : "") +
-          (f && !shown.length ? '<div class="cmmore">no match \u00b7 Enter to use \u201c' + esc(filter) + '\u201d</div>' : "");
-        Array.prototype.forEach.call(list.querySelectorAll("[data-mv]"), function(row){
+          (f && !shown.length ? '<div class="cmmore">No match \u00b7 Enter uses \u201c' + esc(filter) + '\u201d as typed</div>' : "");
+        Array.prototype.forEach.call(list.querySelectorAll("[data-mv]"), function(row, i){
           row.onmousedown = function(ev){ ev.preventDefault(); choose(row.getAttribute("data-mv")); };
+          row.onmousemove = function(){ if (hi !== i) { hi = i; mark(); } };
         });
+        mark();
       }
       api("/api/projects/" + view.pid + "/agents/" + encodeURIComponent(agentId) + "/models").then(function(j){
         allModels = (j && j.models) || [];
@@ -363,35 +449,124 @@ export function createComposer(view) {
         // ship" are different claims, and only one of them goes stale silently.
         var mn = document.getElementById("cmenu");
         if (mn && j && j.source){
-          var note = j.source === "cli" ? "asked " + esc(cur.kind || "the tool")
-            : j.source === "api" ? "asked every provider with a key \u2014 " + (j.count || 0) + " models"
-            : j.source === "builtin" ? esc(cur.kind || "this tool") + " can\u2019t list models \u2014 these are its documented aliases"
-            : "no model list for this agent";
+          var note = j.source === "cli" ? "Listed by " + esc(agentLabel(cur.kind, cur.id)) + " itself"
+            : j.source === "api" ? "From every provider with a key \u00b7 " + (j.count || 0) + " models"
+            : j.source === "builtin" ? esc(agentLabel(cur.kind, cur.id)) + " can\u2019t list its models \u2014 these are its documented aliases"
+            : "No model list for this agent";
           var ft = document.createElement("div");
           ft.className = "cmfoot"; ft.textContent = note;
           mn.appendChild(ft);
         }
         var sb = document.getElementById("cmsearch");
         if (sb){
-          var head0 = document.getElementById("cmlist");
           sb.oninput = function(){ render(sb.value); };
-          sb.onkeydown = function(e){ if (e.key === "Enter"){ var v = sb.value.trim(); if (v) choose(v); } if (e.key === "Escape"){ closeMenu(); } };
+          sb.onkeydown = function(e){
+            if (e.key === "ArrowDown") { e.preventDefault(); hi = Math.min(rowsNow.length - 1, hi + 1); mark(); return; }
+            if (e.key === "ArrowUp") { e.preventDefault(); hi = Math.max(0, hi - 1); mark(); return; }
+            if (e.key === "Enter"){
+              e.preventDefault();
+              var v = sb.value.trim();
+              var match = rowsNow[hi];
+              if (match && (!v || rowsNow.length)) choose(match.value);
+              else if (v) choose(v);
+              return;
+            }
+            if (e.key === "Escape"){ e.preventDefault(); closeMenu(); var box = document.getElementById("box"); if (box) box.focus(); }
+          };
           sb.focus();
         }
         render("");
       }).catch(function(err){
-        var list = document.getElementById("cmlist"); if (list) list.innerHTML = '<div class="cmmore">could not list models</div>';
+        var list = document.getElementById("cmlist"); if (list) list.innerHTML = '<div class="cmmore">Couldn\u2019t list models \u2014 ' + esc(err && err.message || "") + "</div>";
         clog("error", "models", "list failed: " + (err && err.message), err && err.stack);
       });
     }
 
 
     /**
-     * Who this chat talks to. The agent chip in the composer was a dead label —
-     * you could see "opencode" but not change it without hunting the sidebar.
-     * Now it's a real picker: every agent in the project, brand mark and role,
-     * the current one ticked. Selecting one aims the composer (state.selected);
-     * send then hands it the baton.
+     * Ask several models the same thing, and read the answers side by side —
+     * a thread each (POST /ask). It lived only in the CLI; this is the same
+     * call from the composer: tick the models, and what's in the box goes to
+     * all of them. Free models first, and the ticks are remembered.
+     */
+    function openAskSeveral(){
+      var m = document.getElementById("cmenu"); if (!m) return;
+      view.menuState = { kind: "askmenu", at: 0, sel: 0, items: [] };
+      var picked = state.askPicked || (state.askPicked = {});
+      m.style.display = "block"; m.className = "cmenu picker askpick"; fitMenu(m);
+      m.innerHTML = '<div class="cmhead">' + ICONS.sparkles + "<span>Ask several models</span></div>" +
+        '<div class="cmsearchwrap">' + ICONS.search + '<input class="cmsearch" id="asksearch" placeholder="Search models…" spellcheck="false" autocomplete="off"></div>' +
+        '<div class="cmlist" id="asklist">' + LOADER + "</div>" +
+        '<div class="askfoot"><span id="askn" class="askn"></span><button class="btn xs primary" id="askgo" type="button" disabled>Ask</button></div>';
+      setTimeout(function(){ document.addEventListener("mousedown", menuAway); }, 0);
+      var all = [];
+      function count(){ return Object.keys(picked).filter(function(k){ return picked[k]; }).length; }
+      function foot(){
+        var n = count(), go = document.getElementById("askgo"), nn = document.getElementById("askn");
+        if (nn) nn.textContent = n ? n + " model" + (n === 1 ? "" : "s") + " · one thread each" : "Tick the models to ask";
+        if (go) { go.disabled = !n; go.textContent = n ? "Ask " + n : "Ask"; }
+      }
+      function render(f){
+        f = String(f || "").trim().toLowerCase();
+        var shown = all.filter(function(x){ return !f || x.key.toLowerCase().indexOf(f) >= 0; });
+        shown.sort(function(a, b){ return (b.free - a.free) || (picked[b.key] ? 1 : 0) - (picked[a.key] ? 1 : 0); });
+        var list = document.getElementById("asklist"); if (!list) return;
+        var cap = 150, lastG = "";
+        list.innerHTML = shown.slice(0, cap).map(function(x){
+          var g = x.free ? "Free" : "Paid", gh = g !== lastG ? '<div class="cmgroup">' + g + "</div>" : "";
+          lastG = g;
+          return gh + '<div class="cmi mrow askrow' + (picked[x.key] ? " cur" : "") + '" data-ak="' + esc(x.key) + '">' +
+            '<span class="cwon">' + (picked[x.key] ? ICONS.check : "") + "</span>" +
+            '<span class="mtx"><span class="mnm">' + esc(x.id.split("/").pop()) + '<span class="mfrom">' + esc(x.provider + (x.id.indexOf("/") > 0 ? " · " + x.id.split("/")[0] : "")) + "</span></span>" +
+            (modelBlurb(x.id) ? '<span class="mbl">' + esc(modelBlurb(x.id)) + "</span>" : "") + "</span></div>";
+        }).join("") + (shown.length > cap ? '<div class="cmmore">' + (shown.length - cap) + " more — keep typing to narrow</div>" : "") +
+          (!shown.length ? '<div class="cmmore">' + (all.length ? "No match" : "No provider has a key yet — add one in Settings") + "</div>" : "");
+        Array.prototype.forEach.call(list.querySelectorAll("[data-ak]"), function(r){
+          r.onmousedown = function(ev){
+            ev.preventDefault();
+            var k = r.getAttribute("data-ak");
+            picked[k] = !picked[k];
+            r.classList.toggle("cur", !!picked[k]);
+            r.querySelector(".cwon").innerHTML = picked[k] ? ICONS.check : "";
+            foot();
+          };
+        });
+        foot();
+      }
+      var go = document.getElementById("askgo");
+      if (go) go.onmousedown = function(ev){
+        ev.preventDefault();
+        var box = document.getElementById("box");
+        var text = box ? box.value.trim() : "";
+        var keys = Object.keys(picked).filter(function(k){ return picked[k]; });
+        if (!text) { toast("type the question first, then pick the models"); if (box) box.focus(); return; }
+        if (!keys.length) return;
+        go.disabled = true; go.textContent = "Asking…";
+        api("/api/projects/" + view.pid + "/ask", { method: "POST", body: JSON.stringify({ text: text, models: keys }) })
+          .then(function(j){
+            closeMenu();
+            if (box) { box.value = ""; autosizeBox(); }
+            var asked = (j && j.asked) || [];
+            toast("asked " + asked.length + " model" + (asked.length === 1 ? "" : "s") + " — a thread each");
+            if (state.refreshShell) state.refreshShell();
+            if (asked[0] && asked[0].chat && state.setChat) state.setChat(view.pid, asked[0].chat);
+          })
+          .catch(function(err){ toast(err.message); go.disabled = false; foot(); });
+      };
+      api("/api/models").then(function(j){
+        all = ((j && j.models) || []).map(function(x){ return { key: x.provider + "/" + x.id, id: x.id, provider: x.provider, free: x.free ? 1 : 0 }; });
+        var sb = document.getElementById("asksearch");
+        if (sb) { sb.oninput = function(){ render(sb.value); }; sb.focus(); }
+        render("");
+      }).catch(function(err){
+        var list = document.getElementById("asklist"); if (list) list.innerHTML = '<div class="cmmore">Couldn’t list models — ' + esc(err.message || "") + "</div>";
+      });
+    }
+
+    /**
+     * Who this chat talks to: every agent in the project with its mark, the
+     * model it's on and what it may do, the current one ticked. Selecting one
+     * aims the composer (state.selected); send then hands it the baton.
      */
     function openAgentMenu(){
       var p = state.project || {};
@@ -399,31 +574,44 @@ export function createComposer(view) {
       if (!agents.length) { toast("no agents in this project yet"); return; }
       view.menuState = { kind: "agentmenu", at: 0, sel: 0, items: [] };
       var m = document.getElementById("cmenu"); if (!m) return;
-      m.style.display = "block"; m.className = "cmenu";
+      m.style.display = "block"; fitMenu(m); m.className = "cmenu picker";
+      function row(a, i){
+        var tick = !state.auto && a.id === state.selected;
+        var lbl = agentLabel(a.kind, a.id);
+        var bits = [];
+        // the roster id, only when it tells two agents apart ("antigravity"
+        // for kind "antigravity-cli" doesn't)
+        if (a.id !== lbl && a.id !== a.kind && String(a.kind || "").indexOf(a.id) !== 0) bits.push(a.id);
+        if (a.tier === "bridge") bits.push("drives its own window");
+        else {
+          bits.push(a.model ? shortModel(a.model) : (a.kind === "model" ? "no model yet" : "default model"));
+          var pm = permOf(a); if (pm) bits.push(PERM_NAMES[pm] || pm);
+        }
+        return '<div class="cmi arow2' + (tick ? " cur" : "") + '" data-ai="' + i + '"><span class="ic">' + agentGlyph(a.kind, a.id, "brand lg") + "</span>" +
+          '<span class="mtx"><span class="mnm">' + esc(lbl) + (a.id === p.holder ? '<span class="mfrom">baton</span>' : "") + '</span><span class="mbl">' + esc(bits.join(" \u00b7 ")) + "</span></span>" +
+          (a.busy ? '<span class="cmbusy">working</span>' : "") +
+          (tick ? '<span class="tick">' + ICONS.check + "</span>" : "") + "</div>";
+      }
+      var live = agents.map(function(a, i){ return { a: a, i: i }; }).filter(function(x){ return x.a.enabled !== false; });
+      var adapters = live.filter(function(x){ return x.a.tier !== "bridge"; });
+      var bridges = live.filter(function(x){ return x.a.tier === "bridge"; });
       // AUTO leads the list — it's the "let the system choose" option, not an agent.
-      m.innerHTML = '<div class="cmhead">who runs this turn</div>' +
-        '<div class="cmi cmauto' + (state.auto ? " on" : "") + '" data-auto="1"><span class="ic"><span class="autodot"></span></span><span>AUTO</span>' +
-          (state.auto ? '<span class="tick">' + ICONS.info + "</span>" : '<span class="sub">smart routing</span>') + "</div>" +
-        agents.map(function(a, i){
-          var tick = !state.auto && a.id === state.selected;
-          var lbl = agentLabel(a.kind, a.id);
-          // the product name leads; the roster id follows when it says more
-          // (two Claude Codes with different roles are told apart by it)
-          var sub = agentSub(a, lbl);
-          return '<div class="cmi" data-ai="' + i + '"><span class="ic">' + agentGlyph(a.kind, a.id) + "</span><span>" + esc(lbl) + "</span>" +
-            (a.busy ? '<span class="cmbusy">working</span>' : "") +
-            (tick ? '<span class="tick"' + (a.busy ? ' style="margin-left:6px"' : "") + ">" + ICONS.info + "</span>"
-              : (sub && !a.busy ? '<span class="sub">' + esc(sub) + "</span>" : "")) + "</div>";
-        }).join("") +
+      m.innerHTML = '<div class="cmhead"><span>Who takes this turn</span></div>' +
+        '<div class="cmi arow2 cmauto' + (state.auto ? " on cur" : "") + '" data-auto="1"><span class="ic"><span class="autodot"></span></span>' +
+          '<span class="mtx"><span class="mnm">Auto</span><span class="mbl">Loom routes each turn to the right agent</span></span>' +
+          (state.auto ? '<span class="tick">' + ICONS.check + "</span>" : "") + "</div>" +
+        '<div class="cmsep"></div>' +
+        adapters.map(function(x){ return row(x.a, x.i); }).join("") +
+        (bridges.length ? '<div class="cmgroup">Windows Loom drives</div>' + bridges.map(function(x){ return row(x.a, x.i); }).join("") : "") +
         // Cursor is on its way; listing it (inert) says so where you'd look for it.
         '<div class="cmsep"></div><div class="cmi soon" aria-disabled="true"><span class="ic">' + agentGlyph("", "cursor") +
           '</span><span>Cursor</span><span class="sub">coming soon</span></div>';
       var auto = m.querySelector("[data-auto]");
       if (auto) auto.onmousedown = function(ev){ ev.preventDefault(); closeMenu(); setAuto(true); var box = document.getElementById("box"); if (box) box.focus(); };
-      Array.prototype.forEach.call(m.querySelectorAll("[data-ai]"), function(row){
-        row.onmousedown = function(ev){
+      Array.prototype.forEach.call(m.querySelectorAll("[data-ai]"), function(r){
+        r.onmousedown = function(ev){
           ev.preventDefault();
-          var a = agents[Number(row.getAttribute("data-ai"))];
+          var a = agents[Number(r.getAttribute("data-ai"))];
           closeMenu();
           if (!a) return;
           if (a.id === state.selected && !state.auto) return;
@@ -437,12 +625,14 @@ export function createComposer(view) {
     }
 
 
-    function setModel(agentId, model){
+    function setModel(agentId, model, provider){
       api("/api/projects/" + view.pid + "/agents/" + encodeURIComponent(agentId) + "/model", {
-        method: "POST", body: JSON.stringify({ model: model }),
+        method: "POST", body: JSON.stringify(provider ? { model: model, provider: provider } : { model: model }),
       }).then(function(){
-        toast(model ? (agentId + " \u2192 " + model) : (agentId + " \u2192 default model"));
-        view.refresh();
+        toast(model ? (agentId + " \u2192 " + shortModel(model)) : (agentId + " \u2192 default model"));
+        // The Orchestrate cast wears each agent's model on its chip; the
+        // status poll doesn't redraw it, so a pick looked like it hadn't taken.
+        return view.refresh().then(function(){ view.drawOrchControls(); updateModelLabel(); });
       }).catch(function(err){ toast(err.message); });
     }
 
@@ -473,7 +663,8 @@ export function createComposer(view) {
       box.setAttribute("data-bound", "1");
       autosizeBox();
 
-      box.addEventListener("input", function(){ autosizeBox(); scanTrigger(); scheduleSkillSuggest(box.value); });
+      box.addEventListener("input", function(){ autosizeBox(); scanTrigger(); scheduleSkillSuggest(box.value); form.classList.toggle("hastext", !!box.value.trim()); view.saveDraft(); view.recall.i = -1; });
+      view.restoreDraft();
       loadSkillCache();
       box.addEventListener("keydown", function(e){
         // Menu open: arrows move, Enter/Tab accept, Esc closes.
@@ -482,6 +673,20 @@ export function createComposer(view) {
           if (e.key === "ArrowUp") { e.preventDefault(); view.menuState.sel = (view.menuState.sel - 1 + view.menuState.items.length) % view.menuState.items.length; renderMenu(view.menuState.items, view.menuState.kind === "cmd" ? "actions" : "files"); return; }
           if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); acceptMenu(view.menuState.sel); return; }
           if (e.key === "Escape") { e.preventDefault(); closeMenu(); return; }
+        }
+        // ↑/↓ in an empty composer walk back through what you sent here.
+        if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey) {
+          var untouched = box.value === "" || (view.recall.i >= 0 && box.value === view.recall.shown);
+          var mine = untouched ? view.myPrompts() : [];
+          if (mine.length && (e.key === "ArrowUp" ? view.recall.i < mine.length - 1 : view.recall.i >= 0)) {
+            e.preventDefault();
+            view.recall.i += e.key === "ArrowUp" ? 1 : -1;
+            view.recall.shown = view.recall.i >= 0 ? mine[view.recall.i] : "";
+            box.value = view.recall.shown; autosizeBox();
+            box.setSelectionRange(box.value.length, box.value.length);
+            form.classList.toggle("hastext", !!box.value.trim());
+            return;
+          }
         }
         // Enter sends; Shift+Enter is a newline.
         if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
@@ -502,6 +707,20 @@ export function createComposer(view) {
       box.addEventListener("blur", function(){ setTimeout(function(){ if (view.menuState && (view.menuState.kind === "file" || view.menuState.kind === "cmd")) closeMenu(); }, 120); });
 
       form.addEventListener("submit", function(ev){ ev.preventDefault(); send(); });
+      // Escape closes whichever picker is open, wherever focus is — the
+      // permission and agent menus have no input of their own to catch it.
+      // One document listener for the page's life; each project view points
+      // it at its own menu (a listener per view would pile up).
+      state.escMenu = function(){ if (!view.menuState) return false; closeMenu(); return true; };
+      if (!state.escBound) {
+        state.escBound = true;
+        document.addEventListener("keydown", function(ev){
+          if (ev.key !== "Escape" || !state.escMenu) return;
+          var mm = document.getElementById("cmenu");
+          if (!mm || mm.style.display === "none") return;
+          if (state.escMenu()) { ev.preventDefault(); var bx = document.getElementById("box"); if (bx) bx.focus(); }
+        });
+      }
 
       var attachBtn = document.getElementById("attach");
       var fileInput = document.getElementById("cfile");
@@ -540,6 +759,7 @@ export function createComposer(view) {
       var plb = document.getElementById("planbtn");
       if (plb) plb.onclick = function(){ setPlan(!view.planState); var bx = document.getElementById("box"); if (bx) bx.focus(); };
       drawPlan();
+      view.drawLengthPill();
       // the page may be gone by the time profiles arrive (a closed tab, a torn-down test window)
       loadPermProfiles().then(function(){ if (typeof document === "undefined" || !document) return; updateModelLabel(); view.drawOrchControls(); });
       var moreB = document.getElementById("morebtn");
@@ -559,6 +779,17 @@ export function createComposer(view) {
           { label: "Verbose", icon: tview() === "verbose" ? ICONS.check : "", hint: "+ raw payloads",
             run: function(){ setTView("verbose"); } },
           { sep: true },
+          { label: "Ask several models…", icon: ICONS.sparkles, hint: "a thread each", run: function(){ openAskSeveral(); } },
+          { sep: true },
+          { label: "Find in this chat", icon: ICONS.search, hint: KMOD + "F", run: function(){ view.openFind(); } },
+          { head: "reply length" },
+          { label: "Brief", icon: view.replyLength() === "brief" ? ICONS.check : "", hint: "the answer first", run: function(){ view.setReplyLength("brief"); } },
+          { label: "Normal", icon: !view.replyLength() ? ICONS.check : "", run: function(){ view.setReplyLength(""); } },
+          { label: "Detailed", icon: view.replyLength() === "detailed" ? ICONS.check : "", hint: "reasoning, trade-offs", run: function(){ view.setReplyLength("detailed"); } },
+          { sep: true },
+          { label: "Starred messages", icon: ICONS.star, hint: String(Object.keys(state.starSet || {}).length || ""), run: function(){ state.showStarred(); } },
+          { label: "Export as Markdown", icon: ICONS.download, hint: ".md", run: function(){ view.exportThread(); } },
+          { sep: true },
           { label: "Rewind…", icon: ICONS.rewind, hint: "put the files back", run: function(){ view.openRewindMenu(); } },
           { sep: true },
           { label: "Prompts", icon: ICONS.clipboard, hint: KMOD + "⇧V", run: function(){ openPrompts(); } },
@@ -569,6 +800,9 @@ export function createComposer(view) {
         openMenu(Math.round(r.left), Math.round(r.top - 4), items);
       };
       setAuto(state.auto);
+      if (view.desktop) setTimeout(function(){ if (!pageGone() && state.startTour) state.startTour(false); }, 1200);
+      // "Run again" from a run's own thread lands here, in Main, ready to orchestrate
+      try { if (view.chatId === "main" && localStorage.getItem("loomOrchNext:" + view.pid)) { localStorage.removeItem("loomOrchNext:" + view.pid); state.cmode = "orch"; } } catch (e) {}
       view.setComposerMode(state.cmode || "chat");
       refreshSkillCount();
 
@@ -582,11 +816,45 @@ export function createComposer(view) {
       if (micB && navigator.mediaDevices && window.MediaRecorder) {
         var rec = null, chunks = [];
         var stopRec = function(){
+          if (recog) { try { recog.stop(); } catch (e) {} return; }
           if (rec && rec.state !== "inactive") rec.stop();
           micB.classList.remove("active");
         };
+        // No transcriber on the daemon: the browser's own speech recognition
+        // (Chrome, Edge, Safari) types a live transcript instead. It is the
+        // browser vendor's service, so it's only used when nothing local is set.
+        var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+        var recog = null;
+        var startSpeech = function(){
+          if (recog) return;
+          var box = document.getElementById("box"); if (!box) return;
+          var base = box.value ? box.value.replace(/\s+$/, "") + " " : "";
+          var finals = "";
+          recog = new SR();
+          recog.continuous = true;
+          recog.interimResults = true;
+          recog.lang = navigator.language || "en-US";
+          recog.onresult = function(e){
+            var interim = "";
+            for (var i = e.resultIndex; i < e.results.length; i++) {
+              if (e.results[i].isFinal) finals += e.results[i][0].transcript;
+              else interim += e.results[i][0].transcript;
+            }
+            box.value = base + (finals + interim).replace(/^\s+/, "");
+            box.dispatchEvent(new Event("input", { bubbles: true }));
+          };
+          recog.onerror = function(e){
+            var why = e && e.error;
+            toast(why === "not-allowed" || why === "service-not-allowed" ? "microphone permission refused"
+              : why === "network" ? "this browser’s speech service can’t be reached — set LOOM_STT_CMD on the daemon to transcribe locally"
+              : why === "no-speech" ? "didn’t hear anything" : "voice input stopped" + (why ? " (" + why + ")" : ""));
+          };
+          recog.onend = function(){ recog = null; micB.classList.remove("active"); box.focus(); };
+          try { recog.start(); micB.classList.add("active"); } catch (err) { recog = null; }
+        };
         var startRec = function(ev){
           ev.preventDefault();
+          if (state.stt === false && SR) { startSpeech(); return; }
           if (rec && rec.state === "recording") return;
           navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream){
             chunks = [];
@@ -642,7 +910,14 @@ export function createComposer(view) {
       var lbl = document.getElementById("cmodellabel");
       var p = state.project || {};
       var cur = (p.agents || []).filter(function(a){ return a.id === state.selected; })[0];
-      if (lbl) lbl.textContent = (cur && cur.model) ? cur.model : "model";
+      if (lbl) {
+        var mtxt = (cur && cur.model) ? shortModel(cur.model) : (cur && cur.kind === "model" ? "Pick a model" : "Default");
+        // A model agent already wears its model as its name; don't say it twice.
+        if (cur && cur.kind === "model" && cur.model && agentLabel(cur.kind, cur.id) === mtxt.replace(/:free$/, "")) {
+          mtxt = /:free$/.test(cur.model) ? "free" : "model";
+        }
+        lbl.textContent = mtxt;
+      }
       var mp = document.getElementById("modelpick");
       if (mp) mp.style.display = state.auto || state.cmode === "orch" ? "none" : "";
       var meter = document.getElementById("cctx");
@@ -704,7 +979,7 @@ export function createComposer(view) {
       function paint(){
         var prof = permProfile(a.kind), cur = permOf(a), lbl = agentLabel(a.kind, a.id);
         var askCell = prof.modes.ask || {};
-        m.style.display = "block"; m.className = "cmenu";
+        m.style.display = "block"; fitMenu(m); m.className = "cmenu";
         m.innerHTML = '<div class="cmhead">permissions \u00b7 ' + esc(lbl) + (a.id !== lbl ? " (" + esc(a.id) + ")" : "") + "</div>" +
           PERM_MODES.map(function(mode){
             var cell = prof.modes[mode] || {}, parts = permSplit(cell.label), off = !!cell.unsupported;
@@ -787,6 +1062,8 @@ export function createComposer(view) {
 
     function openPrompts(){
       if (view.menuState && view.menuState.kind === "prompts") { closeMenu(); var bx = document.getElementById("box"); if (bx) bx.focus(); return; }
+      // what's selected in the thread now, before focus moves into the search box
+      try { state.promptSel = String(window.getSelection ? window.getSelection() : "").trim(); } catch (e) { state.promptSel = ""; }
       if (view.desktop && state.tab !== "thread") view.showTab("thread"); // the composer lives under Thread
       var m = document.getElementById("cmenu"); if (!m) return;
       closeMenu();
@@ -799,7 +1076,8 @@ export function createComposer(view) {
           '<button type="button" class="pmsave" id="pmsave" title="save what\u2019s in the composer">' + ICONS.bookmark + "Save current</button></div>" +
         '<div class="pmlist" id="pmlist" role="listbox" aria-label="prompts">' + (view.prompts.loaded ? "" : LOADER) + "</div>" +
         '<div class="pmfoot"><span><kbd>\u2191</kbd><kbd>\u2193</kbd> move</span><span><kbd>\u21b5</kbd> insert</span>' +
-          "<span><kbd>" + KMOD + "\u21b5</kbd> insert &amp; send</span><span><kbd>esc</kbd> close</span></div>";
+          "<span><kbd>" + KMOD + "↵</kbd> insert &amp; send</span><span><kbd>esc</kbd> close</span>" +
+          '<span class="pmvars" title="write these in a saved prompt and they fill in when you insert it">{{selection}} {{date}} {{project}} {{branch}} {{chat}} {{agent}} {{last_reply}} {{file}}</span></div>';
       var pb = document.getElementById("promptbtn"); if (pb) pb.classList.add("on");
       var q = document.getElementById("pmq");
       q.oninput = function(){ view.prompts.q = q.value; view.prompts.sel = 0; drawPrompts(); };
@@ -878,8 +1156,10 @@ export function createComposer(view) {
       var clr = list.querySelector("[data-pmclear]");
       if (clr) clr.onmousedown = function(ev){
         ev.preventDefault();
-        if (!window.confirm("Forget every prompt you've sent? Saved prompts stay.")) return;
-        api("/api/prompts/recent", { method: "DELETE" }).then(function(){ view.prompts.recent = []; drawPrompts(); }).catch(function(err){ toast(err.message); });
+        askConfirm("Forget every prompt you've sent? Saved prompts stay.", { ok: "Forget them", danger: true }).then(function(ok){
+          if (!ok) return;
+          api("/api/prompts/recent", { method: "DELETE" }).then(function(){ view.prompts.recent = []; drawPrompts(); }).catch(function(err){ toast(err.message); });
+        });
       };
       var sv = document.getElementById("pmsave"), bx = document.getElementById("box");
       if (sv) sv.disabled = !(bx && bx.value.trim());
@@ -899,10 +1179,38 @@ export function createComposer(view) {
     }
 
     /** Put a prompt in the composer: into an empty box whole, else at the caret. */
+    /**
+     * A saved prompt's {{variables}}, filled from where you are: the selection
+     * you made in the thread, today's date, this project, branch, chat and
+     * agent, the last reply, the file open beside the thread. Anything it
+     * doesn't know stays as written, for you to fill in.
+     */
+    function fillPromptVars(text){
+      var now = new Date(), pad = function(n){ return (n < 10 ? "0" : "") + n; };
+      var chat = ((state.project && state.project.chats) || []).filter(function(c){ return c.id === view.chatId; })[0];
+      var replies = document.querySelectorAll("#feed .msg.agent:not(.thinking) .bubble");
+      var dockOpen = document.querySelector("#dockpane.open");
+      var vars = {
+        selection: state.promptSel || "",
+        date: now.getFullYear() + "-" + pad(now.getMonth() + 1) + "-" + pad(now.getDate()),
+        time: pad(now.getHours()) + ":" + pad(now.getMinutes()),
+        project: (state.project && state.project.name) || "",
+        branch: (state.gitStat && state.gitStat.pid === view.pid && state.gitStat.branch) || "",
+        chat: (chat && chat.title) || "Main",
+        agent: state.selected ? labelOf(state.selected) : "",
+        last_reply: replies.length ? (replies[replies.length - 1].innerText || "").trim().slice(0, 4000) : "",
+        file: dockOpen ? ((document.getElementById("dockpath") || {}).textContent || "") : "",
+      };
+      return String(text).replace(/\{\{\s*([a-z_]+)\s*\}\}/gi, function(m, k){
+        var v = vars[k.toLowerCase()];
+        return v ? v : m;
+      });
+    }
     function insertPrompt(i, andSend){
       var r = view.prompts.rows[i]; if (!r) return;
       var box = document.getElementById("box"); if (!box) return;
-      var text = String(r.p.text || "");
+      var text = fillPromptVars(String(r.p.text || ""));
+      var left = text.match(/\{\{\s*[a-z_]+\s*\}\}/i);
       closeMenu();
       var v = box.value;
       if (!v.trim()) { box.value = text; box.setSelectionRange(text.length, text.length); }
@@ -918,6 +1226,13 @@ export function createComposer(view) {
       if (r.kind === "saved") {
         r.p.uses = (r.p.uses || 0) + 1; // it floats up next time, as it will on the daemon
         api("/api/prompts/" + encodeURIComponent(r.p.id), { method: "PATCH", body: JSON.stringify({ used: true }) }).catch(function(){});
+      }
+      // a blank left to fill: select it, don't send a prompt with a hole in it
+      if (left) {
+        var at = box.value.indexOf(left[0]);
+        if (at >= 0) box.setSelectionRange(at, at + left[0].length);
+        toast("fill in " + left[0] + " — it’s selected");
+        return;
       }
       if (andSend) send();
     }
@@ -1193,5 +1508,5 @@ export function createComposer(view) {
         var x = bar.querySelector(".sugx"); if (x) x.onclick = function(){ bar.style.display = "none"; };
       }).catch(function(){});
     }
-return { autosizeBox, drawAttach, closeMenu, menuAway, openModelMenu, bindComposer, updateModelLabel, openPermMenu, composerPlaceholder };
+return { autosizeBox, drawAttach, closeMenu, menuAway, openModelMenu, bindComposer, updateModelLabel, openPermMenu, composerPlaceholder, send };
 }

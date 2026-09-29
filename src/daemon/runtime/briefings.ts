@@ -34,6 +34,8 @@ export interface RuntimeBriefingsHost {
   extractionEngine: (model: string) => ExtractEngine;
   renderProjection: (input: ProjectionInput) => Promise<RenderedProjection>;
   createSemanticIndex: () => Pick<SemanticIndex, "start" | "sync" | "query" | "byId">;
+  /** Which memories made it into a prompt (the Brain tab's "used N×"). */
+  noteMemoriesUsed: (ids: string[]) => void;
 }
 
 /** Owns briefings state for exactly one open project. */
@@ -171,8 +173,14 @@ export class RuntimeBriefings {
    */
   brainBrief(opts: RetrieveOpts): string {
     const pool = this.host.teamBrain?.pool(this.host.brain.all());
-    if (!pool) return compileBrief(retrieve(this.host.brain, opts).map((h) => h.memory));
-    return compileTieredBrief(retrieveTiered(pool, opts));
+    if (!pool) {
+      const hits = retrieve(this.host.brain, opts);
+      this.host.noteMemoriesUsed(hits.map((h) => h.memory.id));
+      return compileBrief(hits.map((h) => h.memory));
+    }
+    const tiered = retrieveTiered(pool, opts);
+    this.host.noteMemoriesUsed(tiered.map((h) => h.memory.id));
+    return compileTieredBrief(tiered);
   }
 
   /**

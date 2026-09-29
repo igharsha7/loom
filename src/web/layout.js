@@ -4,7 +4,9 @@
 
   var RAIL_KEY = "loomRail";
 
-  function railOpen(){ var v = localStorage.getItem(RAIL_KEY); return v === null ? true : v === "1"; }
+  // Open by default only where there's room for it beside a readable thread;
+  // on a laptop the chat is the point, and the panel is one click away.
+  function railOpen(){ var v = localStorage.getItem(RAIL_KEY); return v === null ? (window.innerWidth || 0) >= 1440 : v === "1"; }
 
   function applyRail(){
     var shell = document.querySelector(".dshell");
@@ -67,4 +69,4 @@
     s.style.setProperty("--sbw", sb + "px");
     s.style.setProperty("--railw", rw + "px");
   }
-export { RAIL_KEY,applyRail,applyWidths,cssPx,makeResizer,railOpen,shellEl,toggleRail };
+export { applyRail,applyWidths,cssPx,makeResizer,RAIL_KEY,railOpen,shellEl,toggleRail };

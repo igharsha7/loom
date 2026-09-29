@@ -149,6 +149,51 @@ export function registerChatsRoutes(app: Express, withRuntime: WithRuntime): voi
     }),
   );
 
+  // Pin a thread to the top of the sidebar, archive it out of the way, or
+  // file it in a folder ("" or null takes it out).
+  app.patch(
+    "/api/projects/:id/chats/:chatId",
+    withRuntime(async (rt, req, res) => {
+      const body = (req.body ?? {}) as { pinned?: unknown; archived?: unknown; folder?: unknown };
+      const flags: { pinned?: boolean; archived?: boolean; folder?: string | null } = {};
+      if (body.pinned !== undefined) flags.pinned = body.pinned === true;
+      if (body.archived !== undefined) flags.archived = body.archived === true;
+      if (body.folder !== undefined) {
+        if (body.folder !== null && typeof body.folder !== "string") return void res.status(400).json({ error: "folder is a name, or null to take it out" });
+        flags.folder = body.folder as string | null;
+      }
+      if (!Object.keys(flags).length) return void res.status(400).json({ error: "nothing to change: send pinned, archived or folder" });
+      if (String(req.params.chatId) === "main") {
+        return void res.status(400).json({ error: "Main is always first and always there, so it can't be pinned, archived or filed" });
+      }
+      const chat = rt.setChatFlags(String(req.params.chatId), flags);
+      if (!chat) return void res.status(404).json({ error: "no such thread" });
+      res.json({ chat });
+    }),
+  );
+
+  // Rate a reply: { eventId, agentId, value: 1 | -1 | 0 }.
+  app.post(
+    "/api/projects/:id/chats/:chatId/rate",
+    withRuntime(async (rt, req, res) => {
+      const { eventId, agentId, value } = (req.body ?? {}) as { eventId?: unknown; agentId?: unknown; value?: unknown };
+      const ratings = rt.rateMessage(String(req.params.chatId), Number(eventId), String(agentId ?? ""), Number(value));
+      if (!ratings) return void res.status(400).json({ error: "no such thread, message or agent" });
+      res.json({ ratings });
+    }),
+  );
+
+  // Star a message worth coming back to.
+  app.post(
+    "/api/projects/:id/chats/:chatId/star",
+    withRuntime(async (rt, req, res) => {
+      const { eventId, on } = (req.body ?? {}) as { eventId?: unknown; on?: unknown };
+      const starred = rt.starMessage(String(req.params.chatId), Number(eventId), on !== false);
+      if (!starred) return void res.status(400).json({ error: "no such thread or message" });
+      res.json({ starred });
+    }),
+  );
+
   app.delete(
     "/api/projects/:id/chats/:chatId",
     withRuntime(async (rt, req, res) => {

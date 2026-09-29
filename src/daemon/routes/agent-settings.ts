@@ -18,6 +18,58 @@ export function registerAgentSettingsRoutes(app: Express, withRuntime: WithRunti
     }),
   );
 
+  // An agent's picture ({ avatar: data URL | null }).
+  app.put(
+    "/api/projects/:id/agents/:agentId/avatar",
+    withRuntime(async (rt, req, res) => {
+      const { avatar } = (req.body ?? {}) as { avatar?: unknown };
+      try {
+        const out = rt.setAgentAvatar(String(req.params.agentId), avatar === null || avatar === undefined ? null : String(avatar));
+        if (!out) return void res.status(404).json({ error: "unknown agent" });
+        res.json(out);
+      } catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+      }
+    }),
+  );
+
+  // A model agent's sampling: temperature and max tokens (null clears).
+  app.put(
+    "/api/projects/:id/agents/:agentId/sampling",
+    withRuntime(async (rt, req, res) => {
+      const b = (req.body ?? {}) as { temperature?: unknown; maxTokens?: unknown };
+      const num = (v: unknown): number | null | undefined => (v === undefined ? undefined : v === null || v === "" ? null : Number(v));
+      try {
+        const cfg = rt.setAgentSampling(String(req.params.agentId), { temperature: num(b.temperature), maxTokens: num(b.maxTokens) });
+        res.json({ id: cfg.id, options: cfg.options });
+      } catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+      }
+    }),
+  );
+
+  // Is this agent ready? Installed, signed in, model listed — no prompt sent.
+  app.post(
+    "/api/projects/:id/agents/:agentId/check",
+    withRuntime(async (rt, req, res) => {
+      const out = await rt.checkAgent(String(req.params.agentId));
+      if (!out) return void res.status(404).json({ error: "no such agent" });
+      res.json(out);
+    }),
+  );
+
+  // Standing instructions for one agent, sent ahead of every turn it takes.
+  app.put(
+    "/api/projects/:id/agents/:agentId/instructions",
+    withRuntime(async (rt, req, res) => {
+      const { instructions } = (req.body ?? {}) as { instructions?: unknown };
+      if (typeof instructions !== "string") return void res.status(400).json({ error: "instructions must be text (empty clears them)" });
+      const updated = rt.setAgentInstructions(String(req.params.agentId), instructions);
+      if (!updated) return void res.status(404).json({ error: "unknown agent" });
+      res.json(updated);
+    }),
+  );
+
   // Switch an agent off (or back on) without removing it from the roster.
   // 409 rather than 400 for the refusals — holding the baton and being
   // mid-turn are both states that pass on their own, so the message names

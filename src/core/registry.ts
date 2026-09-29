@@ -189,6 +189,8 @@ export interface ProjectState {
    * and haven't said anything in yet, still exists.
    */
   chats?: ChatInfo[];
+  /** Work-in-progress limits per board column; a column over its limit warns. */
+  boardLimits?: Record<string, number>;
   /** Task cards you wrote yourself. See BoardTask. */
   tasks?: BoardTask[];
   /** Per-agent spend budgets in USD/day, set from the Observatory burn-rate panel. */
@@ -219,6 +221,10 @@ export interface BoardTask {
    * produces work that has to be thrown away, which is worse than waiting.
    */
   blockedBy?: string[];
+  /** How much it matters, when you've said. */
+  priority?: "high" | "medium" | "low";
+  /** When it's due, as a local date: YYYY-MM-DD. */
+  due?: string;
   createdAt: number;
 }
 
@@ -254,6 +260,8 @@ export interface PairedClient {
   name: string;
   token: string;
   createdAt: number;
+  /** When this device last made a request (written at most every 10 min). */
+  lastSeen?: number;
   /** Expo push token, when the device registered for notifications. */
   pushToken?: string;
   platform?: string;

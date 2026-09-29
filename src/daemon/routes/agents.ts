@@ -39,9 +39,9 @@ export function registerAgentsRoutes(app: Express, withRuntime: WithRuntime): vo
   app.post(
     "/api/projects/:id/agents/:agentId/model",
     withRuntime(async (rt, req, res) => {
-      const { model } = (req.body ?? {}) as { model?: string };
+      const { model, provider } = (req.body ?? {}) as { model?: string; provider?: string };
       try {
-        const cfg = rt.setAgentModel(String(req.params.agentId), model ?? "");
+        const cfg = rt.setAgentModel(String(req.params.agentId), model ?? "", provider);
         res.json({ agent: cfg });
       } catch (err) {
         res.status(400).json({ error: err instanceof Error ? err.message : String(err) });

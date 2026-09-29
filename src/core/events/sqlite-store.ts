@@ -13,8 +13,10 @@ export type SqliteModule = typeof import("node:sqlite");
 export class SqliteStore implements EventStore {
   private db: InstanceType<SqliteModule["DatabaseSync"]>;
   readonly continuity: ContinuityStore;
+  private file: string;
 
   constructor(sqlite: SqliteModule, file: string) {
+    this.file = file;
     this.db = new sqlite.DatabaseSync(file);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS events (
@@ -125,6 +127,10 @@ export class SqliteStore implements EventStore {
       clauses.push("id > ?");
       params.push(opts.since);
     }
+    if (opts.before !== undefined) {
+      clauses.push("id < ?");
+      params.push(opts.before);
+    }
     if (opts.kinds?.length) {
       clauses.push(`kind IN (${opts.kinds.map(() => "?").join(",")})`);
       params.push(...opts.kinds);
@@ -160,6 +166,32 @@ export class SqliteStore implements EventStore {
       ...(r.chat ? { chat: r.chat } : {}),
       payload: JSON.parse(r.payload) as Record<string, unknown>,
     }));
+  }
+
+  size(): { bytes: number; events: number } {
+    const n = this.db.prepare("SELECT COUNT(*) AS n FROM events").get() as { n: number | bigint };
+    let bytes = 0;
+    for (const f of [this.file, `${this.file}-wal`]) {
+      try {
+        bytes += fs.statSync(f).size;
+      } catch {
+        /* no wal file is fine */
+      }
+    }
+    return { bytes, events: Number(n.n) };
+  }
+
+  compact(): void {
+    this.db.exec("VACUUM");
+  }
+
+  lastReplyIds(): Map<string, number> {
+    const rows = this.db
+      .prepare(
+        "SELECT COALESCE(chat, ?) AS c, MAX(id) AS m FROM events WHERE kind = 'message' AND agent_id IS NOT NULL GROUP BY COALESCE(chat, ?)",
+      )
+      .all(MAIN_CHAT, MAIN_CHAT) as Array<{ c: string; m: number | bigint }>;
+    return new Map(rows.map((r) => [r.c, Number(r.m)]));
   }
 
   lastId(): number {

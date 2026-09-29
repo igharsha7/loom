@@ -1,6 +1,6 @@
 import { agentGlyph,agentLabel } from '../agents.js';
 import { api } from '../connection.js';
-import { esc,hue,rel } from '../format.js';
+import { esc,hue,pageGone,rel } from '../format.js';
 import { ICONS,LOADER } from '../icons.js';
 import { toast } from '../notifications.js';
 import { permBadge } from '../permissions.js';
@@ -21,6 +21,10 @@ export function createFleet(view) {
     // the other projects' sockets aren't this view's to hold — and nudged
     // sooner by this project's own events.
     function fleetEl(){
+      // A team frame can land after the window is torn down (a closed tab, a
+      // finished test); there's no fleet to draw into then, and throwing here
+      // surfaced as an unhandled rejection.
+      if (pageGone()) return null;
       if (view.desktop) return state.tab === "fleet" ? document.getElementById("pane-fleet") : null;
       return document.getElementById("fleetsheet");
     }
@@ -65,7 +69,17 @@ export function createFleet(view) {
       // this project first; the rest as the daemon lists them
       projects.sort(function(a, b){ return ((b.project || {}).id === view.pid) - ((a.project || {}).id === view.pid); });
       var agentsN = 0, busyN = 0;
-      projects.forEach(function(pr){ (pr.agents || []).forEach(function(a){ agentsN++; if (a.busy) busyN++; }); });
+      projects.forEach(function(pr){
+        (pr.agents || []).forEach(function(a){ agentsN++; if (a.busy) busyN++; });
+        // An orchestra's workers run as copies of the roster, so the roster
+        // reads idle while they work — the header said "no agents running"
+        // above a run with three tasks in flight. Count what's really going.
+        var o = pr.orchestra;
+        if (o && !view.orchTerminal(o.status)) {
+          (o.tasks || []).forEach(function(t){ if (t.status === "running") busyN++; });
+          if (/^(planning|reviewing|starting)$/.test(String(o.status))) busyN++;
+        }
+      });
       var head = '<div class="ohead"><span class="ot">Fleet</span>' +
         '<span class="os">What every agent in every open project is doing, right now.</span><span class="spacer"></span>' +
         (d ? '<span class="fsum"><span class="fchip' + (busyN ? " live" : "") + '">' + busyN + " working</span>" +

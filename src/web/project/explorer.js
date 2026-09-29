@@ -7,6 +7,7 @@ import { openScmMenu } from '../menus.js';
 import { toast } from '../notifications.js';
 import { state } from '../state.js';
 import { openTaskModal } from '../tasks.js';
+import { relClock } from '../transcript.js';
 
 /** explorer behavior for one mounted project.
  * view contains live accessors to the owning project view's state and callbacks.
@@ -35,7 +36,28 @@ export function createExplorer(view) {
       if (state.railView === "search") return drawSearch(el);
       if (state.railView === "scm") return drawScm(el);
       if (state.railView === "tasks") return drawAgentsView(el);
+      if (state.railView === "outline") return drawOutline(el);
       return drawExplorer(el);
+    }
+    /** The chat at a glance: each of your prompts, click to go there. */
+    function drawOutline(el){
+      railTitle('<span class="b">Outline</span>');
+      var mine = Array.prototype.slice.call(document.querySelectorAll("#feed > .msg.user[data-raw]"));
+      var more = !!document.getElementById("loadearlier");
+      if (!mine.length) { el.innerHTML = '<div class="olempty">Nothing asked in this chat yet — your prompts will line up here.</div>'; return; }
+      el.innerHTML = '<div class="olhead">This chat · ' + mine.length + " prompt" + (mine.length === 1 ? "" : "s") + (more ? " loaded" : "") + "</div>" +
+        mine.map(function(n, i){
+          var t = decodeURIComponent(n.getAttribute("data-raw") || "").replace(/\s+/g, " ").trim();
+          var ts = Number(n.getAttribute("data-ts")) || 0;
+          return '<button type="button" class="olrow" data-olid="' + esc(n.getAttribute("data-id") || "") + '"><span class="oln">' + (i + 1) + "</span>" +
+            '<span class="olt">' + esc(t.slice(0, 140) || "(attachment)") + '</span><span class="olw">' + (ts ? esc(relClock(ts)) : "") + "</span></button>";
+        }).join("") +
+        (more ? '<button type="button" class="olmore" id="olmore">Load earlier prompts</button>' : "");
+      Array.prototype.forEach.call(el.querySelectorAll("[data-olid]"), function(b){
+        b.onclick = function(){ view.jumpToMessage(Number(b.getAttribute("data-olid"))); };
+      });
+      var om = document.getElementById("olmore");
+      if (om) om.onclick = function(){ view.loadEarlier().then(function(){ drawRail(); }); };
     }
 
     function renderTreeLevel(rel, depth){

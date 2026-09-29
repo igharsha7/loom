@@ -1,13 +1,14 @@
 /** Browser settings module. See README.md for ownership and startup. */
-import { brandMark } from './agents.js';
+import { agentLabel,brandMark } from './agents.js';
 import { copyText } from './clipboard.js';
 import { api,logout } from './connection.js';
 import { esc,rel } from './format.js';
 import { ICONS,LOADER } from './icons.js';
-import { toast } from './notifications.js';
+import { askConfirm,askText,chime,devicePref,setDevicePref,toast } from './notifications.js';
 import { THEME_KEY,state } from './state.js';
 import { JOB_KIND,loadTeam,loadTeamPolicy,loadTeamRunners,loadTeamShare,runnerName,teamAvatar,teamEditing,teamField,teamHooks,teamInviteHtml,teamInvites,teamNotify,teamPolicyHtml,teamRunners,teamShareHtml,teamShareOf,teamShares,wireTeamForms,wireTeamInvites,wireTeamShare } from './team.js';
-import { applyTheme,themeNow } from './theme.js';
+import { ACCENTS,appearancePref,applyAppearance,applyTheme,isElectron,themeNow } from './theme.js';
+import { durfmt } from './transcript.js';
 
 
   /**
@@ -169,6 +170,7 @@ import { applyTheme,themeNow } from './theme.js';
         if (!bad && !warn) h += '<span class="updpill ok">All ' + checks.length + " checks pass</span>";
         else h += '<span class="updpill warn">' + (bad ? bad + " failing" : "") + (bad && warn ? " \u00b7 " : "") + (warn ? warn + " warning" + (warn > 1 ? "s" : "") : "") + "</span>";
         h += '<button class="btn ghost sm" id="diagrerun">Re-run</button></div>';
+        h += '<div class="dsys" id="dsys"></div>';
         checks.forEach(function(c){
           var st = c.status === "ok" ? "ok" : c.status === "warn" ? "warn" : "bad";
           h += '<div class="dchk"><span class="sdot ' + st + '" style="margin-top:5px"></span>' +
@@ -177,6 +179,14 @@ import { applyTheme,themeNow } from './theme.js';
         });
         pane.innerHTML = h;
         document.getElementById("diagrerun").onclick = renderDiag;
+        // what is actually running, beside what it checked
+        Promise.all([sapi("/api/health"), sapi("/api/version")]).then(function(r){
+          var hh = r[0] || {}, v = r[1] || {}, box = document.getElementById("dsys"); if (!box) return;
+          var up = Number(v.uptimeSec || 0);
+          var cells = [["Loom", (hh.version || "?") + " · " + String(hh.rev || v.rev || "").slice(0, 8)], ["Node", v.node || "?"],
+            ["Platform", v.platform || "?"], ["Up for", durfmt(up * 1000)], ["Process", "pid " + (v.pid || "?")], ["Terminal", hh.terminal || "?"]];
+          box.innerHTML = cells.map(function(c){ return '<div class="dsc"><span>' + esc(c[0]) + "</span><b>" + esc(c[1]) + "</b></div>"; }).join("");
+        }).catch(function(){});
       }).catch(fail);
     }
 
@@ -192,8 +202,44 @@ import { applyTheme,themeNow } from './theme.js';
       h += '<div class="prow"><div class="pl"><div class="pt">Theme</div>' +
         '<div class="pd">Light or dark. Open terminals repaint to match.</div></div>' +
         '<div class="pc">' + seg("theme", [{ v: "light", l: "Light" }, { v: "dark", l: "Dark" }], themeNow()) + "</div></div>";
+      h += '<div class="prow"><div class="pl"><div class="pt">Text size</div>' +
+        '<div class="pd">Scales the whole app on this device.</div></div>' +
+        '<div class="pc">' + seg("textsize", [{ v: "s", l: "S" }, { v: "m", l: "M" }, { v: "l", l: "L" }, { v: "xl", l: "XL" }], appearancePref("textsize", "m")) + "</div></div>";
+      h += '<div class="prow"><div class="pl"><div class="pt">Density</div>' +
+        '<div class="pd">Compact fits more of a conversation on screen.</div></div>' +
+        '<div class="pc">' + seg("density", [{ v: "comfy", l: "Comfortable" }, { v: "compact", l: "Compact" }], appearancePref("density", "comfy")) + "</div></div>";
+      h += '<div class="prow"><div class="pl"><div class="pt">Accent</div>' +
+        '<div class="pd">The thread colour: live replies, links, unread dots, the heatmap.</div></div>' +
+        '<div class="pc"><div class="accents" role="group" aria-label="accent colour">' + Object.keys(ACCENTS).map(function(k){
+          var on = appearancePref("accent", "cyan") === k;
+          return '<button type="button" class="accentsw' + (on ? " on" : "") + '" data-accent="' + k + '" aria-pressed="' + on + '" title="' + k + '" style="--sw:' + ACCENTS[k][0] + '"></button>';
+        }).join("") + "</div></div></div>";
+      h += '<div class="sgrouph">Notifications · this device</div>';
+      h += '<div class="prow"><div class="pl"><div class="pt">When a long turn finishes</div>' +
+        '<div class="pd">A notification when an agent finishes something that took more than 20 seconds, while Loom is in the background.</div></div>' +
+        '<div class="pc">' + seg("notifydone", [{ v: "on", l: "On" }, { v: "off", l: "Off" }], devicePref("notifyDone", true) ? "on" : "off") + "</div></div>";
+      h += '<div class="prow"><div class="pl"><div class="pt">Chime</div>' +
+        '<div class="pd">A soft two-note sound with it.</div></div>' +
+        '<div class="pc">' + seg("chime", [{ v: "on", l: "On" }, { v: "off", l: "Off" }], devicePref("chime", false) ? "on" : "off") + "</div></div>";
       h += '<div id="projprefs"></div>';
       pane.innerHTML = h;
+      bindSeg("notifydone", function(v){
+        setDevicePref("notifyDone", v === "on");
+        if (v === "on" && !window.loomNative && window.Notification && Notification.permission === "default") {
+          try { Notification.requestPermission(); } catch (e) {}
+        }
+        toast(v === "on" ? "you’ll hear when long turns finish" : "finish notifications off");
+      });
+      bindSeg("chime", function(v){ setDevicePref("chime", v === "on"); if (v === "on") chime(); });
+      bindSeg("textsize", function(v){ try { localStorage.setItem("loomPref:textsize", v); } catch (e) {} applyAppearance(); });
+      bindSeg("density", function(v){ try { localStorage.setItem("loomPref:density", v); } catch (e) {} applyAppearance(); });
+      Array.prototype.forEach.call(pane.querySelectorAll("[data-accent]"), function(b){
+        b.onclick = function(){
+          try { localStorage.setItem("loomPref:accent", b.getAttribute("data-accent")); } catch (e) {}
+          Array.prototype.forEach.call(pane.querySelectorAll("[data-accent]"), function(x){ x.classList.toggle("on", x === b); x.setAttribute("aria-pressed", x === b ? "true" : "false"); });
+          applyAppearance();
+        };
+      });
       bindSeg("theme", function(v){
         localStorage.setItem(THEME_KEY, v === "light" ? "light" : "dark");
         applyTheme();
@@ -290,7 +336,10 @@ import { applyTheme,themeNow } from './theme.js';
      * build, the page waits for it and reloads itself.
      */
     function startUpdate(btn, u){
-      if (!window.confirm("Update Loom to " + u.latest + "?\n\nThis runs:\n" + (u.steps || []).join("\n") + "\n\nThe daemon restarts when it finishes.")) return;
+      askConfirm("Update Loom to " + u.latest + "?\n\nThis runs:\n" + (u.steps || []).join("\n") + "\n\nThe daemon restarts when it finishes.", { ok: "Update" })
+        .then(function(ok){ if (ok) runUpdate(btn, u); });
+    }
+    function runUpdate(btn, u){
       btn.disabled = true;
       btn.textContent = "Updating…";
       var log = document.getElementById("updlog");
@@ -354,31 +403,54 @@ import { applyTheme,themeNow } from './theme.js';
     }
     function revokeDevice(id){
       var me = id === state.clientId;
-      if (!window.confirm(me ? "Revoke THIS device? You\u2019ll be signed out and have to pair again."
-        : "Revoke this device? Its token stops working immediately.")) return;
-      sapi("/api/pair/clients/" + encodeURIComponent(id), { method: "DELETE" }).then(function(){
-        if (me) { close(); logout(); return; }
-        toast("device revoked");
-        renderDevices();
-      }).catch(function(e){ toast(e.message); });
+      askConfirm(me ? "Revoke THIS device? You\u2019ll be signed out and have to pair again."
+        : "Revoke this device? Its token stops working immediately.", { ok: "Revoke", danger: true }).then(function(ok){
+        if (!ok) return;
+        sapi("/api/pair/clients/" + encodeURIComponent(id), { method: "DELETE" }).then(function(){
+          if (me) { close(); logout(); return; }
+          toast("device revoked");
+          renderDevices();
+        }).catch(function(e){ toast(e.message); });
+      });
+    }
+    // Unused: not seen for 30 days, or never used a week after pairing. Every
+    // re-pair mints a new entry, so these pile up; never this device.
+    var DAY = 24 * 3600 * 1000;
+    function isStale(c){
+      if (c.id === state.clientId) return false;
+      if (c.lastSeen) return Date.now() - c.lastSeen > 30 * DAY;
+      return Date.now() - Number(c.createdAt || 0) > 7 * DAY;
+    }
+    function removeStale(list){
+      askConfirm("Remove " + list.length + " unused device" + (list.length === 1 ? "" : "s") + "?\n\nTheir tokens stop working. Anything you still use can pair again in a minute.", { ok: "Remove them", danger: true })
+        .then(function(ok){
+          if (!ok) return;
+          return Promise.all(list.map(function(c){ return sapi("/api/pair/clients/" + encodeURIComponent(c.id), { method: "DELETE" }).catch(function(){ return null; }); }))
+            .then(function(){ toast("removed " + list.length + " unused device" + (list.length === 1 ? "" : "s")); renderDevices(); });
+        });
     }
     function renderDevices(){
       busy();
       sapi("/api/pair/clients").then(function(d){
-        var clients = d.clients || [];
+        var clients = (d.clients || []).slice().sort(function(a, b){
+          return (Number(b.lastSeen) || Number(b.createdAt) || 0) - (Number(a.lastSeen) || Number(a.createdAt) || 0);
+        });
+        var stale = clients.filter(isStale);
         var h = '<div class="setphead">Devices</div>' +
           '<div class="setpsub">Every client paired to this Loom. Revoke one and its token stops working at once.</div>';
-        h += '<div class="pillrow"><button class="btn primary sm" id="devpair">Pair a new device</button></div><div id="devpairout"></div>';
+        h += '<div class="pillrow"><button class="btn primary sm" id="devpair">Pair a new device</button>' +
+          (stale.length ? '<button class="btn ghost sm" id="devstale">Remove ' + stale.length + " unused</button>" : "") + '</div><div id="devpairout"></div>';
         if (!clients.length) h += '<div class="snote">No devices paired yet.</div>';
         clients.forEach(function(c){
           var me = c.id === state.clientId;
-          h += '<div class="dev"><div class="di">' + ICONS.agents + "</div>" +
+          h += '<div class="dev' + (isStale(c) ? " stale" : "") + '"><div class="di">' + ICONS.agents + "</div>" +
             '<div class="dn"><div class="dnt">' + esc(c.name || "device") + (me ? ' <span class="devme">this device</span>' : "") + "</div>" +
-            '<div class="dnd">paired ' + rel(c.createdAt) + (c.push ? " \u00b7 push on" : "") + "</div></div>" +
+            '<div class="dnd">' + (c.lastSeen ? "last used " + rel(c.lastSeen) : "not used since pairing") + " \u00b7 paired " + rel(c.createdAt) + (c.push ? " \u00b7 push on" : "") + "</div></div>" +
             '<button class="btn ghost sm" data-revoke="' + esc(c.id) + '">Revoke</button></div>';
         });
         pane.innerHTML = h;
         document.getElementById("devpair").onclick = pairNewDevice;
+        var ds = document.getElementById("devstale"); if (ds) ds.onclick = function(){ removeStale(stale); };
         Array.prototype.forEach.call(pane.querySelectorAll("[data-revoke]"), function(b){
           b.onclick = function(){ revokeDevice(b.getAttribute("data-revoke")); };
         });
@@ -411,13 +483,16 @@ import { applyTheme,themeNow } from './theme.js';
           "<dt>Frames</dt><dd>" + Number(c.stats.frames || 0) + "</dd>" +
           "<dt>Rejected</dt><dd>" + Number(c.stats.rejected || 0) + "</dd></dl>";
       }
-      h += '<div class="sgrouph">Supabase project</div>';
+      // Loom's own relay project is the default, so there's nothing to fill
+      // in; your own Supabase project is an option, not a prerequisite.
+      var own = !!(c.supabaseUrl && c.supabaseUrl !== c.hostedUrl && c.hostedUrl);
+      h += '<details class="cloudadv"' + (own ? " open" : "") + '><summary>Use your own Supabase project…</summary>';
       h += '<div class="cloudin">' +
         '<div class="field"><label for="cloudurl">Supabase URL</label>' +
         '<input id="cloudurl" placeholder="https://your-project.supabase.co" autocomplete="off" spellcheck="false" value="' + esc(c.supabaseUrl || "") + '"></div>' +
         '<div class="field"><label for="cloudkey">Anon key <span class="opt">' + (c.configured ? "\u2014 blank keeps the saved one" : "") + "</span></label>" +
         '<input id="cloudkey" type="password" placeholder="' + (c.configured ? "\u2022\u2022\u2022\u2022\u2022\u2022 saved" : "eyJhbGciOi\u2026") + '" autocomplete="off" spellcheck="false"></div>' +
-        "</div>";
+        "</div></details>";
       h += '<div class="pillrow">' +
         '<button class="btn primary sm" id="cloudon">' + (c.enabled ? "Save & reconnect" : "Enable") + "</button>" +
         (c.enabled ? '<button class="btn ghost sm" id="cloudoff">Disable</button>' : "") +
@@ -626,7 +701,12 @@ import { applyTheme,themeNow } from './theme.js';
       if (t.signedIn) h += runnerPanelHtml();
       // your teams first; then making or joining another
       if (!t.signedIn) {
-        h += '<div class="sgrouph">Sign in to a hub</div><div class="cloudin">' +
+        // The hosted hub first: one button, your GitHub account. The form
+        // below is for teams running their own loom hub.
+        h += '<div class="sgrouph">Sign in</div>' +
+          '<div class="pillrow"><button class="btn primary sm" type="button" id="tghsign">' + ICONS.github + "Sign in with GitHub</button>" +
+          '<span class="hintx" id="tghnote">Uses the hosted Loom Team Hub. Only titles you share are sent, encrypted.</span></div>' +
+          '<div class="sgrouph">Or use your own hub</div><div class="cloudin">' +
           teamField("Hub URL", "hub", 'class="mono" placeholder="https://hub.example.com"') +
           teamField('GitHub login <span class="opt">\u2014 blank uses the gh CLI\u2019s</span>', "cgh", 'placeholder="your GitHub username"') +
           teamField('Join secret <span class="opt">if the hub has one</span>', "csec", 'type="password"') + "</div>" +
@@ -641,6 +721,35 @@ import { applyTheme,themeNow } from './theme.js';
         '<div class="pillrow"><button class="btn outline sm" type="button" data-tjoin>Join team</button>' +
         '<span class="hintx">' + (t.signedIn ? "The link names its hub; you join as " + esc(t.github) + "." : "Signs in to the link\u2019s hub with the login and secret above.") + "</span></div>";
       pane.innerHTML = h;
+      var ghb = document.getElementById("tghsign");
+      if (ghb) ghb.onclick = function(){
+        var note = document.getElementById("tghnote");
+        ghb.disabled = true;
+        // Open the tab now, inside the click: a window opened after the
+        // request comes back is a popup, and browsers block it silently.
+        // (The desktop app hands every outside link to your real browser and
+        // blocks nothing, so there it opens the URL itself once it has it.)
+        var electron = isElectron();
+        var win = null;
+        if (!electron) { try { win = window.open("about:blank", "_blank"); } catch (e) { win = null; } }
+        sapi("/api/team/hosted-signin", { method: "POST", body: "{}" }).then(function(j){
+          if (j && j.url) {
+            if (electron) window.open(j.url, "_blank");
+            else if (win && !win.closed) { try { win.opener = null; } catch (e) {} win.location.href = j.url; }
+            else if (note) { note.innerHTML = 'Your browser blocked the sign-in window — <a href="' + esc(j.url) + '" target="_blank" rel="noopener">open it here</a>.'; return; }
+          }
+          if (note) note.textContent = "Finish signing in with GitHub in the browser tab that opened — this page updates on its own.";
+          // wait for the session to land (the daemon holds the callback)
+          var tries = 0;
+          var iv = setInterval(function(){
+            if (++tries > 300 || !document.getElementById("tghsign")) { clearInterval(iv); return; }
+            sapi("/api/team/hosted-signin").then(function(st){
+              if (st && st.error) { clearInterval(iv); ghb.disabled = false; if (note) note.textContent = "Sign-in didn’t finish: " + st.error; return; }
+              return sapi("/api/team").then(function(tt){ if (tt && tt.signedIn) { clearInterval(iv); state.team = tt; toast("signed in as " + (tt.github || "you")); renderTeam(); } });
+            }).catch(function(){});
+          }, 2000);
+        }).catch(function(e){ if (win && !win.closed) win.close(); ghb.disabled = false; if (note) note.textContent = e.message; });
+      };
       wireTeamForms(pane, teamSact);
       wireTeamInvites(pane, teamSact);
       wireDoctor();
@@ -749,15 +858,28 @@ import { applyTheme,themeNow } from './theme.js';
         return '<div class="psrow' + (on ? "" : " off") + '">' +
           '<label class="psswitch" aria-label="toggle ' + esc(a.id) + '"><input type="checkbox" class="psen" data-agent="' + esc(a.id) + '"' + (on ? " checked" : "") + (a.holdsBaton ? " disabled" : "") + '><span class="pssl"></span></label>' +
           '<div class="psinfo"><div class="psname">' + esc(a.id) + (a.holdsBaton ? ' <span class="psbaton">baton</span>' : "") + '</div><div class="pskind">' + esc(a.kind) + (a.model ? " \u00b7 " + esc(a.model) : "") + "</div></div>" +
-          '<div class="psrolewrap"><span class="pslabel">role</span>' + roleSel + "</div></div>";
+          '<div class="psrolewrap"><span class="pslabel">role</span>' + roleSel +
+          '<button type="button" class="btn xs ' + (a.instructions ? "outline psinstr on" : "ghost psinstr") + '" data-instr="' + esc(a.id) + '" title="' +
+            esc(a.instructions ? "Standing instructions: " + a.instructions.slice(0, 160) : "Add standing instructions this agent gets before every turn") + '">' +
+            ICONS.pencil + (a.instructions ? "Instructions" : "Instruct") + "</button>" +
+          '<button type="button" class="btn xs ghost psinstr" data-avatar="' + esc(a.id) + '" title="' + (a.avatar ? "change its picture" : "give this agent a picture") + '">' +
+            (a.avatar ? '<img class="psav" src="' + a.avatar + '" alt="">' : ICONS.camera) + (a.avatar ? "Picture" : "Picture") + "</button>" +
+          (a.avatar ? '<button type="button" class="btn xs ghost" data-avatarx="' + esc(a.id) + '" title="remove its picture" aria-label="remove picture">' + ICONS.x + "</button>" : "") +
+          (a.kind === "model" ? '<button type="button" class="btn xs ghost psinstr" data-sampling="' + esc(a.id) + '" title="' +
+            esc("Temperature " + (a.sampling && a.sampling.temperature != null ? a.sampling.temperature : "default") + " · max tokens " + (a.sampling && a.sampling.maxTokens ? a.sampling.maxTokens : "default")) + '">' +
+            ICONS.gear + "Sampling</button>" : "") +
+          '<button type="button" class="btn xs ghost psinstr" data-check="' + esc(a.id) + '" title="is it installed, signed in, and is its model there? No prompt is sent">' + ICONS.check + "Check</button>" +
+          "</div></div>" + '<div class="pscheck" data-chkout="' + esc(a.id) + '"></div>';
       }).join("");
       body.innerHTML = '<div class="pshdr"><div class="psproj">' + esc(p.name) + '</div><div class="obsub">' + agents.length + " agents \u00b7 baton " + esc(p.holder || "\u2014") + "</div></div>" +
         '<div class="pssec">Agents \u2014 switch on/off, set each role</div><div class="psrows">' + rows + "</div>" +
         '<div class="pshint">Off agents stay in the roster but can\u2019t take turns or hold the baton. Changes land on the next turn \u2014 no restart. You can\u2019t switch off the baton holder; hand it off first.</div>' +
         '<div class="pssec" style="margin-top:14px">Policies \u2014 all off by default</div>' +
         '<div class="psrows" id="pspolicies"><div class="loader"><i></i><i></i><i></i><i></i></div></div>' +
-        '<div class="pssec" style="margin-top:14px">Team</div><div id="psteam">' + LOADER + "</div>";
+        '<div class="pssec" style="margin-top:14px">Team</div><div id="psteam">' + LOADER + "</div>" +
+        '<div class="pssec" style="margin-top:14px">Storage</div><div id="psstore" class="psstore">' + LOADER + "</div>";
       if (state.team) drawPsTeam(); else loadTeam().then(drawPsTeam);
+      drawPsStore();
       // The policy toggles, from the same settings the CLI and config file use.
       api("/api/projects/" + pid + "/config").then(function(cfg){
         var host = document.getElementById("pspolicies"); if (!host) return;
@@ -792,6 +914,112 @@ import { applyTheme,themeNow } from './theme.js';
             .then(afterChange).catch(function(err){ toast(err.message || "could not toggle"); cb.checked = !cb.checked; });
         };
       });
+      /** Crop to a square and shrink to 96px on the device; only that small PNG is sent. */
+      function pictureFrom(file){
+        return new Promise(function(resolve, reject){
+          if (!/^image\//.test(file.type)) return reject(new Error("that isn’t an image"));
+          var url = URL.createObjectURL(file), img = new Image();
+          img.onload = function(){
+            var side = Math.min(img.width, img.height), c = document.createElement("canvas");
+            c.width = c.height = 96;
+            c.getContext("2d").drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, 96, 96);
+            URL.revokeObjectURL(url);
+            resolve(c.toDataURL("image/png"));
+          };
+          img.onerror = function(){ URL.revokeObjectURL(url); reject(new Error("couldn’t read that image")); };
+          img.src = url;
+        });
+      }
+      Array.prototype.forEach.call(body.querySelectorAll("[data-avatar]"), function(b){
+        b.onclick = function(){
+          var agent = b.getAttribute("data-avatar");
+          var inp = document.createElement("input");
+          inp.type = "file"; inp.accept = "image/png,image/jpeg,image/webp";
+          inp.onchange = function(){
+            var f = inp.files && inp.files[0]; if (!f) return;
+            pictureFrom(f).then(function(dataUrl){
+              return api("/api/projects/" + pid + "/agents/" + encodeURIComponent(agent) + "/avatar", { method: "PUT", body: JSON.stringify({ avatar: dataUrl }) });
+            }).then(function(){ toast(agent + " has a picture now"); afterChange(); }).catch(function(err){ toast(err.message); });
+          };
+          inp.click();
+        };
+      });
+      Array.prototype.forEach.call(body.querySelectorAll("[data-check]"), function(b){
+        b.onclick = function(){
+          var id = b.getAttribute("data-check");
+          var out = body.querySelector('[data-chkout="' + id + '"]');
+          if (!out) return;
+          b.disabled = true;
+          out.innerHTML = '<div class="pschk dim">checking ' + esc(id) + "…</div>";
+          api("/api/projects/" + pid + "/agents/" + encodeURIComponent(id) + "/check", { method: "POST", body: "{}" }).then(function(r){
+            out.innerHTML = '<div class="pschkhead ' + (r.ok ? "ok" : "bad") + '">' + (r.ok ? ICONS.check + esc(id) + " is ready" : ICONS.alert + esc(id) + " isn’t ready") +
+              '<span class="dim"> · ' + (r.ms < 1000 ? r.ms + " ms" : (r.ms / 1000).toFixed(1) + " s") + "</span></div>" +
+              (r.checks || []).map(function(c){
+                return '<div class="pschk ' + (c.ok ? "ok" : "bad") + '"><span class="pschkn">' + (c.ok ? "✓ " : "✗ ") + esc(c.name) + "</span>" + esc(c.detail) + "</div>";
+              }).join("");
+          }).catch(function(err){
+            out.innerHTML = '<div class="pschk bad">' + esc(err.message) + "</div>";
+          }).then(function(){ b.disabled = false; });
+        };
+      });
+      Array.prototype.forEach.call(body.querySelectorAll("[data-avatarx]"), function(b){
+        b.onclick = function(){
+          var agent = b.getAttribute("data-avatarx");
+          api("/api/projects/" + pid + "/agents/" + encodeURIComponent(agent) + "/avatar", { method: "PUT", body: JSON.stringify({ avatar: null }) })
+            .then(function(){ toast(agent + "’s picture removed"); afterChange(); }).catch(function(err){ toast(err.message); });
+        };
+      });
+      Array.prototype.forEach.call(body.querySelectorAll("[data-sampling]"), function(b){
+        b.onclick = function(){
+          var agent = b.getAttribute("data-sampling");
+          var a = (p.agents || []).filter(function(x){ return x.id === agent; })[0] || {};
+          var cur = a.sampling || {};
+          var sc = document.createElement("div");
+          sc.className = "scrim cfscrim";
+          sc.innerHTML = '<div class="modal cfmodal" role="dialog" aria-modal="true"><div class="cft">Sampling for ' + esc(agent) + "</div>" +
+            '<div class="cfb">How ' + esc(agent) + ' writes. Leave a field blank for the provider’s default.</div>' +
+            '<label class="cflab">Temperature <span>0 is steady, 1 is lively, up to 2</span><input class="cfin" id="smtemp" type="number" min="0" max="2" step="0.1" placeholder="default"></label>' +
+            '<label class="cflab">Max tokens per reply <span>16 to 200000</span><input class="cfin" id="smmax" type="number" min="16" max="200000" step="1" placeholder="default"></label>' +
+            '<div class="cfa"><button type="button" class="btn sm ghost" id="smcancel">Cancel</button><button type="button" class="btn sm primary" id="smsave">Save</button></div></div>';
+          document.body.appendChild(sc);
+          var t = document.getElementById("smtemp"), m = document.getElementById("smmax");
+          if (cur.temperature != null) t.value = cur.temperature;
+          if (cur.maxTokens) m.value = cur.maxTokens;
+          function done(){ sc.remove(); document.removeEventListener("keydown", key, true); }
+          function key(e){ if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); done(); } }
+          document.addEventListener("keydown", key, true);
+          sc.onmousedown = function(e){ if (e.target === sc) done(); };
+          document.getElementById("smcancel").onclick = done;
+          document.getElementById("smsave").onclick = function(){
+            var body2 = { temperature: t.value === "" ? null : Number(t.value), maxTokens: m.value === "" ? null : Number(m.value) };
+            api("/api/projects/" + pid + "/agents/" + encodeURIComponent(agent) + "/sampling", { method: "PUT", body: JSON.stringify(body2) })
+              .then(function(){ done(); toast(agent + " sampling saved — it takes on the next turn"); afterChange(); })
+              .catch(function(err){
+                var e = sc.querySelector(".mferr");
+                if (!e) { e = document.createElement("div"); e.className = "mferr"; e.setAttribute("role", "alert"); sc.querySelector(".cfa").insertAdjacentElement("beforebegin", e); }
+                e.textContent = err.message;
+              });
+          };
+          setTimeout(function(){ t.focus(); }, 0);
+        };
+      });
+      Array.prototype.forEach.call(body.querySelectorAll("[data-instr]"), function(b){
+        b.onclick = function(){
+          var agent = b.getAttribute("data-instr");
+          var a = (p.agents || []).filter(function(x){ return x.id === agent; })[0] || {};
+          askText("Standing instructions for " + agent, {
+            value: a.instructions || "", multiline: true,
+            placeholder: "e.g. Use pnpm, never npm. Don’t touch db/migrations. Keep replies short.",
+            note: "Sent ahead of every turn " + agent + " takes in this project. Empty clears them.",
+            ok: "Save",
+          }).then(function(text){
+            if (text === null) return;
+            api("/api/projects/" + pid + "/agents/" + encodeURIComponent(agent) + "/instructions", { method: "PUT", body: JSON.stringify({ instructions: text }) })
+              .then(function(r){ toast(r.instructions ? agent + " will get these before every turn" : agent + "’s instructions cleared"); afterChange(); })
+              .catch(function(err){ toast(err.message); });
+          });
+        };
+      });
       Array.prototype.forEach.call(body.querySelectorAll(".psrole"), function(sel){
         sel.onchange = function(){
           var agent = sel.getAttribute("data-agent");
@@ -799,6 +1027,24 @@ import { applyTheme,themeNow } from './theme.js';
             .then(afterChange).catch(function(err){ toast(err.message || "could not set role"); });
         };
       });
+    }
+    function kb(n){ return n >= 1048576 ? (n / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(n / 1024)) + " KB"; }
+    /** The event log on disk, and a button that gives back its free pages. */
+    function drawPsStore(){
+      var host = document.getElementById("psstore"); if (!host) return;
+      api("/api/projects/" + pid + "/log/size").then(function(s){
+        host.innerHTML = '<div class="psrow"><div class="psinfo"><div class="psname">Event log</div>' +
+          '<div class="pskind">' + kb(s.bytes) + " · " + Number(s.events).toLocaleString() + " events — the whole history of this project’s threads</div></div>" +
+          '<button type="button" class="btn xs outline" id="pscompact" title="reclaim space the log no longer uses (SQLite VACUUM) — nothing is deleted">Compact</button></div>';
+        document.getElementById("pscompact").onclick = function(){
+          var b = this; b.disabled = true; b.textContent = "Compacting…";
+          api("/api/projects/" + pid + "/log/compact", { method: "POST", body: "{}" }).then(function(r){
+            var saved = r.before.bytes - r.after.bytes;
+            toast(saved > 0 ? "compacted — " + kb(saved) + " back, every event kept" : "already compact — every event kept");
+            drawPsStore();
+          }).catch(function(err){ toast(err.message); b.disabled = false; b.textContent = "Compact"; });
+        };
+      }).catch(function(){ host.innerHTML = '<div class="pshint" style="margin-top:0">Couldn’t read the log size.</div>'; });
     }
     // Sharing with the team (D8) — only when this machine is on one.
     function drawPsTeam(){
@@ -837,6 +1083,7 @@ import { applyTheme,themeNow } from './theme.js';
           '<div class="pickrow"><input id="pdir" spellcheck="false" autocomplete="off" placeholder="' +
             (native ? "choose a folder\u2026" : "/path/to/repo on the daemon host") + '">' +
             (native ? '<button class="btn outline" id="pbrowse">Choose\u2026</button>' : "") + "</div>" +
+          '<span class="ferr" id="perr" role="alert"></span>' +
           '<span class="hintx">Loom writes a <code>.loom/</code> folder here and leaves the rest of the repo alone.</span></div>' +
         '<div class="field"><label>Name <span class="opt">optional</span></label>' +
           '<input id="pname" spellcheck="false" autocomplete="off" placeholder="defaults to the folder name"></div>' +
@@ -859,11 +1106,22 @@ import { applyTheme,themeNow } from './theme.js';
       }).catch(function(err){ toast(String(err.message || err)); });
     };
     setTimeout(function(){ dirEl.focus(); }, 30);
+    // Errors belong under the field they're about, not in a toast behind the
+    // dialog where your eyes aren't.
+    function fieldErr(msg){
+      var e = document.getElementById("perr"); if (e) e.textContent = msg || "";
+      dirEl.classList.toggle("bad", !!msg);
+      if (msg) dirEl.focus();
+    }
+    dirEl.addEventListener("input", function(){ fieldErr(""); });
     function create(){
       var dir = (dirEl.value || "").trim();
-      if (!dir) return toast(native ? "choose a folder first" : "enter a directory path");
+      if (!dir) return fieldErr(native ? "Choose a folder first." : "Enter the path to a folder on this machine.");
       var name = (document.getElementById("pname").value || "").trim();
-      var btn = document.getElementById("pcreate"); btn.disabled = true;
+      var btn = document.getElementById("pcreate");
+      if (btn.disabled) return; // a double-click is one project, not two requests
+      btn.disabled = true;
+      var was = btn.innerHTML; btn.textContent = "Creating…";
       api("/api/projects", {
         method: "POST",
         body: JSON.stringify(name ? { dir: dir, name: name } : { dir: dir }),
@@ -871,18 +1129,21 @@ import { applyTheme,themeNow } from './theme.js';
         close();
         var p = j.project || {};
         // say what was actually detected rather than a bare "added"
-        var found = ((j.config && j.config.agents) || []).filter(function(a){ return a.tier === "adapter"; });
+        // (The config carries kinds, not tiers — filtering on tier counted
+        // zero and told you no agents were found beside a roster of five.)
+        var found = (j.config && j.config.agents) || [];
         toast(found.length
-          ? p.name + " \u00b7 " + found.length + (found.length === 1 ? " ADE" : " ADEs") + ": " + found.map(function(a){ return a.id; }).join(", ")
-          : p.name + " added \u00b7 no ADE CLIs detected on this host");
+          ? p.name + " added \u00b7 " + found.length + " agent" + (found.length === 1 ? "" : "s") + ": " + found.map(function(a){ return agentLabel(a.kind, a.id); }).join(", ")
+          : p.name + " added \u00b7 no agent CLIs found on this machine \u2014 install one, or add a model agent");
         if (state.refreshProjects) state.refreshProjects();
         if (p.id) { if (state.selectProject) state.selectProject(p.id); else location.hash = "#p/" + p.id; }
-      }).catch(function(err){ btn.disabled = false; toast(err.message); });
+      }).catch(function(err){ btn.disabled = false; btn.innerHTML = was; fieldErr(String(err.message || err).replace(/^./, function(c){ return c.toUpperCase(); })); });
     }
     document.getElementById("pcreate").onclick = create;
     function onKey(e){
       if (e.key === "Escape") { e.preventDefault(); close(); }
-      else if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); create(); }
+      // Enter in a one-line field submits, as it does everywhere else
+      else if (e.key === "Enter" && (e.metaKey || e.ctrlKey || e.target === dirEl || (e.target && e.target.id === "pname"))) { e.preventDefault(); create(); }
     }
     document.addEventListener("keydown", onKey);
   }

@@ -15,6 +15,9 @@ import { ICONS } from './icons.js';
     String(patch || "").split("\n").forEach(function(line){
       var m = line.match(/^diff --git a\/(.+) b\/(.+)$/);
       if (m) { cur = { path: m[2], lines: [], add: 0, del: 0 }; parts.push(cur); return; }
+      // a file the turn created, reported without a git diff of its own
+      var nf = line.match(/^\?\? new file: (.+)$/);
+      if (nf) { cur = { path: nf[1], lines: [line], add: 0, del: 0, created: true }; parts.push(cur); return; }
       if (!cur) { cur = { path: "", lines: [], add: 0, del: 0 }; parts.push(cur); }
       cur.lines.push(line);
       if (line.charAt(0) === "+" && line.slice(0, 3) !== "+++") cur.add++;
@@ -63,6 +66,39 @@ import { ICONS } from './icons.js';
     });
     return out;
   }
+  /** Old on the left, new on the right: removals and additions paired row by row within a hunk. */
+  function renderSplitLines(lines){
+    var oldN = 0, newN = 0, out = "", dels = [], adds = [];
+    function cell(n, text, cls){ return '<span class="ln">' + (n || "") + '</span><span class="sc' + (cls ? " " + cls : "") + '">' + (text === null ? "" : (esc(text) || " ")) + "</span>"; }
+    function flush(){
+      var n = Math.max(dels.length, adds.length);
+      for (var i = 0; i < n; i++) {
+        var d = dels[i], a = adds[i];
+        out += '<div class="sl">' + (d ? cell(d[0], d[1], "del") : cell("", null, "empty")) + (a ? cell(a[0], a[1], "add") : cell("", null, "empty")) + "</div>";
+      }
+      dels = []; adds = [];
+    }
+    lines.forEach(function(line){
+      var m = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (m) { flush(); oldN = Number(m[1]); newN = Number(m[2]); out += '<div class="sl hunk">' + esc(line) + "</div>"; return; }
+      var c = diffLineClass(line);
+      if (c === "meta" || (!oldN && !newN && line.charAt(0) !== "+" && line.charAt(0) !== "-")) { flush(); if (line) out += '<div class="sl meta">' + esc(line) + "</div>"; return; }
+      var body = /^[+\- ]/.test(line) ? line.slice(1) : line;
+      if (c === "del") { dels.push([oldN++, body]); return; }
+      if (c === "add") { adds.push([newN++, body]); return; }
+      flush();
+      out += '<div class="sl">' + cell(oldN++, body, "") + cell(newN++, body, "") + "</div>";
+    });
+    flush();
+    return out;
+  }
+  function diffView(){ try { return localStorage.getItem("loomDiffView") === "split" ? "split" : "unified"; } catch (e) { return "unified"; } }
+  function diffBody(lines, path){ return diffView() === "split" ? '<div class="dsplit">' + renderSplitLines(lines) + "</div>" : renderDiffLines(lines, path); }
+  function diffToggle(){
+    var v = diffView();
+    return '<div class="dvtoggle" role="group" aria-label="diff layout"><button type="button" data-dv="unified" class="' + (v === "unified" ? "on" : "") + '">Unified</button>' +
+      '<button type="button" data-dv="split" class="' + (v === "split" ? "on" : "") + '">Side by side</button></div>';
+  }
 
   function renderDiffFiles(tree){
     var files = splitPatch(tree.patch).filter(function(f){ return !isLoomInternal(f.path); });
@@ -75,7 +111,7 @@ import { ICONS } from './icons.js';
       return '<div class="dfile" id="df-' + i + '">' +
         '<div class="dfh">' + ICONS.tree + '<span class="p">' + esc(f.path || "patch") + "</span>" +
         '<span class="cadd">+' + f.add + "</span><span class=\"cdel\">\u2212" + f.del + "</span></div>" +
-        '<div class="dcode">' + renderDiffLines(f.lines, f.path) + "</div></div>";
+        '<div class="dcode">' + diffBody(f.lines, f.path) + "</div></div>";
     }).join("");
   }
-export { diffLineClass,isLoomInternal,renderDiffFiles,renderDiffLines,splitPatch,visibleFiles };
+export { diffBody,diffLineClass,diffToggle,isLoomInternal,renderDiffFiles,renderDiffLines,splitPatch,visibleFiles };

@@ -114,7 +114,10 @@ describe("firing alert -> baton intervention", () => {
   it("auto-returns the baton on the recheck loop when the agent stops erroring", async () => {
     // Enable the background loop with a fast recheck just for this test.
     process.env.LOOM_HEAL_RECHECK_MS = "60";
-    process.env.LOOM_HEAL_MAX_RETRIES = "3";
+    // Retries are how many rechecks it gets, not what's being tested: on a
+    // loaded machine a recheck can come back "not yet" (the error backend is
+    // asked first and can be slow), and three of those ended the loop early.
+    process.env.LOOM_HEAL_MAX_RETRIES = "20";
     delete process.env.LOOM_HEAL_DISABLED;
     try {
       await client.handoff(projectId, "plannerbot");
@@ -126,10 +129,18 @@ describe("firing alert -> baton intervention", () => {
       // failover happened; the recheck loop (no new errors) then hands it back.
       // The loop rechecks every 60ms, but each step is a real handoff through
       // the daemon — the budget is for a loop that never runs, not a busy host.
-      await waitUntil(async () => (await client.project(projectId)).project.holder !== "plannerbot", { timeoutMs: 20_000 });
+      // Watch the log rather than the holder: at a 60ms recheck the baton can
+      // leave and come back between two polls, and a wait for "not plannerbot"
+      // then never sees it — the log keeps both steps.
+      const recovered = async () =>
+        (await client.events(projectId, undefined, 200)).events.some(
+          (e) => e.kind === "status" && e.payload.state === "alert_recovery" && e.payload.via === "recheck",
+        );
+      await waitUntil(recovered, { timeoutMs: 20_000 });
       await waitUntil(async () => (await client.project(projectId)).project.holder === "plannerbot", { timeoutMs: 20_000 });
-      const { events } = await client.events(projectId, undefined, 100);
-      expect(events.some((e) => e.kind === "status" && e.payload.state === "alert_recovery" && e.payload.via === "recheck")).toBe(true);
+      const { events } = await client.events(projectId, undefined, 200);
+      // it really did fail over first: a handoff away from plannerbot is in the log
+      expect(events.some((e) => e.kind === "handoff" && e.payload.from === "plannerbot")).toBe(true);
     } finally {
       delete process.env.LOOM_HEAL_RECHECK_MS;
       delete process.env.LOOM_HEAL_MAX_RETRIES;

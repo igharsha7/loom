@@ -12,14 +12,35 @@ export function registerPublicRoutes(app: Express, ctx: Pick<RouteContext, "term
       version: VERSION,
       rev: BUILD_REV,
       terminal: ctx.terminals.mode,
+      // a transcriber is configured: the mic records and the daemon transcribes
+      stt: !!process.env.LOOM_STT_CMD,
     });
   });
 
+  /** Wrong pairing codes per address, for throttling guesses at /api/pair/claim. */
+  const claimTries = new Map<string, { fails: number; until: number }>();
   app.post("/api/pair/claim", (req, res) => {
     const { token, name } = (req.body ?? {}) as { token?: string; name?: string };
     if (!token) return void res.status(400).json({ error: "missing token" });
+    // A pairing token is the only credential this route takes, so guessing
+    // is throttled: ten wrong ones from one address and it waits.
+    const who = String(req.headers["x-loom-via"] ? "relay" : req.socket.remoteAddress ?? "?");
+    const now = Date.now();
+    const tries = claimTries.get(who);
+    if (tries && tries.until > now && tries.fails >= 10) {
+      const mins = Math.ceil((tries.until - now) / 60_000);
+      res.setHeader("Retry-After", String(Math.ceil((tries.until - now) / 1000)));
+      return void res.status(429).json({ error: `too many wrong pairing codes from here — try again in ${mins} minute${mins === 1 ? "" : "s"}` });
+    }
     const claimed = ctx.auth.claim(token, name ?? "device");
-    if (!claimed) return void res.status(403).json({ error: "invalid or expired pairing token" });
+    if (!claimed) {
+      const t = tries && tries.until > now ? tries : { fails: 0, until: now + 10 * 60_000 };
+      t.fails++;
+      claimTries.set(who, t);
+      if (claimTries.size > 1000) claimTries.clear(); // bounded, whatever happens
+      return void res.status(403).json({ error: "invalid or expired pairing token" });
+    }
+    claimTries.delete(who);
     res.json(claimed);
   });
 

@@ -20,4 +20,4 @@
                 auto: false, cpanel: null };
 
   var root = document.getElementById("root");
-export { CLIENT_ID_KEY,SETUP_SEEN_KEY,THEME_KEY,TOKEN_KEY,root,state };
+export { CLIENT_ID_KEY,root,SETUP_SEEN_KEY,state,THEME_KEY,TOKEN_KEY };

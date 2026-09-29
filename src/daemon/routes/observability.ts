@@ -7,6 +7,7 @@ import { buildSnapshots } from "../../observability/snapshots.js";
 import { triageAgent } from "../../observability/triage.js";
 import { kairoMetrics } from '../system.js';
 import type { WithRuntime } from './context.js';
+import { leaderboard, perDay, turnRows, turnsCsv } from "../../core/turn-stats.js";
 /** Register observability routes in the order established by LoomDaemon.routes(). */
 export function registerObservabilityRoutes(app: Express, withRuntime: WithRuntime): void {
 
@@ -231,6 +232,32 @@ export function registerObservabilityRoutes(app: Express, withRuntime: WithRunti
     }),
   );
 
+  // Turns off the log: the agent leaderboard, a per-day count for the
+  // activity heatmap, and every turn as CSV.
+  app.get(
+    "/api/projects/:id/insights/turns",
+    withRuntime(async (rt, req, res) => {
+      const days = Math.min(366, Math.max(7, Number(req.query.days) || 84));
+      const rows = turnRows(rt.log.list({ kinds: ["run_complete", "error"], limit: 50_000 }));
+      // ?since= (ms) narrows the leaderboard to a window — "today", for loom stats
+      const since = Number(req.query.since) || 0;
+      const board = leaderboard(since ? rows.filter((r) => r.ts >= since) : rows);
+      // your 👍/👎, beside what the log says
+      const rated = rt.ratingsByAgent();
+      res.json({ leaderboard: board.map((a) => (rated[a.agentId] ? { ...a, rated: rated[a.agentId] } : a)), days: perDay(rows, days), total: rows.length });
+    }),
+  );
+  app.get(
+    "/api/projects/:id/insights/turns.csv",
+    withRuntime(async (rt, _req, res) => {
+      const rows = turnRows(rt.log.list({ kinds: ["run_complete", "error"], limit: 50_000 }));
+      const safe = rt.info.name.replace(/[^\w.-]+/g, "-");
+      res
+        .type("text/csv")
+        .setHeader("Content-Disposition", `attachment; filename="${safe}-turns.csv"`)
+        .send(turnsCsv(rows));
+    }),
+  );
   app.get(
     "/api/projects/:id/insights/health",
     withRuntime(async (rt, req, res) => {

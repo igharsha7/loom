@@ -33,8 +33,19 @@ import type { HarnessHealth } from "../../core/continuity/capabilities.js";
 
 export interface TurnOptions {
   source?: "user" | "route"; chat?: string; plan?: boolean; fromQueue?: boolean;
+  /** How long you asked this one answer to be. */
+  length?: "brief" | "detailed";
   requestId?: string; capturedModel?: string | null; resume?: boolean; contextTarget?: number;
 }
+/** How long you asked the answer to be, this once ("" for the usual). */
+function lengthLine(length: TurnOptions["length"]): string {
+  return length === "brief"
+    ? "Keep this reply brief: the answer first, a few sentences at most, no preamble."
+    : length === "detailed"
+      ? "Give a detailed reply this time: explain your reasoning and the trade-offs, with examples where they help."
+      : "";
+}
+
 export interface TurnResult { agentId: string; queued?: number; queueId?: string;
   requestId?: string; receiptId?: string; packetId?: string; continuityStatus?: string; }
 
@@ -69,6 +80,8 @@ export interface RuntimeTurnsHost {
   dispatchFailed: (agent: AnyAgent, chat: string, error: unknown) => void;
   consumePendingBriefing: (agentId: string) => string | undefined;
   activeSkillsBlock: () => string;
+  /** The agent's standing instructions block ("" when it has none). */
+  agentInstructions: (agentId: string) => string;
   healthyMcps: () => McpServerConfig[];
   appendIfOpen: (event: Parameters<EventJournal["append"]>[0]) => void;
   agents: ReadonlyMap<string, AnyAgent>;
@@ -217,6 +230,10 @@ export class RuntimeTurns {
     this.preTurnTree.delete(agentId);
     const checkpoint = this.turnCheckpoint.get(agentId);
     this.turnCheckpoint.delete(agentId);
+    // The chat the turn ran in, read now: by the time the diff is computed the
+    // agent may already be on its next turn somewhere else. Without it, every
+    // "changed N files" card landed in Main whatever thread asked.
+    const turnChat = this.turnChat.get(agentId);
     const pending = diffSinceSnapshot(this.host.agentDir(agentId), before).catch(() => null);
     this.lastTurnDiff.set(agentId, pending);
     const finalized = pending
@@ -225,6 +242,7 @@ export class RuntimeTurns {
         if (diff) {
           this.host.log.append({
             kind: "turn_diff",
+            ...(turnChat && turnChat !== MAIN_CHAT ? { chat: turnChat } : {}),
             agentId,
             payload: {
               files: diff.files,
@@ -347,7 +365,14 @@ export class RuntimeTurns {
     if (source === "user") this.host.releaseQuestionHold(target);
     // It shows in the queue, editable, and enters the thread when it's sent.
     if (!opts.fromQueue && this.busySince.has(target)) {
-      const item = this.host.queue.add({ text, target: { kind: "agent", agentId: target }, chat, source, ...(opts.plan ? { plan: true } : {}) });
+      const item = this.host.queue.add({
+        text,
+        target: { kind: "agent", agentId: target },
+        chat,
+        source,
+        ...(opts.plan ? { plan: true } : {}),
+        ...(opts.length ? { length: opts.length } : {}),
+      });
       return { agentId: target, queued: this.host.queue.length, queueId: item.id };
     }
 
@@ -378,7 +403,7 @@ export class RuntimeTurns {
       // saved under plans/ by the runtime. Other agents get Loom's briefing.
       const nativePlan = Boolean(opts.plan) && agent instanceof ProviderAgent;
       const briefing =
-        [this.host.activeSkillsBlock(), pendingBriefing, opts.plan && !nativePlan ? planModeBriefing(text) : ""]
+        [this.host.agentInstructions(target), this.host.activeSkillsBlock(), pendingBriefing, opts.plan && !nativePlan ? planModeBriefing(text) : "", lengthLine(opts.length)]
           .filter(Boolean)
           .join("\n")
           .trim() || undefined;
@@ -472,7 +497,7 @@ export class RuntimeTurns {
     if (this.busySince.size) {
       if (opts.fromQueue) throw new ContinuityError("conflict", "another foreground turn is preparing or running");
       const item = this.host.queue.add({ text, target: { kind: "agent", agentId: target }, chat, source,
-        ...(opts.plan ? { plan: true } : {}), continuity: { requestId: request.id, model: request.model } });
+        ...(opts.plan ? { plan: true } : {}), ...(opts.length ? { length: opts.length } : {}), continuity: { requestId: request.id, model: request.model } });
       return { agentId: target, queued: this.host.queue.length, queueId: item.id, requestId: request.id };
     }
     this.busySince.set(target, Date.now()); this.turnChat.set(target, chat);
@@ -494,7 +519,7 @@ export class RuntimeTurns {
       await this.checkpointBefore(target, text);
       assertPrepared();
       const nativePlan = Boolean(opts.plan) && agent instanceof ProviderAgent;
-      const supplement = [this.host.activeSkillsBlock(), opts.plan && !nativePlan ? planModeBriefing(text) : ""].filter(Boolean).join("\n");
+      const supplement = [this.host.agentInstructions(target), this.host.activeSkillsBlock(), opts.plan && !nativePlan ? planModeBriefing(text) : "", lengthLine(opts.length)].filter(Boolean).join("\n");
       let prepared = await brain.prepare({ ...request, targetAddedTokens: opts.contextTarget ?? request.targetAddedTokens }, cfg.kind,
         this.host.agentDir(target), options, supplement);
       assertPrepared();
