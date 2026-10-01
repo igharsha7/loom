@@ -15,6 +15,21 @@ import { ContextItemV1, ContextPacketV1, RequestV1, ContinuityError, NativeDispa
 const exec = promisify(execFile);
 export const estimateTokens = (text: string): number => Math.ceil(Buffer.byteLength(text, "utf8") / 3);
 
+/** Context windows to budget by until a harness reports its own (Codex's default model, Claude's 200k). */
+export const DEFAULT_CONTEXT_WINDOW: Record<string, number> = { codex: 272_000, "claude-code": 200_000 };
+export const PACKET_BUDGET = { share: 0.1, min: 6000, max: 40_000 };
+
+/**
+ * How many tokens a packet may add for a target: a tenth of the context window
+ * it last reported (or its provider's default), between 6k and 40k. A switch
+ * to a large-window model carries more of the chat exactly; a small one gets
+ * more headlines and fewer observations rather than an overflow.
+ */
+export function packetBudget(kind: string, window?: number | null): number {
+  const w = window && window > 0 ? window : DEFAULT_CONTEXT_WINDOW[kind] ?? 0;
+  return Math.max(PACKET_BUDGET.min, Math.min(PACKET_BUDGET.max, Math.floor(w * PACKET_BUDGET.share)));
+}
+
 export async function observeWorkspace(dir: string): Promise<{ workspace: WorkspaceRef; instructions: string }> {
   const checkout = fs.realpathSync(dir);
   let head: string | null = null, dirty: boolean | null = null, state = "unknown";
@@ -113,7 +128,7 @@ export function renderPacket(packet: ContextPacket): RenderedBriefing {
 export class ContinuityEngine {
   readonly store: ContinuityStore;
   /** `compacted`: the harness reported native compaction during this run. */
-  private readonly runs = new Map<string, { receipt: Receipt; binding: Binding; compacted: boolean }>();
+  private readonly runs = new Map<string, { receipt: Receipt; binding: Binding; compacted: boolean; outcome?: "complete" | "interrupted" }>();
   constructor(private readonly log: EventLog, readonly projectId: string) {
     const store = log.continuity;
     if (!store) throw new ContinuityError("unsupported", "Brain native continuity requires SQLite, not legacy JSONL");
@@ -228,8 +243,9 @@ export class ContinuityEngine {
     const since = basis?.snapshot.throughEventId ?? 0, window = basis ? 2000 : 300;
     const recent = this.store.observations(chat, since, through, window);
     packet.unlisted!.observations = Math.max(0, this.store.countObservations(chat, since, through) - recent.length);
+    const dropped = this.store.dropped(chat);
     const holes = (basis?.coverage ?? []).filter(c => c.disposition === "omitted").slice(0, 900)
-      .flatMap(c => { const event = this.store.event(c.source.eventId); return event ? [event] : []; });
+      .flatMap(c => { const event = this.store.event(c.source.eventId); return event && !dropped.isDropped(event.id) ? [event] : []; });
     const own = (event: LoomEvent) => basis !== undefined && event.payload.loomBindingId === binding.id && event.payload.loomSessionEpoch === binding.sessionEpoch;
     const seen = new Set<number>([current.id]);
     for (const event of recent.concat(holes)) {
@@ -390,7 +406,12 @@ export class ContinuityEngine {
   }
   ingest(event: LoomEvent): void {
     const p = event.payload, runId = typeof p.loomRunId === "string" ? p.loomRunId : null;
-    if (!runId) return;
+    if (!runId) {
+      if (event.kind === "status" && p.state === "native_compacted" && event.agentId && typeof p.session === "string")
+        for (const binding of this.store.bindingsFor(event.chat ?? MAIN_CHAT, event.agentId))
+          if (binding.nativeSessionId === p.session) this.store.updateBinding({ ...binding, retention: "compacted" });
+      return;
+    }
     const run = this.runs.get(runId);
     if (!run || event.agentId !== run.binding.agentInstanceId || (event.chat ?? MAIN_CHAT) !== run.binding.conversationId ||
       p.loomBindingId !== run.binding.id || p.loomSessionEpoch !== run.binding.sessionEpoch) return;
@@ -415,10 +436,9 @@ export class ContinuityEngine {
       }
     }
     if (event.kind === "run_complete" || (event.kind === "status" && p.state === "interrupted")) {
-      const execution = event.kind === "run_complete" ? "complete" : "interrupted";
-      if (run.receipt.status === "accepted") run.receipt = this.store.transition(run.receipt.id, "accepted", execution, `native ${execution}; event ${event.id}`);
-      else run.receipt = this.store.transition(run.receipt.id, "outcome_unknown", "unknown", "interrupted before native acceptance evidence");
-      this.runs.delete(runId);
+      // Native terminal events precede command settlement. They record the
+      // outcome, but only send() settlement can release the writer lease.
+      run.outcome = event.kind === "run_complete" ? "complete" : "interrupted";
     }
     // An error can be emitted while the child is still running. Only send()
     // settlement or proven interrupt permits releasing the writer lease.
@@ -434,7 +454,7 @@ export class ContinuityEngine {
     else if (run.receipt.status === "submitting") this.store.transition(run.receipt.id, "outcome_unknown", "unknown", "send settled without correlated native acceptance; inspect before retrying");
     else if (run.receipt.status === "accepted" && error instanceof NativeQuiescenceUnknown)
       this.store.transition(run.receipt.id, "accepted", "unknown", error.message);
-    else if (run.receipt.status === "accepted") this.store.transition(run.receipt.id, "accepted", error ? "failed" : "complete", error ? "native send failed after acceptance" : "native send settled");
+    else if (run.receipt.status === "accepted") this.store.transition(run.receipt.id, "accepted", error ? "failed" : run.outcome ?? "complete", error ? "native send failed after acceptance" : "native send settled");
     this.runs.delete(runId);
   }
   diagnostics(requestId?: string): object {

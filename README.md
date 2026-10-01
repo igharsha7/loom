@@ -276,6 +276,18 @@ SQLite search, source-backed checkpoints and delivery diagnostics. It requires n
 embedding model or inference package. Enable **Native context continuity** in
 Settings → Preferences; the legacy workflow remains the default.
 
+**Switch provider mid-chat.** `POST /api/projects/:id/chats/:chat/switch`
+with `{ "agentId": "claude" }` moves a chat from Codex to Claude Code (or back).
+The outgoing agent's session is parked, warm, for a switch back. On its next
+turn the new agent gets what its session is missing: the whole chat if its
+session is new, or only what changed since it last took part. The context it
+adds is sized by that agent's context window (a tenth of it, 6k–40k tokens).
+When a provider reports its usage limit reached, Loom posts a
+`switch_suggested` status naming the agents on another provider that can take
+over. `"resend": true` switches and sends your last message again. A rewind
+takes the chat's conversation back for every agent, and Brain leaves the
+dropped turns out of what it tells the next one.
+
 Unknown CLI versions, OpenCode/bridges, attachments and parallel execution are
 gated in this mode. Overflow saves a reviewable request instead of silently dropping
 user intent. See [native continuity](docs/brain-continuity.md),
@@ -610,6 +622,7 @@ detects at least two roles.
 | `loom brain:conflicts` | Units that likely contradict each other, with the signal that tripped each |
 | `loom snapshot [file]` / `loom restore <file>` | Checkpoint brain+board+config · bring one back (brain merges) |
 | `loom rewind [checkpoint]` | Points the working tree can go back to · put the files back to one |
+| `loom recover-compaction --evidence "<how you checked>"` | Release an unfinished compaction after a crash, once you've confirmed its processes are gone (Stop or `loom interrupt` usually does it for you) |
 | `loom routes:save <name> <steps...>` / `routes:rm` | Define a named pipeline, validated against the roster · remove one |
 | `loom task "<title>"` / `loom tasks` | Put a card on the board (`--agent`, `--blocked-by`) · list yours |
 | `loom specs` / `loom specs:run <file>` | The project's Playwright specs · run one through the daemon |
@@ -1034,8 +1047,11 @@ happened; the files just don't have to live with it.
 
 **Three things it will never touch.** Checkpoints are taken with `git add -A`,
 so `.gitignore` applies at capture: your `node_modules`, your build output and
-your `.env` are never read, never stored and never restored. `.loom/` is
-ignored too, which is why a rewind cannot eat the event log.
+your `.env` are never read, never stored and never restored. `.loom/` (and
+`.git/`) are left out whatever your ignore rules say, which is why a rewind
+cannot eat the event log. A rewind only touches paths the checkpoints hold,
+never follows a symlinked folder out of the project, and leaves your staging
+area as it was.
 
 **It is itself rewindable.** A rewind saves what it is about to replace before
 it replaces it, and hands you that checkpoint back — in the thread as *Undo the
@@ -1057,6 +1073,13 @@ go back, for example because Claude has compacted that turn away, the rewind
 refuses before touching a file and says why. `--files-only` (or answering the
 prompt in the app) puts back just the files. Undoing a rewind brings back the
 files only; the dropped turns stay dropped.
+
+**If a rewind is interrupted** (the daemon stops halfway, or a provider's
+rollback fails after the files moved), Loom remembers it and holds new messages
+until it is finished, so no agent works on a half-rewound project. Run the same
+rewind again to finish it, restore its undo checkpoint, or give up on the
+conversation part with `--files-only`, which keeps each agent's conversation as
+it now stands. A rewind refused before any file moved holds nothing.
 
 ```sh
 loom rewind                 # the points you can go back to

@@ -744,6 +744,19 @@ program
  * that did both would be a command nobody could predict.
  */
 program
+  .command("recover-compaction")
+  .description("release unfinished compaction after confirming its native processes are stopped")
+  .requiredOption("--evidence <details>", "how you verified the native processes are stopped")
+  .action(async (opts: { evidence: string }) => {
+    try {
+      const client = await ensureDaemon();
+      const project = await currentProject(client);
+      await client.reconcileCompaction(project.id, opts.evidence);
+      console.log(pc.green("✓ compaction recovery released; you can send messages again"));
+    } catch (error) { console.error(pc.red(error instanceof Error ? error.message : String(error))); process.exitCode = 1; }
+  });
+
+program
   .command("rewind [checkpoint]")
   .description("put the working tree back to a checkpoint (no argument lists them)")
   .option("-y, --yes", "don't ask")

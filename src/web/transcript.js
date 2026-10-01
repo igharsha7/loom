@@ -9,7 +9,23 @@ import { orchGoalName } from './team.js';
 import { shortModel } from './permissions.js';
 
 
-  // ---- event rendering -----------------------------------------------------
+  // A resolution can be loaded before its question (pagination). Remember it
+// and fold every matching card rather than resurrecting an actionable request.
+export function settleQuestionCards(event, root){
+  var p = event.payload || {};
+  if (event.kind !== "status" || p.state !== "question_answered" || !p.requestId) return;
+  state.resolvedQuestions = state.resolvedQuestions || {};
+  state.resolvedQuestions[p.requestId] = p.answers || {};
+  Array.prototype.forEach.call((root || document).querySelectorAll("[data-nireq]"), function(card){
+    if (card.getAttribute("data-nireq") !== p.requestId) return;
+    card.classList.add("done");
+    Array.prototype.forEach.call(card.querySelectorAll("button,input"), function(el){ el.disabled = true; });
+    var done = card.querySelector(".nidone");
+    if (done) done.textContent = Object.keys(p.answers || {}).length ? "Answered" : "Cancelled";
+  });
+}
+
+// ---- event rendering -----------------------------------------------------
   // ---- thread presentation ------------------------------------------------
   // A reply reads like a document with a byline, not a chat bubble: who wrote
   // it (their mark, their name, the model), when, then the words at full
@@ -288,12 +304,14 @@ import { shortModel } from './permissions.js';
       var who = String(e.agentId || "agent");
       // A structured question the turn is waiting on: its own options, and the
       // answer goes back to that request rather than as a new message.
+      if (p.requestId && state.resolvedQuestions && Object.prototype.hasOwnProperty.call(state.resolvedQuestions, p.requestId))
+        return '<div class="nicard done"><div class="niq">' + esc(q) + '</div><div class="nidone">' + (Object.keys(state.resolvedQuestions[p.requestId]).length ? "Answered" : "Cancelled") + '</div></div>';
       if (p.requestId && p.responseMode !== "message" && Array.isArray(p.questions) && p.questions.length) {
         return '<div class="nicard" data-niask="' + esc(who) + '" data-nichat="' + esc(e.chat || "") + '" data-nireq="' + esc(p.requestId) + '">' +
           '<div class="nih">' + brandMark(kindOf(who)) + '<span class="niwho">' + esc(who) + "</span>" +
           '<span class="nitag">needs you</span></div>' +
           p.questions.map(function(qq){
-            return '<div class="niqb" data-niqid="' + esc(qq.id) + '">' + (qq.header ? '<div class="nitag">' + esc(qq.header) + "</div>" : "") +
+            return '<div class="niqb" data-niqid="' + esc(qq.id) + '"' + (qq.multiSelect ? ' data-nimulti="true"' : '') + '>' + (qq.header ? '<div class="nitag">' + esc(qq.header) + "</div>" : "") +
               '<div class="niq">' + esc(qq.question) + "</div>" +
               ((qq.options || []).length ? '<div class="niopts">' + qq.options.map(function(o){
                 return '<button class="nio" type="button" data-nipick="' + esc(o.label) + '" data-niqid="' + esc(qq.id) + '" title="' + esc(o.description || "") + '">' + esc(o.label) + "</button>";

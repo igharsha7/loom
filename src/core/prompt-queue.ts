@@ -44,6 +44,8 @@ export interface QueueItem {
   id: string;
   text: string;
   target: QueueTarget;
+  /** An inferred target follows the chat when its agent changes. */
+  followsChat?: true;
   /** The chat it was typed in — an agent's reply comes back there. */
   chat: string;
   plan?: boolean;
@@ -101,6 +103,7 @@ export interface QueueState {
 export interface QueueInput {
   text: string;
   target?: QueueTarget;
+  followsChat?: true;
   chat?: string;
   plan?: boolean;
   length?: "brief" | "detailed";
@@ -184,6 +187,7 @@ export class PromptQueue {
       text,
       target: input.target ?? { kind: "auto" },
       chat: input.chat ?? "main",
+      ...(input.followsChat ? { followsChat: true } : {}),
       ...(input.plan ? { plan: true } : {}),
       ...(input.length ? { length: input.length } : {}),
       source: input.source ?? "user",
@@ -202,7 +206,7 @@ export class PromptQueue {
     if (this.state.items.length >= MAX_QUEUE) throw new Error(`the queue is full (${MAX_QUEUE} prompts)`);
   }
 
-  edit(id: string, patch: { text?: string; target?: QueueTarget; plan?: boolean; when?: QueueCondition | null }): QueueItem {
+  edit(id: string, patch: { text?: string; target?: QueueTarget; plan?: boolean; when?: QueueCondition | null }, opts: { preserveFollowsChat?: true } = {}): QueueItem {
     const item = this.must(id);
     if (patch.text !== undefined) {
       const text = item.continuity ? patch.text : patch.text.trim();
@@ -210,7 +214,12 @@ export class PromptQueue {
       if (text.length > MAX_QUEUE_TEXT) throw new Error(`a queued prompt is at most ${MAX_QUEUE_TEXT} characters`);
       item.text = text;
     }
-    if (patch.target) item.target = patch.target;
+    if (patch.target) {
+      item.target = patch.target;
+      // A picker choice is explicit; only an internal chat move keeps inference.
+      if (opts.preserveFollowsChat || patch.target.kind === "auto") item.followsChat = true;
+      else delete item.followsChat;
+    }
     if (patch.plan !== undefined) {
       if (patch.plan) item.plan = true;
       else delete item.plan;

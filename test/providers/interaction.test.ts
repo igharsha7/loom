@@ -213,3 +213,36 @@ describe("claude · plan files", () => {
     await agent.stop();
   });
 });
+
+describe("approval and limit regressions", () => {
+  it("answers a Codex file-read approval through the broker (#23)", async () => {
+    const requests: ApprovalRequest[] = [];
+    setApprovalBroker(async req => { requests.push(req); return { behavior: "allow" }; });
+    const bin = fakeCodex({ script: [started, { ask: "item/fileRead/requestApproval", params: { path: "secret.txt" } }, ...finish] });
+    const { agent } = codex(bin, { permissions: "ask" });
+    await agent.send({ text: "read" });
+    expect(requests).toHaveLength(1);
+    expect(stdinOf(bin).some(m => (m.result as Record<string, unknown> | undefined)?.decision === "accept")).toBe(true);
+    await agent.stop();
+  });
+  it("preserves exhausted credits without rate windows (#24)", async () => {
+    const { agent, events } = codex(fakeCodex({ script: [started,
+      codexNotify("account/rateLimits/updated", { rateLimits: { rateLimitReachedType: "workspace_member_credits_depleted" } }), ...finish] }));
+    await agent.send({ text: "work" });
+    expect(of(events, "status").find(p => p.state === "usage_limits")).toMatchObject({ reached: "workspace_member_credits_depleted", windows: [] });
+    await agent.stop();
+  });
+});
+
+it.each([
+  { status: "rejected", rateLimitType: "five_hour" },
+  { status: "rejected" },
+  { status: "allowed", errorCode: "credits_required" },
+  { status: "rejected", overageDisabledReason: "out_of_credits" },
+])("normalizes sparse blocked Claude limit reports %# (#18)", async info => {
+  const { agent, events } = claude(fakeClaude({ script: [claudeInit,
+    { out: { type: "rate_limit_event", rate_limit_info: info, session_id: "$SESSION" } }, claudeResult()] }));
+  await agent.send({ text: "work" });
+  expect(of(events, "status").find(p => p.state === "usage_limits")).toMatchObject({ reached: expect.any(String) });
+  await agent.stop();
+});

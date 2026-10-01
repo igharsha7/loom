@@ -268,3 +268,29 @@ describe("optional semantic retrieval lifecycle", () => {
     await expect(briefings.prepareHandoff("a", null, "", [])).rejects.toThrow(/closed/);
   });
 });
+
+it("retries preserved retired handles after a stop rejection (audit #5)", async () => {
+  const runtime = new RuntimeAgents(), agent = new ControlledAgent();
+  agent.starting.resolve(); agent.stopping.resolve();
+  const stop = vi.spyOn(agent, "stop").mockRejectedValueOnce(new Error("containment failed")).mockResolvedValue();
+  runtime.install(agent, () => {});
+  await runtime.start(agent.id);
+  await expect(runtime.retire(agent.id)).rejects.toThrow("containment failed");
+  await runtime.retire(agent.id);
+  expect(stop).toHaveBeenCalledTimes(2);
+  await runtime.close();
+});
+
+it("stops every retired replacement while an earlier stop is still pending (audit #5)", async () => {
+  const runtime = new RuntimeAgents(), first = new ControlledAgent(), second = new ControlledAgent(), third = new ControlledAgent();
+  first.starting.resolve(); second.starting.resolve(); third.starting.resolve();
+  runtime.install(first, () => {}); await runtime.start(first.id);
+  runtime.install(second, () => {});
+  const startingSecond = expect(runtime.start(second.id)).rejects.toThrow(/replaced/);
+  runtime.install(third, () => {});
+  const startingThird = runtime.start(third.id);
+  first.stopping.resolve(); second.stopping.resolve();
+  await startingSecond; expect(await startingThird).toBe(third);
+  expect(first.stopCalls).toBe(1); expect(second.stopCalls).toBe(1);
+  third.stopping.resolve(); await runtime.close(); expect(third.stopCalls).toBe(1);
+});

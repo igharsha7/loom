@@ -17,6 +17,7 @@ export const providerOf = (kind: string): string | undefined => PROVIDER[kind];
 
 export class NativeUsage {
   private readonly contexts = new Map<string, AgentContextUsage>();
+  private readonly blocked = new Map<string, Set<string>>();
   private readonly limits = new Map<string, ProviderLimits>();
 
   /** Fold one adapter event in. Unrelated events are ignored. */
@@ -52,8 +53,15 @@ export class NativeUsage {
         const previous = this.limits.get(p.provider);
         const windows = new Map((previous?.windows ?? []).map(w => [w.id, w]));
         for (const w of p.windows as ProviderLimits["windows"]) if (w && typeof w.id === "string") windows.set(w.id, w);
+        const blocked = this.blocked.get(p.provider) ?? new Set<string>();
+        // Codex reached values are account reasons, not primary/secondary IDs.
+        // Its account snapshot without a reached reason supersedes the previous one.
+        if (p.provider === "codex") blocked.clear();
+        else for (const w of p.windows as ProviderLimits["windows"]) if (w.id !== p.reached) blocked.delete(w.id);
+        if (typeof p.reached === "string") blocked.add(p.reached);
+        this.blocked.set(p.provider, blocked);
         this.limits.set(p.provider, { provider: p.provider, windows: [...windows.values()],
-          reached: typeof p.reached === "string" ? p.reached : null, at });
+          reached: blocked.values().next().value ?? null, at });
         return;
       }
       default:

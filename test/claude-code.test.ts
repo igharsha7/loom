@@ -120,7 +120,8 @@ describe("claude-code · a normal turn", () => {
 
 describe("claude-code · what it did, not just what it said", () => {
   it("reports tool calls with a readable summary", async () => {
-    const { events } = await run([claudeInit, claudeTool("Bash", { command: "npm test" }), claudeText("green"), claudeResult()]);
+    const { events } = await run([claudeInit, claudeTool("Bash", { command: "npm test" }),
+      { out: { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu-Bash", content: "green" }] }, parent_tool_use_id: null, session_id: "$SESSION" } }, claudeText("green"), claudeResult()]);
     // Commands are one canonical kind across providers.
     expect(of(events, "tool_call")[0]).toMatchObject({ tool: "shell" });
     expect(String(of(events, "tool_call")[0]?.summary)).toContain("npm test");

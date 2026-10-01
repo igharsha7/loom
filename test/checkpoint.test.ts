@@ -15,6 +15,7 @@ import { describe, expect, it } from "vitest";
 
 import { capture, diffSince, find, forgetAll, list, prune, restore, restoreFile, STORE_LIMITS } from "../src/core/checkpoint.js";
 import { tmpDir } from "./helpers.js";
+import { turnSnapshot, diffSinceSnapshot } from "../src/core/worktree.js";
 
 const git = (dir: string, ...args: string[]): string => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
 
@@ -380,7 +381,7 @@ describe("Loom's own store (a project without git)", () => {
     const gitDir = repo();
     const gitCp = (await capture(gitDir, "x"))!;
     write(gitDir, "app.ts", "changed\n");
-    expect(await diffSince(gitDir, gitCp.id)).toBeNull();
+    expect((await diffSince(gitDir, gitCp.id))!.files.map(f => f.path)).toEqual(["app.ts"]);
   });
 
   it("skips a capture that would take in too much new content", async () => {
@@ -404,4 +405,185 @@ describe("Loom's own store (a project without git)", () => {
     expect(await forgetAll(dir)).toBe(1);
     expect(await list(dir)).toEqual([]);
   });
+});
+
+describe("checkpoint safety regressions", () => {
+  it("refuses deletion through a directory symlink (#1)", async () => {
+    const dir = repo(), outside = tmpDir("outside");
+    write(outside, "victim.txt", "keep me");
+    fs.symlinkSync(outside, path.join(dir, "escape"));
+    const cp = (await capture(dir, "symlink"))!;
+    await expect(restoreFile(dir, cp.id, "escape/victim.txt")).rejects.toThrow(/symlink/);
+    expect(read(outside, "victim.txt")).toBe("keep me");
+  });
+  it("refuses excluded single-file restores without losing the file (#2)", async () => {
+    for (const dir of [repo(), tmpDir("excluded")]) {
+      write(dir, ".env", "SECRET=keep");
+      const cp = (await capture(dir, "secret"))!;
+      await expect(restoreFile(dir, cp.id, ".env")).rejects.toThrow(/excluded/);
+      expect(read(dir, ".env")).toBe("SECRET=keep");
+    }
+  });
+  it("protects unignored and tracked Loom bookkeeping (#3)", async () => {
+    const dir = repo();
+    write(dir, ".gitignore", ".env\nnode_modules/\n");
+    git(dir, "add", "-f", ".loom/events.db"); git(dir, "commit", "-qm", "tracked bookkeeping");
+    const cp = (await capture(dir, "before"))!;
+    expect(git(dir, "ls-tree", "-r", "--name-only", cp.commit)).not.toContain(".loom/");
+    // An old checkpoint may still contain the journal; restore must protect it too.
+    git(dir, "update-ref", `refs/loom/checkpoints/${cp.id}`, git(dir, "rev-parse", "HEAD").trim());
+    write(dir, ".loom/events.db", "new journal"); write(dir, "app.ts", "changed");
+    await restore(dir, cp.id);
+    expect(read(dir, ".loom/events.db")).toBe("new journal");
+    await expect(restoreFile(dir, cp.id, ".loom/events.db")).rejects.toThrow(/inside/);
+  });
+  it("captures and restores a linked worktree (#19)", async () => {
+    const dir = repo(), linked = path.join(tmpDir("linked"), "work");
+    git(dir, "worktree", "add", "-qb", "linked", linked);
+    const cp = (await capture(linked, "linked"))!;
+    expect(cp).toBeTruthy(); write(linked, "app.ts", "changed");
+    await restore(linked, cp.id);
+    expect(read(linked, "app.ts")).toContain("3000");
+    git(dir, "worktree", "remove", "--force", linked);
+  });
+  it("attributes content changes to an already-dirty file (#25)", async () => {
+    const dir = repo(); write(dir, "app.ts", "before\n");
+    const cp = (await capture(dir, "dirty"))!;
+    write(dir, "app.ts", "after\n");
+    const diff = (await diffSince(dir, cp.id))!;
+    expect(diff.files.map(f => f.path)).toEqual(["app.ts"]);
+    expect(diff.patch).toContain("-before"); expect(diff.patch).toContain("+after");
+  });
+});
+
+ it("attributes already-dirty edits even without a checkpoint (#25)", async () => {
+   const dir = repo(); write(dir, "app.ts", "before\n");
+   const snapshot = await turnSnapshot(dir); write(dir, "app.ts", "after\n");
+   expect((await diffSinceSnapshot(dir, snapshot))!.files.map(f => f.path)).toEqual(["app.ts"]);
+ });
+
+describe("port audit checkpoint regressions", () => {
+  it("restores project-relative paths inside a repository subdirectory (#2)", async () => {
+    const root = repo(), dir = path.join(root, "nested");
+    write(dir, "app/file.txt", "before");
+    write(root, "outside.txt", "outside");
+    const cp = (await capture(dir, "nested"))!;
+    write(dir, "app/file.txt", "after");
+    await restoreFile(dir, cp.id, "app/file.txt");
+    expect(read(dir, "app/file.txt")).toBe("before");
+    write(dir, "app/file.txt", "after again");
+    await restore(dir, cp.id);
+    expect(read(dir, "app/file.txt")).toBe("before");
+    expect(read(root, "outside.txt")).toBe("outside");
+    expect(read(dir, "nested/app/file.txt")).toBeNull();
+  });
+  it("never overwrites newly ignored content or carries it into later captures (#3)", async () => {
+    for (const dir of [repo(), tmpDir("ignore-store")]) {
+      write(dir, "private.txt", "captured");
+      const cp = (await capture(dir, "before ignore"))!;
+      write(dir, ".gitignore", "private.txt\n.loom/\n");
+      write(dir, "private.txt", "current secret");
+      const later = (await capture(dir, "ignored now"))!;
+      const env = later.store === "loom" ? ["--git-dir", path.join(dir, ".loom/checkpoints.git")] : [];
+      expect(git(dir, ...env, "ls-tree", "-r", "--name-only", later.commit)).not.toContain("private.txt");
+      await restore(dir, cp.id);
+      expect(read(dir, "private.txt")).toBe("current secret");
+    }
+  });
+  it("preserves staged versions distinct from HEAD and the worktree (#4)", async () => {
+    const dir = repo(), cp = (await capture(dir, "before"))!;
+    write(dir, "app.ts", "staged version"); git(dir, "add", "app.ts");
+    write(dir, "app.ts", "working version");
+    const index = git(dir, "write-tree");
+    await restore(dir, cp.id);
+    expect(git(dir, "write-tree")).toBe(index);
+    await restoreFile(dir, cp.id, "app.ts");
+    expect(git(dir, "show", ":app.ts")).toBe("staged version");
+  });
+  it("preserves whitespace in the first changed filename (#23)", async () => {
+    const dir = repo(); write(dir, " leading.txt", "before");
+    const cp = (await capture(dir, "spaces"))!;
+    write(dir, " leading.txt", "after");
+    expect((await restore(dir, cp.id)).changed).toContain(" leading.txt");
+    expect(read(dir, " leading.txt")).toBe("before");
+  });
+  it("enforces the store cap while computing a turn diff (#21)", async () => {
+    const dir = tmpDir("diff-cap"), cp = (await capture(dir, "empty"))!;
+    const old = STORE_LIMITS.bytes; STORE_LIMITS.bytes = 10;
+    try { write(dir, "big.txt", "x".repeat(11)); expect(await diffSince(dir, cp.id)).toBeNull(); }
+    finally { STORE_LIMITS.bytes = old; }
+    expect(git(dir, "--git-dir", path.join(dir, ".loom/checkpoints.git"), "count-objects", "-v")).toContain("count: 2");
+  });
+  it("bounds pre-turn hashing of oversized dirty files (#21)", async () => {
+    const dir = repo();
+    const fd = fs.openSync(path.join(dir, "huge.bin"), "w");
+    fs.ftruncateSync(fd, 257 * 1024 * 1024); fs.closeSync(fd);
+    expect(await turnSnapshot(dir)).toBe("");
+  });
+});
+
+vi.mock("node:child_process", { spy: true });
+import * as childProcess from "node:child_process";
+import { vi } from "vitest";
+
+it.each(["diff", "ls-tree"])("fails restore before touching files when git %s fails (#5)", async command => {
+  const dir = repo(), cp = (await capture(dir, "before"))!;
+  write(dir, "app.ts", "keep this");
+  const exec = (await vi.importActual<typeof import("node:child_process")>("node:child_process")).execFile;
+  const spy = vi.spyOn(childProcess, "execFile").mockImplementation(((...args: unknown[]) => {
+    const argv = args[1] as string[];
+    if (argv[0] === command && (command !== "diff" || argv.includes("-z"))) {
+      (args[3] as Function)(new Error("injected git failure"), "", "injected git failure");
+      return {};
+    }
+    return Reflect.apply(exec, childProcess, args);
+  }) as typeof childProcess.execFile);
+  try {
+    await expect(command === "diff" ? restore(dir, cp.id) : restoreFile(dir, cp.id, "app.ts")).rejects.toThrow("injected git failure");
+    expect(read(dir, "app.ts")).toBe("keep this");
+  } finally { spy.mockRestore(); }
+});
+
+it("returns project-relative turn paths inside a parent repository (audit #13)", async () => {
+  const root = repo(), dir = path.join(root, "apps", "web");
+  write(dir, "file.ts", "before\n");
+  git(root, "add", "-A"); git(root, "commit", "-qm", "nested");
+  const cp = (await capture(dir, "nested"))!;
+  write(dir, "file.ts", "after\n");
+  const diff = (await diffSince(dir, cp.id))!;
+  expect(diff.files.map(f => f.path)).toEqual(["file.ts"]);
+  await restoreFile(dir, cp.id, diff.files[0]!.path);
+  expect(read(dir, "file.ts")).toBe("before\n");
+});
+
+it("prepares an undo point without pruning the target (audit #2)", async () => {
+  const dir = repo(), cp = (await capture(dir, "oldest"))!;
+  // Fill the retention window; the next ordinary capture would prune cp.
+  for (let i = 1; i < 60; i++) await capture(dir, `point ${i}`);
+  const { prepareRestore } = await import("../src/core/checkpoint.js");
+  const prepared = await prepareRestore(dir, cp.id);
+  expect(await find(dir, cp.id)).not.toBeNull();
+  await restore(dir, cp.id, prepared);
+});
+
+it("diffs ordinary git repos above the Loom-store limits (#8)", async () => {
+  const dir = repo(), cp = (await capture(dir, "before"))!;
+  const oldFiles = STORE_LIMITS.files, oldBytes = STORE_LIMITS.bytes;
+  STORE_LIMITS.files = 1; STORE_LIMITS.bytes = 1;
+  try {
+    write(dir, "app.ts", "export const port = 9000;\n");
+    expect(await diffSince(dir, cp.id)).toMatchObject({ files: [{ path: "app.ts" }], added: 1, removed: 1 });
+  } finally { STORE_LIMITS.files = oldFiles; STORE_LIMITS.bytes = oldBytes; }
+});
+
+it("hashes and diffs repo-relative porcelain paths from a project subdirectory (#10)", async () => {
+  const dir = repo(), sub = path.join(dir, "nested");
+  write(dir, "nested/code.txt", "one\n"); git(dir, "add", "nested/code.txt"); git(dir, "commit", "-qm", "nested");
+  write(dir, "nested/code.txt", "two\n");
+  const before = await turnSnapshot(sub);
+  expect(JSON.parse(before).loomTurnTree["nested/code.txt"].hash).not.toBe("missing");
+  write(dir, "nested/code.txt", "three\n");
+  const diff = await diffSinceSnapshot(sub, before);
+  expect(diff?.files).toEqual([{ status: " M", path: "nested/code.txt" }]);
+  expect(diff?.patch).toContain("+three");
 });

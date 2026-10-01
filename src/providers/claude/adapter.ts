@@ -21,6 +21,7 @@
  * process group, and stopping it proves every tool it started is gone.
  */
 
+import { isDeepStrictEqual } from "node:util";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -56,7 +57,7 @@ export interface ClaudeAdapterOptions {
 }
 
 export interface ClaudeHistory {
-  messages(sessionId: string, dir: string): Promise<Array<{ type: string; uuid: string }>>;
+  messages(sessionId: string, dir: string): Promise<Array<{ type: string; uuid: string; parent_tool_use_id?: string | null; message?: unknown }>>;
   fork(sessionId: string, dir: string, upToMessageId: string): Promise<{ sessionId: string }>;
 }
 
@@ -172,7 +173,7 @@ class PromptQueue implements AsyncIterable<SDKUserMessage> {
   }
 }
 
-interface Tool { name: string; input: Record<string, unknown>; itemType: CanonicalItemType; declined?: boolean }
+interface Tool { name: string; input: Record<string, unknown>; itemType: CanonicalItemType; turnId?: TurnId; declined?: boolean }
 
 interface Turn {
   id: TurnId;
@@ -268,6 +269,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
         const proc = spawnHarness(spawnOptions.command, spawnOptions.args, { cwd: spawnOptions.cwd ?? input.cwd,
           env: spawnOptions.env as NodeJS.ProcessEnv });
         session.proc = proc;
+        session.info.processGroupId = proc.child.pid;
         guardNativeOutput(proc.child, error => {
           session.failure = error.message;
           if (!session.turn) this.emit(input.threadId, "runtime.error", { message: error.message, class: "transport_error" });
@@ -297,7 +299,14 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
       session.stopping = true;
       prompts.close();
       try { q.close(); } catch { /* already closed */ }
-      if (session.proc) await stopHarness(session.proc, 0).catch(() => {});
+      if (session.proc) {
+        try { await stopHarness(session.proc, 0); }
+        catch (containment) {
+          this.sessions.set(input.threadId, session);
+          this.containmentFailed(session, containment);
+          throw containment;
+        }
+      }
       const stderr = session.proc?.stderr().trim() ?? "";
       if (resume && MISSING_SESSION.test(`${(error as Error).message}\n${stderr}`)) throw fail("session_missing", `claude session ${resume} could not be resumed`, error);
       const failure = fail("transport", `claude could not start: ${(error as Error).message}`.slice(0, 500), error);
@@ -420,6 +429,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     const s = this.sessions.get(threadId);
     if (!s || s.stopping) throw new ProviderError("not_found", operation, `no live claude session for chat "${threadId}"`,
       { provider: this.provider, instanceId: this.instanceId, threadId, mayHaveStarted: false });
+    if (s.failure?.includes("quiescence unknown")) throw new ProviderError("validation", operation, s.failure);
     return s;
   }
 
@@ -430,10 +440,10 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     if (s.turn) throw new ProviderError("validation", "sendTurn", "a claude turn is already running in this chat",
       { provider: this.provider, instanceId: this.instanceId, threadId: input.threadId, mayHaveStarted: false });
     const model = input.modelSelection?.model;
-    if (model && model !== s.info.model) {
-      try { await s.query.setModel(model); }
+    if (input.modelSelection?.model !== undefined && (model ?? undefined) !== s.info.model) {
+      try { await s.query.setModel(model ?? undefined); }
       catch (error) { throw refuse(`claude could not switch to model ${model}: ${(error as Error).message}`, error); }
-      s.info = { ...s.info, model };
+      s.info = { ...s.info, model: model ?? undefined };
     }
     // Plan mode is Claude's own permission mode, switched per turn (t3code).
     const wantPlan = input.interactionMode === "plan";
@@ -483,6 +493,13 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
    * session file is left as it was. (t3code's rollbackThread, which finds the
    * same boundary through its recorded turn-start message ids.)
    */
+  async validateRollback(threadId: ThreadId, beforeTurnId: TurnId): Promise<void> {
+    const s = this.session(threadId, "rollbackThread");
+    const messages = await (this.options.history ?? sdkHistory).messages(s.sessionId, s.info.cwd);
+    if (!messages.some(m => m.uuid === beforeTurnId))
+      throw new ProviderError("request", "rollbackThread", "the turn isn't in claude's session history (compaction replaces it), so the conversation can't be put back to before it");
+  }
+
   async rollbackThread(threadId: ThreadId, beforeTurnId: TurnId): Promise<RollbackResult> {
     const s = this.session(threadId, "rollbackThread");
     const fail = (message: string, cause?: unknown) => new ProviderError("request", "rollbackThread", message,
@@ -490,7 +507,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     if (s.turn) throw new ProviderError("validation", "rollbackThread", "a claude turn is running in this chat",
       { provider: this.provider, instanceId: this.instanceId, threadId });
     const history = this.options.history ?? sdkHistory;
-    let messages: Array<{ type: string; uuid: string }>;
+    let messages: Array<{ type: string; uuid: string; parent_tool_use_id?: string | null; message?: unknown }>;
     try { messages = await history.messages(s.sessionId, s.info.cwd); }
     catch (error) { throw fail(`claude's session history could not be read: ${(error as Error).message}`, error); }
     const index = messages.findIndex(m => m.uuid === beforeTurnId);
@@ -501,8 +518,23 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
       try { resumeCursor = (await history.fork(s.sessionId, s.info.cwd, keepThrough)).sessionId; }
       catch (error) { throw fail(`claude could not fork its session: ${(error as Error).message}`, error); }
     }
+    const turnIds: Record<string, string> = {};
+    if (resumeCursor) {
+      const conversation = (m: typeof messages[number]) => m.type === "user" || m.type === "assistant";
+      const retained = messages.slice(0, index).filter(conversation);
+      const forked = (await history.messages(resumeCursor, s.info.cwd)).filter(conversation);
+      const offset = forked.length - retained.length;
+      if (offset < 0 || retained.some((m, i) => m.message === undefined || m.type !== forked[i + offset]?.type || !isDeepStrictEqual(m.message, forked[i + offset]?.message)))
+        throw fail("claude's fork does not preserve retained conversation boundaries");
+      retained.forEach((m, i) => {
+        if (m.type !== "user" || m.parent_tool_use_id) return;
+        const content = m.message && typeof m.message === "object" && "content" in m.message ? m.message.content : undefined;
+        if (typeof content === "string" || Array.isArray(content) && content.some(part => part && typeof part === "object" && part.type !== "tool_result"))
+          turnIds[m.uuid] = forked[i + offset]!.uuid;
+      });
+    }
     await this.stopSession(threadId);
-    return { resumeCursor, live: false };
+    return { resumeCursor, live: false, turnIds };
   }
 
   async stopSession(threadId: ThreadId): Promise<void> {
@@ -518,10 +550,20 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     try {
       if (s.proc) await stopHarness(s.proc, 0);
       await Promise.race([s.done, new Promise(resolve => setTimeout(resolve, 3000).unref())]);
-    } finally {
-      if (s.failure) this.closed(s, s.failure, "error", "aborted");
-      else this.closed(s, "session stopped", "graceful", "interrupted");
+    } catch (error) {
+      this.containmentFailed(s, error);
+      throw error;
     }
+    if (s.failure) this.closed(s, s.failure, "error", "aborted");
+    else this.closed(s, "session stopped", "graceful", "interrupted");
+  }
+
+  private containmentFailed(s: Session, error: unknown): void {
+    s.stopping = false;
+    s.failure = `${error instanceof Error ? error.message : String(error)}; quiescence unknown`;
+    s.info = { ...s.info, status: "error", updatedAt: Date.now() };
+    if (s.turn) { this.emit(s.info.threadId, "turn.aborted", { reason: s.failure }, { turnId: s.turn.id }); s.turn = null; }
+    this.emit(s.info.threadId, "runtime.error", { message: s.failure, class: "transport_error" });
   }
 
   async stopAll(): Promise<void> {
@@ -564,7 +606,10 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     for (const id of [...s.inputs.keys()]) this.resolveInput(s, id, {});
     s.prompts.close();
     try { s.query.close(); } catch { /* already closed */ }
-    if (s.proc) await stopHarness(s.proc, 0).catch(() => {});
+    if (s.proc) {
+      try { await stopHarness(s.proc, 0); }
+      catch (error) { this.containmentFailed(s, error); return; }
+    }
     const stderr = s.proc?.stderr().trim() ?? "";
     const reason = `claude exited${failure ? `: ${failure}`.slice(0, 300) : ""}${stderr ? ` — ${stderr.slice(-300)}` : ""}`;
     this.closed(s, reason, failure ? "error" : "graceful", "aborted", stderr);
@@ -638,7 +683,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
             // under ~/.claude/plans) is not a change to the project.
             const target = toolInput.file_path ?? toolInput.notebook_path;
             if (itemType === "file_change" && typeof target === "string" && outside(s.info.cwd, target)) itemType = "dynamic_tool_call";
-            const tool: Tool = { name, input: toolInput, itemType };
+            const tool: Tool = { name, input: toolInput, itemType, ...(turnId ? { turnId } : {}) };
             s.tools.set(block.id, tool);
             this.emit(threadId, "item.started", { itemType: tool.itemType, status: "inProgress", ...describeTool(tool),
               ...(main ? {} : { parentToolUseId: msg.parent_tool_use_id! }) }, { ...at, itemId: block.id });
@@ -657,7 +702,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
           const output = toolResultText(block.content);
           const status = tool.declined ? "declined" : block.is_error === true ? "failed" : "completed";
           this.emit(threadId, "item.completed", { itemType: tool.itemType, status, ...describeTool(tool, output),
-            ...(msg.parent_tool_use_id ? { parentToolUseId: msg.parent_tool_use_id } : {}) }, { ...at, itemId: block.tool_use_id });
+            ...(msg.parent_tool_use_id ? { parentToolUseId: msg.parent_tool_use_id } : {}) }, { ...(tool.turnId ? { turnId: tool.turnId } : at), itemId: block.tool_use_id });
         }
         return;
       }
@@ -669,8 +714,11 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
         if (!turn) return; // a result for no turn of ours (a background task)
         s.turn = null;
         // A tool with no result by the end of the turn finished without saying how.
-        for (const [id, tool] of s.tools) this.emit(threadId, "item.completed", { itemType: tool.itemType, ...describeTool(tool) }, { turnId: turn.id, itemId: id });
-        s.tools.clear();
+        for (const [id, tool] of s.tools) {
+          if (tool.itemType === "command_execution") continue; // Only a tool result proves a command finished.
+          this.emit(threadId, "item.completed", { itemType: tool.itemType, ...describeTool(tool) }, { turnId: turn.id, itemId: id });
+          s.tools.delete(id);
+        }
         delete s.info.activeTurnId;
         s.info = { ...s.info, status: "ready", updatedAt: Date.now() };
         const errors = msg.subtype === "success" ? [] : msg.errors ?? [];
@@ -692,12 +740,15 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
       case "rate_limit_event": {
         const info = msg.rate_limit_info;
         // Overage the account has provisioned keeps the turn running.
-        const blocked = info.status === "rejected" && !(info.overageStatus === "allowed" || info.overageStatus === "allowed_warning"
+        const credits = info.errorCode === "credits_required" || info.overageDisabledReason === "out_of_credits" && (info.status === "rejected" || info.overageStatus === "rejected");
+        const blocked = credits || info.status === "rejected" && !(info.overageStatus === "allowed" || info.overageStatus === "allowed_warning"
           || info.isUsingOverage === true || info.overageInUse === true);
-        if (typeof info.utilization === "number" && info.rateLimitType) {
-          this.emit(threadId, "account.rate-limits.updated", { windows: [{ id: info.rateLimitType, usedPercent: Math.round(info.utilization * 1000) / 10,
-            ...(WINDOW_MINUTES[info.rateLimitType] ? { windowMinutes: WINDOW_MINUTES[info.rateLimitType] } : {}),
-            ...(typeof info.resetsAt === "number" ? { resetsAt: info.resetsAt * 1000 } : {}) }], ...(blocked ? { reached: info.rateLimitType } : {}) }, at);
+        if (blocked || typeof info.utilization === "number" || info.rateLimitType) {
+          const id = credits ? "credits" : info.rateLimitType ?? "usage";
+          this.emit(threadId, "account.rate-limits.updated", { windows: [{ id,
+            usedPercent: typeof info.utilization === "number" ? Math.round(info.utilization * 1000) / 10 : blocked ? 100 : 0,
+            ...(WINDOW_MINUTES[id] ? { windowMinutes: WINDOW_MINUTES[id] } : {}),
+            ...(typeof info.resetsAt === "number" ? { resetsAt: info.resetsAt * 1000 } : {}) }], ...(blocked ? { reached: id } : {}) }, at);
         }
         // A rejected window parks the turn inside the CLI: no result arrives
         // until it resets, so say why the turn is waiting.

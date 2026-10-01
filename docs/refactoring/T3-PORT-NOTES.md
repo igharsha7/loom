@@ -254,3 +254,59 @@ test fix (#212). These are the changes that touch the port:
   repository; this goes beyond it. A repository with no commit yet also uses
   Loom's store, and the repo itself is untouched. Checkpoints are listed from both
   stores, and a restore's undo point goes to the store of the checkpoint it undoes.
+
+## Decisions (Phase 5)
+
+- **2026-09-30.** No new switching machinery. Brain continuity already keys a
+  binding per (chat, agent) and builds what the target session lacks; warm
+  sessions keyed the same way make "park" free. Phase 5 added the switch
+  action, sizing and the usage-limit offer, and made rewinds and Brain agree.
+- **2026-09-30.** Packet budget is 10% of the target's reported context window
+  (6k–40k). The window comes from the agent's last `context_usage` (any chat),
+  so it follows the agent's model rather than a specific session. Current usage
+  isn't subtracted: a switch usually lands in a new or parked session whose usage
+  that reading doesn't describe.
+- **2026-09-30, revised 2026-10-01.** A rewind's dropped turns stay in the log
+  and are excluded at query time. The `rewound` event records
+  `dropped: { from, turns, keep }`: the range starts at the turn's `before_turn`
+  checkpoint (not its message, which a queued request logs early, before the
+  previous turn's answer), every later turn's message is named in `turns`, and
+  requests still queued at rewind time are kept. One helper (`droppedHistory`)
+  serves the SQL and in-memory checks. After any rollback the binding moves to a
+  new epoch, so the next packet is a reconstruction: a delta would trust
+  deliveries the rollback may have removed.
+- **2026-09-30.** The usage-limit offer suggests only agents on another provider
+  whose own limit isn't reached. Another account on the same provider comes with
+  Phase 6 instances. The offer doesn't switch by itself, because switching
+  interrupts a turn and moves the chat, which is the person's call.
+
+## Decisions (audit, 2026-09-30 to 2026-10-01)
+
+- **The audit loop.** Sol (GPT 6.1 Sol through the Codex plugin) audits and fixes;
+  Claude checks findings against the code, reviews the diffs and runs the suite
+  (Sol's sandbox often can't). Sol designs its own fixes. Later rounds found
+  mostly bugs in earlier fixes, so the loop stopped after round 8 with a commit;
+  further audits go area by area.
+- **Settlement is the boundary for everything after a turn.** Brain's lease, the
+  turn diff, auto-commit and route advancement all wait until the harness says
+  the turn is done and no command is still running. A command with no result is
+  not settled, even when Claude's SDK sends its turn result.
+- **Uncertain submission is not failure.** If a turn may have reached the
+  harness (a lost acknowledgement, Stop mid-submission), Loom keeps ownership and
+  records the uncertainty durably, rather than releasing the lease and letting
+  another provider write.
+- **Recovery journals, with ordinary ways out.** An interrupted rewind
+  (`rewind-pending.json`) and an unfinished manual compaction
+  (`compaction-pending.json`) hold dispatch, because continuing on a half-rewound
+  tree or mid-compaction session is worse than waiting. Every hold has a normal
+  exit: retry, undo or `--files-only` for a rewind; Stop, `loom interrupt`,
+  shutdown or `loom recover-compaction` for a compaction. A rewind refused before
+  files move writes no journal. The UI for these is Phase 7.
+- **Checkpoints never touch Loom's own state or the user's index.** `.loom` and
+  `.git` are excluded regardless of ignore rules (including from older
+  checkpoints that captured them), restore works path by path from the captured
+  trees with a temporary index, and parent symlinks are refused.
+- **Event routing stays out of payloads.** Which chat a parked session's event
+  belongs to is carried beside the event (a WeakMap), not in its persisted
+  payload.
+

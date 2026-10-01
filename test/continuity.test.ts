@@ -182,8 +182,9 @@ describe("Brain cleanup regressions", () => {
     vi.spyOn(brain, "submit").mockImplementation(async (prepared, signal) => {
       if (!injected) {
         injected = true;
-        // A large reviewed item changes protected state after preparation.
-        brain.putItem({ id: "new-governing", revision: 1, conversationId: "main", kind: "instruction", text: "Preserve this constraint. ".repeat(1200),
+        // A large reviewed item (past even the largest packet budget) changes
+        // protected state after preparation.
+        brain.putItem({ id: "new-governing", revision: 1, conversationId: "main", kind: "instruction", text: "Preserve this constraint. ".repeat(6000),
           origin: "user", status: "accepted", sources: [brain.store.source(brain.store.requestEvent("reassemble")!, "project")], supersedes: null });
       }
       return original(prepared, signal);
@@ -332,6 +333,7 @@ describe("Brain cleanup regressions", () => {
     const tags = { loomRunId: turn.runId, loomBindingId: turn.bindingId, loomSessionEpoch: turn.sessionEpoch };
     brain.ingest(log.append({ kind: "status", agentId: "claude", payload: { ...tags, state: "turn_started", session: "native" } }));
     brain.ingest(log.append({ kind: "run_complete", agentId: "claude", payload: tags }));
+    brain.settled(turn.runId);
     const next = await brain.prepare(request(brain, "unrelated query"), "codex", dir, {});
     expect(next.packet.mode).toBe("delta");
     expect(next.packet.evidence.some(e => e.source.eventId === missed.id)).toBe(true);
@@ -458,6 +460,7 @@ describe("usage-aware switching and validation fixes", () => {
     const tags = { loomRunId: turn.runId, loomBindingId: turn.bindingId, loomSessionEpoch: turn.sessionEpoch };
     brain.ingest(log.append({ kind: "status", agentId: agent, payload: { ...tags, state: "turn_started", session } }));
     brain.ingest(log.append({ kind: "run_complete", agentId: agent, payload: tags }));
+    brain.settled(turn.runId);
   };
   it("a return delta covers every observation since its basis, not a recent window", async () => {
     const { brain, log, dir } = await setup();
@@ -610,4 +613,64 @@ describe("usage-aware switching and validation fixes", () => {
     await waitUntil(() => brain.store.receipts("again").at(-1)?.execution === "complete");
     expect(calls(bin)).toHaveLength(1);
   });
+});
+
+describe("settlement and idle compaction regressions", () => {
+  it("holds the writer lease after native completion until command settlement (#4)", async () => {
+    const { brain, log, dir } = await setup();
+    const turn = await brain.submit(await brain.prepare(request(brain), "codex", dir, {}));
+    const tags = { loomRunId: turn.runId, loomBindingId: turn.bindingId, loomSessionEpoch: turn.sessionEpoch };
+    brain.ingest(log.append({ kind: "run_complete", agentId: "claude", payload: tags }));
+    expect(brain.store.activeReceipts()).toHaveLength(1);
+    brain.settled(turn.runId, new NativeQuiescenceUnknown("command still running"));
+    expect(brain.store.receipts().at(-1)!.execution).toBe("unknown");
+    expect(brain.store.activeReceipts()).toHaveLength(1);
+  });
+  it("reconstructs after compaction outside a tagged run (#9)", async () => {
+    const { brain, log, dir } = await setup();
+    const turn = await brain.submit(await brain.prepare(request(brain, "Remember BLUE"), "codex", dir, {}));
+    const tags = { loomRunId: turn.runId, loomBindingId: turn.bindingId, loomSessionEpoch: turn.sessionEpoch };
+    brain.ingest(log.append({ kind: "status", agentId: "claude", payload: { ...tags, state: "turn_started", session: "native" } }));
+    brain.ingest(log.append({ kind: "run_complete", agentId: "claude", payload: tags })); brain.settled(turn.runId);
+    brain.ingest(log.append({ kind: "status", agentId: "claude", payload: { state: "native_compacted", session: "native" } }));
+    const next = await brain.prepare(request(brain), "codex", dir, {});
+    expect(next.packet.mode).toBe("reconstruction"); expect(next.rendered.text).toContain("Remember BLUE");
+  });
+});
+
+it("keeps an accepted unknown native outcome as an active writer (#1)", async () => {
+  const { brain, log, dir } = await setup();
+  const prepared = await brain.prepare(request(brain), "codex", dir, {}), turn = await brain.submit(prepared);
+  brain.ingest(log.append({ kind: "status", agentId: "claude", payload: { state: "native_turn_accepted", loomRunId: turn.runId, loomBindingId: turn.bindingId, loomSessionEpoch: turn.sessionEpoch } }));
+  brain.settled(turn.runId, new NativeQuiescenceUnknown("lost turn/start acknowledgement"));
+  expect(brain.store.activeReceipts()).toHaveLength(1);
+  await expect(brain.prepare(request(brain), "claude-code", dir, {})).rejects.toMatchObject({ code: "recovery_required" });
+});
+
+it("loads dropped ranges once for all omitted sources in a preparation (#22)", async () => {
+  const { brain, log, dir } = await setup();
+  for (let n = 0; n < 60; n++) log.append({ kind: "message", agentId: "other", payload: { text: `observation ${n} ` + "detail ".repeat(300) } });
+  const first = await brain.prepare({ ...request(brain), targetAddedTokens: 6000 }, "codex", dir, {});
+  const turn = await brain.submit(first);
+  brain.ingest(log.append({ kind: "status", agentId: "claude", payload: { state: "turn_started", session: "native", loomRunId: turn.runId, loomBindingId: turn.bindingId, loomSessionEpoch: turn.sessionEpoch } }));
+  brain.ingest(log.append({ kind: "run_complete", agentId: "claude", payload: { loomRunId: turn.runId, loomBindingId: turn.bindingId, loomSessionEpoch: turn.sessionEpoch } }));
+  brain.settled(turn.runId);
+  const markers = Array.from({ length: 100 }, () => log.append({ kind: "checkpoint", payload: { reason: "rewound", chat: "main", dropped: { from: 99999999 } } }).id);
+  const events = vi.spyOn(brain.store, "event");
+  const ranges = vi.spyOn(brain.store, "dropped"), individual = vi.spyOn(brain.store, "isDropped");
+  try {
+    await brain.prepare(request(brain, "next"), "codex", dir, {});
+    expect(individual).not.toHaveBeenCalled(); expect(ranges.mock.calls.length).toBeLessThan(10);
+    expect(events.mock.calls.some(([id]) => markers.includes(id))).toBe(false);
+  } finally { ranges.mockRestore(); individual.mockRestore(); events.mockRestore(); }
+});
+
+it("queries protected sources and observations after more than 1000 rewinds (audit #11)", async () => {
+  const { log, brain } = await setup();
+  const kept = say(log, "retained");
+  const dropped = log.append({ kind: "message", agentId: "claude", payload: { text: "discard" } });
+  for (let i = 0; i < 1100; i++) log.append({ kind: "checkpoint", payload: { reason: "rewound", chat: "main", dropped: { from: dropped.id, keep: [kept.id] } } });
+  expect(brain.store.protectedEvents("main", log.lastId()).map(e => e.id)).toEqual([kept.id]);
+  expect(brain.store.observations("main", 0, log.lastId(), 10)).toEqual([]);
+  expect(brain.store.countObservations("main", 0, log.lastId())).toBe(0);
 });

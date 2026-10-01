@@ -22,7 +22,7 @@
 
 import path from "node:path";
 import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
-import { AdapterBase, ADAPTER_CAPABILITIES, cliAvailable, cliOutput, firstLine, frameBriefing, type AgentCheck } from "../adapters/base.js";
+import { AdapterBase, ADAPTER_CAPABILITIES, cliAvailable, cliOutput, firstLine, frameBriefing, withNativeChat, type AgentCheck } from "../adapters/base.js";
 import { hasApprovalBroker } from "../core/approvals.js";
 import { NativeDispatchRejected, NativeQuiescenceUnknown, NativeSessionMissing } from "../core/continuity/contracts.js";
 import { permissionFor } from "../core/permissions.js";
@@ -31,7 +31,7 @@ import type { ProviderAdapter } from "./adapter.js";
 import { ApprovalBridge } from "./approvals.js";
 import { ClaudeProviderAdapter, claudeBin, type ClaudeHistory } from "./claude/adapter.js";
 import { CodexProviderAdapter, codexBin } from "./codex/adapter.js";
-import type { ProviderKind, ProviderRuntimeEvent, ThreadId, TurnId } from "./contracts.js";
+import type { ProviderKind, ProviderRuntimeEvent, ThreadId, TurnId, ProviderSession } from "./contracts.js";
 import { runtimeModeFor } from "./contracts.js";
 import { FileSessionDirectory } from "./directory.js";
 import { isProviderError } from "./errors.js";
@@ -140,6 +140,9 @@ export class ProviderAgent extends AdapterBase {
   private readonly ingestion: RuntimeIngestion;
   private current: CurrentTurn | null = null;
   private settled: Promise<void> | null = null;
+  private beforeCompact: ((session: ProviderSession) => void) | undefined;
+  private compactingChat: string | undefined;
+  private compaction: { chat: string; interrupted?: boolean; resolve: () => void; reject: (error: Error) => void } | null = null;
   /** The MCP servers each chat's live session was started with. */
   private readonly sessionMcp = new Map<ThreadId, string>();
   private mcp: SendInput["mcp"];
@@ -150,7 +153,7 @@ export class ProviderAgent extends AdapterBase {
     super(id, provider, projectDir);
     this.options = options as AgentOptions;
     this.ingestion = new RuntimeIngestion({
-      append: event => this.emit({ kind: event.kind, payload: event.payload }),
+      append: event => this.emit(withNativeChat({ kind: event.kind, payload: event.payload }, event.chat)),
       live: delta => { for (const cb of this.liveListeners) { try { cb(delta); } catch { /* a viewer's problem */ } } },
       liveItem: item => { for (const cb of this.itemListeners) { try { cb(item); } catch { /* a viewer's problem */ } } },
       artifactDir: () => this.projectDir,
@@ -181,14 +184,35 @@ export class ProviderAgent extends AdapterBase {
    * compacts on its `/compact` command, sent as a turn (t3code's
    * `compaction: { type: "slash-command" }`).
    */
-  async compact(chat: ThreadId = MAIN_CHAT): Promise<void> {
-    if (this.provider === "claude-code") return this.send({ text: "/compact", chat });
+  async compact(chat: ThreadId = MAIN_CHAT, beforeSubmit?: (session: ProviderSession) => void): Promise<void> {
+    if (this.provider === "claude-code") {
+      this.beforeCompact = beforeSubmit;
+      try { await this.send({ text: "/compact", chat }); } finally { this.beforeCompact = undefined; }
+      return;
+    }
     if (this._busy) throw new Error(`${this.provider} agent "${this.id}" is busy`);
-    const { service } = await this.attach();
-    await service.ensureSession({ threadId: chat, instanceId: this.id, cwd: this.projectDir, runtimeMode: this.runtimeMode(),
-      ...(this.options.model ? { model: this.options.model } : {}), onMissingSession: "fresh" });
-    await service.compact(chat, this.id);
+    this._busy = true;
+    let requested = false;
+    this.compactingChat = chat;
+    const completed = new Promise<void>((resolve, reject) => { this.compaction = { chat, resolve, reject }; });
+    void completed.catch(() => {});
+    try {
+      const { service } = await this.attach();
+      const ensured = await service.ensureSession({ threadId: chat, instanceId: this.id, cwd: this.projectDir, runtimeMode: this.runtimeMode(),
+        model: this.options.model || null, onMissingSession: "fresh" });
+      if (this.compaction?.interrupted) throw new NativeDispatchRejected("interrupted before compaction started");
+      beforeSubmit?.(ensured.session);
+      requested = true;
+      await service.compact(chat, this.id);
+      await completed;
+      service.directory.touch(chat, this.id, Date.now());
+    } catch (error) {
+      if (!requested) throw new NativeDispatchRejected(error instanceof Error ? error.message : String(error));
+      throw this.dispatchError(error, false);
+    } finally { this.compaction = null; this.compactingChat = undefined; this._busy = false; }
   }
+
+  get workspaceDir(): string { return this.projectDir; }
 
   private get bin(): string | null {
     return this.provider === "codex" ? codexBin(this.options.bin) : claudeBin(this.options.bin);
@@ -251,7 +275,7 @@ export class ProviderAgent extends AdapterBase {
         mcpServers: () => Object.fromEntries(mcpServers().map(s => [s.key, claudeMcpServer(s.entry)])), canAsk: hasApprovalBroker });
     providers.service.register(adapter);
     providers.owners.set(this.id, this);
-    providers.busy.set(this.id, () => this.current?.chat);
+    providers.busy.set(this.id, () => this.current?.chat ?? this.compactingChat);
     this.unsubscribe = providers.service.onEvent(event => { if (event.instanceId === this.id) this.observe(event); });
     this.providers = providers;
     this.adapter = adapter;
@@ -279,7 +303,12 @@ export class ProviderAgent extends AdapterBase {
   }
 
   private observe(event: ProviderRuntimeEvent): void {
-    this.ingestion.ingest(event);
+    if (this.compaction?.chat === event.threadId) {
+      if (event.type === "thread.state.changed" && event.payload.state === "compacted") this.compaction.resolve();
+      if (event.type === "session.exited") this.compaction.reject(new NativeQuiescenceUnknown("session exited before compaction completed"));
+    }
+    if (event.type === "session.exited" && !this.current) this.ingestion.forget(event.threadId, this.id);
+    if (event.type !== "turn.completed" && event.type !== "turn.aborted") this.ingestion.ingest(event);
     this.trackCommands(event);
     const cur = this.current;
     if (!cur?.watching || event.threadId !== cur.chat) return;
@@ -348,10 +377,12 @@ export class ProviderAgent extends AdapterBase {
         loomBindingId: input.continuity.bindingId, loomSessionEpoch: input.continuity.sessionEpoch });
       let result;
       cur.watching = true;
+      submitted = true; // From here a lost acknowledgement cannot prove non-submission.
       try {
-        result = await service.sendTurn({ threadId: chat, instanceId: this.id, input: text, cwd: this.projectDir, runtimeMode,
-          ...(model ? { model } : {}), ...(effort ? { effort } : {}),
-          ...(model || effort ? { modelSelection: { ...(model ? { model } : {}), ...(effort ? { effort } : {}) } } : {}),
+        result = await service.sendTurn({ threadId: chat, instanceId: this.id, input: text, cancelled: () => cur.interrupted,
+          ...(this.beforeCompact ? { beforeSubmit: this.beforeCompact } : {}), cwd: this.projectDir, runtimeMode,
+          model: model || null, ...(effort ? { effort } : {}),
+          modelSelection: { model: model || null, ...(effort ? { effort } : {}) },
           ...(input.interactionMode ? { interactionMode: input.interactionMode } : {}),
           onMissingSession: input.continuity ? "fail" : "fresh",
           ...(input.continuity ? { clientTurnId: input.continuity.runId } : {}) });
@@ -376,8 +407,13 @@ export class ProviderAgent extends AdapterBase {
       // Brain waits up to a minute for proof; an ordinary turn moves on after a
       // few seconds, since a harness can end a turn with a command it abandoned.
       const settleMs = typeof this.options.commandSettleMs === "number" ? this.options.commandSettleMs : input.continuity ? 60_000 : 5_000;
-      if (!(await this.commandsSettled(chat, settleMs)) && input.continuity)
-        throw new NativeQuiescenceUnknown(`${this.provider} reported the turn done while a command is still running; quiescence unknown`);
+      const commandsIdle = await this.commandsSettled(chat, settleMs);
+      if (!commandsIdle) {
+        const reason = `${this.provider} reported the turn done while a command is still running; quiescence unknown`;
+        this.ingestion.ingest({ ...end, type: "turn.aborted", payload: { reason } });
+        throw new NativeQuiescenceUnknown(reason);
+      }
+      this.ingestion.ingest(end);
       if (end.type === "turn.completed") {
         // A failed turn is already in the log as an error. Brain also needs to
         // hear it from send(); outside continuity the error event ends the turn.
@@ -385,11 +421,11 @@ export class ProviderAgent extends AdapterBase {
           throw new Error(`${this.provider} reported a failed turn${end.payload.errorMessage ? `: ${end.payload.errorMessage}` : ""}`);
         return;
       }
-      if (end.type === "turn.aborted") throw new Error(end.payload.reason);
+      if (end.type === "turn.aborted") throw /quiescence unknown/.test(end.payload.reason) ? new NativeQuiescenceUnknown(end.payload.reason) : new Error(end.payload.reason);
       // The session went away with no word on the turn.
       const message = `${this.provider} session ended before the turn completed; native outcome is unknown`;
       this.emit({ kind: "error", payload: { message } });
-      throw new Error(message);
+      throw new NativeQuiescenceUnknown(message);
     } catch (error) {
       if (cur.interrupted && !submitted && !(error instanceof NativeSessionMissing)) {
         // Stopped before any prompt reached the harness: interrupted, not failed.
@@ -399,6 +435,7 @@ export class ProviderAgent extends AdapterBase {
       }
       throw error;
     } finally {
+      this.ingestion.untagTurn(chat, this.id);
       this.current = null;
       this._busy = false;
       this.endContinuity();
@@ -439,7 +476,15 @@ export class ProviderAgent extends AdapterBase {
   /** What putting this agent's conversation in `chat` back to `cutoff` (epoch ms) takes; throws when it can't be done. */
   async planRollback(chat: ThreadId, cutoff: number): Promise<RollbackStep | null> {
     const { service } = await this.attach();
-    return service.planRollback(chat, this.id, cutoff, this.projectDir);
+    const step = service.planRollback(chat, this.id, cutoff, this.projectDir);
+    if (step) await service.validateRollback(step);
+    return step;
+  }
+
+  /** What resumes this agent's conversation in `chat` now; null when its next turn starts a new session. */
+  sessionCursor(chat: ThreadId): string | null {
+    const cursor = this.providers?.service.directory.get(chat, this.id)?.resumeCursor;
+    return typeof cursor === "string" && cursor ? cursor : null;
   }
 
   /** Carry out a planned rollback. The agent takes no turn meanwhile. */
@@ -464,25 +509,32 @@ export class ProviderAgent extends AdapterBase {
 
   /** A provider error as the runtime and Brain understand dispatch failures. */
   private dispatchError(error: unknown, continuity: boolean): Error {
-    if (!isProviderError(error)) return error instanceof Error ? error : new Error(String(error));
+    if (!isProviderError(error)) return error instanceof NativeQuiescenceUnknown || error instanceof NativeDispatchRejected || error instanceof NativeSessionMissing
+      ? error : new NativeQuiescenceUnknown(`${error instanceof Error ? error.message : String(error)}; native outcome is unknown`);
     if (error.code === "session_missing") {
       return continuity ? new NativeSessionMissing(error.message) : new NativeDispatchRejected(error.message);
     }
     if (error.notSubmitted) return new NativeDispatchRejected(error.message);
-    return new Error(/native outcome is unknown/.test(error.message) ? error.message : `${error.message}; native outcome is unknown`);
+    return new NativeQuiescenceUnknown(/native outcome is unknown/.test(error.message) ? error.message : `${error.message}; native outcome is unknown`);
   }
 
   async interrupt(): Promise<void> {
     const cur = this.current;
-    if (!cur) return;
+    if (!cur) {
+      if (this.compaction) {
+        this.compaction.interrupted = true;
+        await this.providers?.service.stopSession(this.compaction.chat, this.id);
+      }
+      return;
+    }
     cur.interrupted = true;
     const service = this.providers?.service;
-    if (service && cur.turnId) await service.interruptTurn(cur.chat, this.id, cur.turnId).catch(() => {});
+    if (service && cur.turnId) await service.interruptTurn(cur.chat, this.id, cur.turnId).catch(error => { if (error instanceof NativeQuiescenceUnknown) throw error; });
     const settled = this.settled ?? Promise.resolve();
     const within = (ms: number) => Promise.race([settled.then(() => true), new Promise<false>(resolve => setTimeout(() => resolve(false), ms).unref())]);
     if (await within(15_000)) return;
     // The harness did not stop the turn: end its session (and process group).
-    if (service) await service.stopSession(cur.chat, this.id).catch(() => {});
+    if (service) await service.stopSession(cur.chat, this.id);
     if (!(await within(10_000))) throw new NativeQuiescenceUnknown(`${this.provider} did not stop after interruption; quiescence unknown`);
   }
 
@@ -490,15 +542,13 @@ export class ProviderAgent extends AdapterBase {
     await this.interrupt();
     const providers = this.providers;
     if (!providers) return;
+    await providers.service.unregister(this.id);
     this.providers = null;
     this.adapter = null;
-    try { await providers.service.unregister(this.id); }
-    finally {
-      this.unsubscribe?.();
-      this.unsubscribe = null;
-      if (providers.owners.get(this.id) === this) { providers.owners.delete(this.id); providers.busy.delete(this.id); }
-      releaseProviders(this.projectDir, providers);
-    }
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+    if (providers.owners.get(this.id) === this) { providers.owners.delete(this.id); providers.busy.delete(this.id); }
+    releaseProviders(this.projectDir, providers);
   }
 }
 

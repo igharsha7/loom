@@ -16,12 +16,13 @@
  *    send a delta to an empty session.
  */
 
+import { NativeQuiescenceUnknown } from "../core/continuity/contracts.js";
 import { EventHub, type ProviderAdapter } from "./adapter.js";
 import type {
   AdapterCapabilities, ApprovalDecision, InstanceId, ProviderKind, ProviderRuntimeEvent, ProviderSession, RequestId,
   RuntimeMode, SendTurnInput, ThreadId, TurnId, TurnStartResult, UserInputAnswers,
 } from "./contracts.js";
-import type { SessionDirectory } from "./directory.js";
+import type { SessionDirectory, TurnLedger } from "./directory.js";
 import { ProviderError, isProviderError } from "./errors.js";
 
 export interface EnsureSessionInput {
@@ -30,7 +31,7 @@ export interface EnsureSessionInput {
   /** Used when starting fresh or when the binding has none recorded. */
   cwd: string;
   runtimeMode: RuntimeMode;
-  model?: string;
+  model?: string | null;
   /** Reasoning effort to start the session with, where the provider fixes it per session. */
   effort?: string;
   /**
@@ -57,6 +58,9 @@ export interface RollbackStep {
   beforeTurnId: TurnId | null;
   /** How many native turns go. */
   turns: number;
+  /** Exact prefix retained by an idempotent native cut. */
+  retainedTurnIds?: string[];
+  nativeSessionId?: string;
   cwd: string;
   runtimeMode: RuntimeMode;
   model?: string;
@@ -68,6 +72,10 @@ export class ProviderService {
   private readonly adapters = new Map<InstanceId, { adapter: ProviderAdapter; unsubscribe: () => void }>();
   private readonly hub: EventHub<ProviderRuntimeEvent>;
   private readonly starting = new Map<string, Promise<EnsuredSession>>();
+  private readonly submittingLedgers = new Map<string, TurnLedger | null | undefined>();
+  private stoppingAll = 0;
+  private readonly stoppingInstances = new Set<string>();
+  private readonly stoppingSessions = new Map<string, Promise<void>>();
   private readonly activeTurns = new Map<string, TurnId>();
   /** The last turn each session finished; a turn can finish before sendTurn returns. */
   private readonly finishedTurns = new Map<string, TurnId>();
@@ -91,12 +99,17 @@ export class ProviderService {
   async unregister(instanceId: InstanceId): Promise<void> {
     const entry = this.adapters.get(instanceId);
     if (!entry) return;
-    this.adapters.delete(instanceId);
-    try { await entry.adapter.stopAll(); }
-    finally {
+    this.stoppingInstances.add(instanceId);
+    try {
+      await Promise.allSettled([...this.starting].filter(([k]) => k.endsWith(`\0${instanceId}`)).map(([, p]) => p));
+      await entry.adapter.stopAll();
+      this.adapters.delete(instanceId);
       entry.unsubscribe();
+    }
+    finally {
+      this.stoppingInstances.delete(instanceId);
       for (const b of this.directory.list({ excludeStopped: true })) {
-        if (b.instanceId === instanceId) this.directory.upsert({ ...b, status: "stopped" });
+        if (b.instanceId === instanceId) this.directory.upsert({ ...b, status: entry.adapter.hasSession(b.threadId) ? "error" : "stopped" });
       }
     }
   }
@@ -123,6 +136,8 @@ export class ProviderService {
     // caller always finds the start registered below.
     const adapter = this.adapter(input.instanceId, "ensureSession");
     const k = sessionKey(input.threadId, input.instanceId);
+    if (this.stoppingAll || this.stoppingInstances.has(input.instanceId) || this.stoppingSessions.has(k))
+      throw new ProviderError("validation", "ensureSession", "the native session is stopping", { mayHaveStarted: false });
     if (adapter.hasSession(input.threadId)) {
       const session = adapter.listSessions().find(s => s.threadId === input.threadId);
       if (session) return { session, via: "live", replacedLostSession: false };
@@ -138,7 +153,7 @@ export class ProviderService {
     const binding = this.directory.get(input.threadId, input.instanceId);
     const cursor = binding?.resumeCursor ?? undefined;
     const cwd = binding?.runtimePayload?.cwd ?? input.cwd;
-    const model = input.model ?? binding?.runtimePayload?.model;
+    const model = input.model === null ? undefined : input.model ?? binding?.runtimePayload?.model;
     const launch = async (resumeCursor: unknown) => {
       // A new native session: every turn it will ever have gets recorded.
       this.directory.upsert({ threadId: input.threadId, instanceId: input.instanceId, provider: adapter.provider,
@@ -152,7 +167,7 @@ export class ProviderService {
         this.directory.upsert({ threadId: input.threadId, instanceId: input.instanceId, provider: adapter.provider,
           status: "error", resumeCursor: resumeCursor ?? null, runtimePayload: { cwd, ...(model ? { model } : {}) }, runtimeMode: input.runtimeMode });
         // Starting a session never submits a turn, whatever went wrong.
-        if (isProviderError(error)) throw error;
+        if (isProviderError(error) || error instanceof NativeQuiescenceUnknown) throw error;
         throw new ProviderError("transport", "ensureSession", error instanceof Error ? error.message : String(error),
           { provider: adapter.provider, instanceId: input.instanceId, threadId: input.threadId, mayHaveStarted: false, cause: error });
       }
@@ -185,16 +200,37 @@ export class ProviderService {
   }
 
   /** Start a turn on a live session (starting or resuming one first). */
-  async sendTurn(input: SendTurnInput & Omit<EnsureSessionInput, "threadId" | "instanceId">): Promise<TurnStartResult & { session: EnsuredSession }> {
+  async sendTurn(input: SendTurnInput & Omit<EnsureSessionInput, "threadId" | "instanceId"> & { cancelled?: () => boolean; beforeSubmit?: (session: ProviderSession) => void }): Promise<TurnStartResult & { session: EnsuredSession }> {
     if (!input.input.trim()) throw new ProviderError("validation", "sendTurn", "a turn needs input");
     const ensured = await this.ensureSession(input);
+    if (input.cancelled?.()) throw new ProviderError("validation", "sendTurn", "interrupted before the turn started", { mayHaveStarted: false });
+    try { input.beforeSubmit?.(ensured.session); }
+    catch (error) { throw new ProviderError("validation", "sendTurn", error instanceof Error ? error.message : String(error), { mayHaveStarted: false, cause: error }); }
     const adapter = this.adapter(input.instanceId, "sendTurn");
+    const k = sessionKey(input.threadId, input.instanceId);
+    if (this.stoppingAll || this.stoppingInstances.has(input.instanceId) || this.stoppingSessions.has(k))
+      throw new ProviderError("validation", "sendTurn", "the native session is stopping", { mayHaveStarted: false });
     const startedAt = Date.now();
-    const result = await adapter.sendTurn({ threadId: input.threadId, instanceId: input.instanceId, input: input.input,
+    const original = this.directory.get(input.threadId, input.instanceId);
+    // Acceptance may precede every native event. Persist uncertainty and its
+    // activity time before submission, so rollback cannot treat it as idle.
+    if (original) { this.submittingLedgers.set(k, original.turnLedger); this.directory.upsert({ ...original, turnLedger: null, lastSeenAt: startedAt }); }
+    const before = new Set(original?.turnLedger?.turns.map(t => t.id));
+    let result: TurnStartResult;
+    try { result = await adapter.sendTurn({ threadId: input.threadId, instanceId: input.instanceId, input: input.input,
       ...(input.modelSelection ? { modelSelection: input.modelSelection } : {}),
       ...(input.interactionMode ? { interactionMode: input.interactionMode } : {}),
-      ...(input.clientTurnId ? { clientTurnId: input.clientTurnId } : {}) });
-    const k = sessionKey(input.threadId, input.instanceId);
+      ...(input.clientTurnId ? { clientTurnId: input.clientTurnId } : {}) }); }
+    catch (error) {
+      if (original && isProviderError(error) && error.notSubmitted) this.directory.upsert(original);
+      const binding = this.directory.get(input.threadId, input.instanceId);
+      if (binding && !(isProviderError(error) && error.notSubmitted) && !binding.turnLedger?.turns.some(t => !before.has(t.id)))
+        this.directory.upsert({ ...binding, turnLedger: null });
+      this.submittingLedgers.delete(k);
+      throw error;
+    }
+    this.submittingLedgers.delete(k);
+    if (original) this.directory.upsert({ ...this.directory.get(input.threadId, input.instanceId)!, turnLedger: original.turnLedger });
     if (this.finishedTurns.get(k) !== result.turnId) this.activeTurns.set(k, result.turnId);
     const binding = this.directory.get(input.threadId, input.instanceId);
     if (binding) this.directory.upsert({ ...binding, status: "running", ...(result.resumeCursor !== undefined ? { resumeCursor: result.resumeCursor } : {}) });
@@ -225,7 +261,9 @@ export class ProviderService {
     const adapter = this.live(threadId, instanceId, "compact");
     if (!adapter.capabilities.manualCompaction || !adapter.compact)
       throw new ProviderError("unsupported", "compact", `${adapter.provider} does not support starting a compaction`, { provider: adapter.provider });
+    this.directory.touch(threadId, instanceId, Date.now());
     await adapter.compact(threadId);
+    this.directory.touch(threadId, instanceId, Date.now());
   }
 
   /**
@@ -254,7 +292,19 @@ export class ProviderService {
     if (!everything && (!adapter.capabilities.supportsConversationRollback || !adapter.rollbackThread))
       throw new ProviderError("unsupported", "rollback", `${adapter.provider} cannot roll back its conversation`, { provider: adapter.provider, instanceId, threadId });
     return { threadId, instanceId, provider: adapter.provider, beforeTurnId: everything ? null : first.id, turns: after.length,
+      ...(typeof binding.resumeCursor === "string" ? { nativeSessionId: binding.resumeCursor } : {}),
+      retainedTurnIds: ledger.turns.slice(0, ledger.turns.indexOf(first)).map(t => t.id),
       cwd: binding.runtimePayload?.cwd ?? cwd, runtimeMode: binding.runtimeMode, ...(binding.runtimePayload?.model ? { model: binding.runtimePayload.model } : {}) };
+  }
+
+  async validateRollback(step: RollbackStep): Promise<void> {
+    if (step.beforeTurnId === null) return;
+    const adapter = this.adapter(step.instanceId, "rollback");
+    try {
+      await this.ensureSession({ threadId: step.threadId, instanceId: step.instanceId, cwd: step.cwd, runtimeMode: step.runtimeMode, ...(step.model ? { model: step.model } : {}) });
+    } catch (error) { if (isProviderError(error, "session_missing")) return; throw error; }
+    const retained = await adapter.validateRollback?.(step.threadId, step.beforeTurnId);
+    if (retained) step.retainedTurnIds = retained;
   }
 
   /**
@@ -265,6 +315,11 @@ export class ProviderService {
    */
   async rollbackConversation(step: RollbackStep): Promise<void> {
     const adapter = this.adapter(step.instanceId, "rollback");
+    const saved = this.directory.get(step.threadId, step.instanceId);
+    // A completed rollback durably removed this boundary. Retrying its intent
+    // must not apply a second native cut (including Codex's count fallback).
+    if (saved?.resumeCursor == null || (step.beforeTurnId !== null && saved.turnLedger &&
+      !saved.turnLedger.turns.some(t => t.id === step.beforeTurnId))) return;
     if (this.activeTurn(step.threadId, step.instanceId))
       throw new ProviderError("validation", "rollback", `a ${adapter.provider} turn is running in this chat`, { provider: adapter.provider, instanceId: step.instanceId, threadId: step.threadId });
     const forget = async () => {
@@ -280,7 +335,7 @@ export class ProviderService {
       if (isProviderError(error, "session_missing")) return forget();
       throw error;
     }
-    const result = await adapter.rollbackThread!(step.threadId, step.beforeTurnId);
+    const result = await adapter.rollbackThread!(step.threadId, step.beforeTurnId, step.retainedTurnIds);
     // Nothing of the native conversation is left.
     if (result.resumeCursor === null) return forget();
     const b = this.directory.get(step.threadId, step.instanceId);
@@ -288,24 +343,36 @@ export class ProviderService {
     const ledger = b.turnLedger;
     const cut = ledger ? ledger.turns.findIndex(t => t.id === step.beforeTurnId) : -1;
     this.directory.upsert({ ...b, resumeCursor: result.resumeCursor, status: result.live ? "running" : "stopped",
-      turnLedger: ledger ? { ...ledger, turns: cut < 0 ? ledger.turns : ledger.turns.slice(0, cut) } : null });
+      turnLedger: ledger ? { ...ledger, turns: (cut < 0 ? ledger.turns : ledger.turns.slice(0, cut)).map(t => ({ ...t, id: result.turnIds?.[t.id] ?? t.id })) } : null });
   }
 
   /** Stop one session. Its binding stays, marked stopped, so it can be resumed. */
   async stopSession(threadId: ThreadId, instanceId: InstanceId): Promise<void> {
+    const k = sessionKey(threadId, instanceId), pending = this.stoppingSessions.get(k);
+    if (pending) return pending;
     const adapter = this.adapter(instanceId, "stopSession");
-    if (adapter.hasSession(threadId)) await adapter.stopSession(threadId);
-    this.activeTurns.delete(sessionKey(threadId, instanceId));
-    const binding = this.directory.get(threadId, instanceId);
-    if (binding && binding.status !== "stopped") this.directory.upsert({ ...binding, status: "stopped" });
+    const stop = (async () => {
+      await this.starting.get(k)?.catch(() => {});
+      if (adapter.hasSession(threadId)) await adapter.stopSession(threadId);
+      this.activeTurns.delete(k);
+      const binding = this.directory.get(threadId, instanceId);
+      if (binding && binding.status !== "stopped") this.directory.upsert({ ...binding, status: "stopped" });
+    })().finally(() => this.stoppingSessions.delete(k));
+    this.stoppingSessions.set(k, stop);
+    return stop;
   }
 
   async stopAll(): Promise<void> {
-    const results = await Promise.allSettled([...this.adapters.values()].map(({ adapter }) => adapter.stopAll()));
-    this.activeTurns.clear();
-    for (const b of this.directory.list({ excludeStopped: true })) this.directory.upsert({ ...b, status: "stopped" });
-    const failed = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
-    if (failed) throw failed.reason;
+    this.stoppingAll++;
+    try {
+      // Fence new starts first, then join existing starts and shared stops.
+      await Promise.allSettled([...this.starting.values()]);
+      const results = await Promise.allSettled(this.listSessions().map(s => this.stopSession(s.threadId, s.instanceId)));
+      const failed = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
+      if (failed) throw failed.reason;
+      this.activeTurns.clear();
+      for (const b of this.directory.list({ excludeStopped: true })) this.directory.upsert({ ...b, status: "stopped" });
+    } finally { this.stoppingAll--; }
   }
 
   listSessions(): ProviderSession[] {
@@ -324,32 +391,45 @@ export class ProviderService {
   /** Keep the directory and turn state current, then publish. */
   private observe(event: ProviderRuntimeEvent): void {
     const k = sessionKey(event.threadId, event.instanceId);
-    switch (event.type) {
-      case "thread.started": {
-        const binding = this.directory.get(event.threadId, event.instanceId);
-        if (binding && event.payload.providerThreadId && binding.resumeCursor !== event.payload.providerThreadId)
-          this.directory.upsert({ ...binding, resumeCursor: event.payload.providerThreadId });
-        break;
+    try {
+      switch (event.type) {
+        case "thread.started": {
+          const binding = this.directory.get(event.threadId, event.instanceId);
+          if (binding && event.payload.providerThreadId && binding.resumeCursor !== event.payload.providerThreadId)
+            this.directory.upsert({ ...binding, resumeCursor: event.payload.providerThreadId });
+          break;
+        }
+        case "turn.started":
+          if (event.turnId) {
+            this.activeTurns.set(k, event.turnId);
+            const ledger = this.submittingLedgers.get(k), binding = this.directory.get(event.threadId, event.instanceId);
+            if (binding && ledger) this.directory.upsert({ ...binding, turnLedger: ledger });
+            this.submittingLedgers.delete(k);
+            this.directory.recordTurn(event.threadId, event.instanceId, event.turnId, event.createdAt);
+          }
+          this.directory.touch(event.threadId, event.instanceId, event.createdAt);
+          break;
+        case "turn.completed":
+        case "turn.aborted":
+          if (event.turnId) this.finishedTurns.set(k, event.turnId);
+          if (!event.turnId || this.activeTurns.get(k) === event.turnId) this.activeTurns.delete(k);
+          this.directory.touch(event.threadId, event.instanceId, event.createdAt);
+          break;
+        case "runtime.error": {
+          const binding = this.directory.get(event.threadId, event.instanceId);
+          if (binding && /quiescence unknown/.test(event.payload.message)) this.directory.upsert({ ...binding, status: "error" });
+          break;
+        }
+        case "session.exited": {
+          this.activeTurns.delete(k);
+          const binding = this.directory.get(event.threadId, event.instanceId);
+          if (binding) this.directory.upsert({ ...binding, status: event.payload.exitKind === "error" ? "error" : "stopped", lastSeenAt: binding.lastSeenAt });
+          break;
+        }
+        default:
+          break;
       }
-      case "turn.started":
-        if (event.turnId) this.activeTurns.set(k, event.turnId);
-        this.directory.touch(event.threadId, event.instanceId, event.createdAt);
-        break;
-      case "turn.completed":
-      case "turn.aborted":
-        if (event.turnId) this.finishedTurns.set(k, event.turnId);
-        if (!event.turnId || this.activeTurns.get(k) === event.turnId) this.activeTurns.delete(k);
-        this.directory.touch(event.threadId, event.instanceId, event.createdAt);
-        break;
-      case "session.exited": {
-        this.activeTurns.delete(k);
-        const binding = this.directory.get(event.threadId, event.instanceId);
-        if (binding) this.directory.upsert({ ...binding, status: event.payload.exitKind === "error" ? "error" : "stopped", lastSeenAt: binding.lastSeenAt });
-        break;
-      }
-      default:
-        break;
-    }
-    this.hub.publish(event);
+    } catch (error) { this.log("warn", "could not persist provider event", error); }
+    finally { this.hub.publish(event); }
   }
 }

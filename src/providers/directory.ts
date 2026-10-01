@@ -75,8 +75,8 @@ export class MemorySessionDirectory implements SessionDirectory {
 
   upsert(binding: Omit<ProviderBinding, "lastSeenAt"> & { lastSeenAt?: number }): ProviderBinding {
     const ledger = binding.turnLedger !== undefined ? binding.turnLedger : this.rows.get(key(binding.threadId, binding.instanceId))?.turnLedger;
-    const row: ProviderBinding = { ...binding, lastSeenAt: binding.lastSeenAt ?? Date.now(), ...(ledger ? { turnLedger: ledger } : {}) };
-    if (!ledger) delete row.turnLedger;
+    const row: ProviderBinding = { ...binding, lastSeenAt: binding.lastSeenAt ?? Date.now(), ...(ledger !== undefined ? { turnLedger: ledger } : {}) };
+    if (ledger === undefined) delete row.turnLedger;
     this.rows.set(key(row.threadId, row.instanceId), row);
     this.changed();
     return { ...row };
@@ -94,7 +94,9 @@ export class MemorySessionDirectory implements SessionDirectory {
     const row = this.rows.get(key(threadId, instanceId));
     if (!row) return;
     const ledger = row.turnLedger ?? { since: at, fromStart: false, turns: [] };
-    const turns = [...ledger.turns.filter(t => t.id !== turnId), { id: turnId, at }];
+    // The canonical start can arrive before its RPC acknowledgement.
+    if (ledger.turns.some(t => t.id === turnId)) return;
+    const turns = [...ledger.turns, { id: turnId, at }];
     const kept = turns.slice(-LEDGER_CAP);
     row.turnLedger = kept.length < turns.length ? { since: kept[0]!.at, fromStart: false, turns: kept } : { ...ledger, turns };
     this.changed();
@@ -147,7 +149,7 @@ export class FileSessionDirectory extends MemorySessionDirectory {
       // so its turns are known from now on.
       const now = Date.now();
       for (const b of parsed.bindings)
-        this.rows.set(key(b.threadId, b.instanceId), { ...b, turnLedger: b.turnLedger ?? { since: now, fromStart: false, turns: [] } } as ProviderBinding);
+        this.rows.set(key(b.threadId, b.instanceId), { ...b, turnLedger: b.turnLedger === undefined ? { since: now, fromStart: false, turns: [] } : b.turnLedger } as ProviderBinding);
     } catch (error) {
       const aside = `${this.file}.unreadable.${randomUUID()}`;
       try { fs.renameSync(this.file, aside); } catch { /* reported below either way */ }

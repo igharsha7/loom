@@ -43,7 +43,7 @@
  *
  * Ignored files. `git add -A` honours `.gitignore`, so `node_modules`, build
  * output and — the one that matters — `.env` are never read, never written
- * into an object, and never restored. `.loom/` is ignored too, which is the
+ * into an object, and never restored. `.loom/` is excluded even if tracked, which is the
  * reason a rewind cannot eat the event log: history is what happened, and a
  * rewind that edited it would be a lie with a timestamp.
  *
@@ -114,16 +114,17 @@ interface Store {
   env: Record<string, string>;
   /** Where temporary indexes go. */
   scratch: string;
+  prefix?: string;
 }
 
-function run(args: string[], cwd: string, env?: Record<string, string>, timeoutMs?: number): Promise<string> {
+function run(args: string[], cwd: string, env?: Record<string, string>, timeoutMs?: number, allowNoMatch = false): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(
       "git",
       args,
       { cwd, maxBuffer: 64 * 1024 * 1024, ...(env ? { env: { ...process.env, ...env } } : {}), ...(timeoutMs ? { timeout: timeoutMs } : {}) },
       (err, stdout, stderr) => {
-        if (err) {
+        if (err && !(allowNoMatch && (err as { code?: unknown }).code === 1)) {
           const detail = String(stderr || err.message).trim();
           reject(new GitError(detail.split("\n").find((l) => l.trim())?.trim() || `git ${args[0]} failed`, detail));
           return;
@@ -145,8 +146,8 @@ async function quiet(args: string[], cwd: string, env?: Record<string, string>):
 const trimDir = (dir: string) => dir.replace(/\/+$/, "");
 const loomStorePath = (dir: string) => path.join(trimDir(dir), ".loom", "checkpoints.git");
 
-function gitStore(dir: string): Store {
-  return { kind: "git", dir, env: {}, scratch: `${trimDir(dir)}/.git` };
+async function gitStore(dir: string): Promise<Store> {
+  return { kind: "git", dir, prefix: (await run(["rev-parse", "--show-prefix"], dir)).trimEnd(), env: {}, scratch: (await run(["rev-parse", "--absolute-git-dir"], dir)).trim() };
 }
 
 function loomStore(dir: string): Store {
@@ -180,7 +181,7 @@ async function repoHead(dir: string): Promise<string | null> {
 /** Every store that may hold checkpoints for `dir`. */
 async function storesOf(dir: string): Promise<Store[]> {
   const stores: Store[] = [];
-  if ((await quiet(["rev-parse", "--is-inside-work-tree"], dir)) === "true") stores.push(gitStore(dir));
+  if ((await quiet(["rev-parse", "--is-inside-work-tree"], dir)) === "true") stores.push(await gitStore(dir));
   if (fs.existsSync(path.join(loomStorePath(dir), "HEAD"))) stores.push(loomStore(dir));
   return stores;
 }
@@ -231,7 +232,7 @@ async function latestCommit(store: Store): Promise<string | null> {
 async function tooMuchNew(store: Store, env: Record<string, string>): Promise<boolean> {
   let listed: string;
   try {
-    listed = await run(["ls-files", "-z", "--others", "--exclude-standard", "--", "."], store.dir, env, STORE_LIMITS.listMs);
+    listed = await run(["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "."], store.dir, env, STORE_LIMITS.listMs);
   } catch {
     return true; // too slow to even list
   }
@@ -260,7 +261,15 @@ async function writeTree(store: Store, id: string, seed: string | null, guard: b
     // keeps .env and node_modules out of the object store.
     if (seed) await run(["read-tree", seed], store.dir, env);
     if (guard && (await tooMuchNew(store, env))) return null;
-    await run(["add", "-A", "--", "."], store.dir, env);
+    const listed = (await run(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], store.dir, env)).split("\0").filter(Boolean);
+    const ignored = new Set((await run(["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"], store.dir, env)).split("\0").filter(Boolean));
+    const files = listed.filter(p => !protectedPath(p) && !ignored.has(p));
+    for (let i = 0; i < files.length; i += 200)
+      await run(["--literal-pathspecs", "add", "-A", "--", ...files.slice(i, i + 200)], store.dir, env);
+    // A tracked .loom in HEAD is just as unsafe as unignored bookkeeping.
+    const excluded = listed.filter(p => protectedPath(p) || ignored.has(p));
+    for (let i = 0; i < excluded.length; i += 200)
+      await run(["--literal-pathspecs", "rm", "-f", "--cached", "--ignore-unmatch", "--", ...excluded.slice(i, i + 200)], store.dir, env);
     return (await run(["write-tree"], store.dir, env)).trim();
   } finally {
     dropIndex(index);
@@ -276,13 +285,13 @@ async function writeTree(store: Store, id: string, seed: string | null, guard: b
  * the checkpoint it undoes lives. Returns null when no checkpoint could be
  * taken: git missing, or too much new content for Loom's store.
  */
-export async function capture(dir: string, label: string, options: { store?: CheckpointStore } = {}): Promise<Checkpoint | null> {
+export async function capture(dir: string, label: string, options: { store?: CheckpointStore; prune?: boolean } = {}): Promise<Checkpoint | null> {
   let store: Store;
   let head: string | null = null;
   try {
     head = options.store === "loom" ? null : await repoHead(dir);
     if (options.store === "git" && !head) return null;
-    store = head ? gitStore(dir) : await openLoomStore(dir);
+    store = head ? await gitStore(dir) : await openLoomStore(dir);
   } catch {
     return null;
   }
@@ -323,7 +332,7 @@ export async function capture(dir: string, label: string, options: { store?: Che
       dirty,
       store: store.kind,
     };
-    await pruneStore(store, KEEP_CHECKPOINTS);
+    if (options.prune !== false) await pruneStore(store, KEEP_CHECKPOINTS);
     return cp;
   } catch {
     // A checkpoint is a courtesy taken on a hot path. It must never be the
@@ -368,61 +377,73 @@ export async function find(dir: string, id: string): Promise<Checkpoint | null> 
   return (await list(dir)).find((c) => c.id === id) ?? null;
 }
 
-const storeOf = (dir: string, cp: Checkpoint): Store => (cp.store === "loom" ? loomStore(dir) : gitStore(dir));
+const storeOf = async (dir: string, cp: Checkpoint): Promise<Store> => (cp.store === "loom" ? loomStore(dir) : await gitStore(dir));
+
+const protectedPath = (rel: string) => rel.split("/").some(p => p === ".loom" || p === ".git");
+async function safePath(dir: string, rel: string): Promise<void> {
+  if (!rel || path.isAbsolute(rel) || rel.split("/").some(p => p === ".." || !p) || protectedPath(rel))
+    throw new GitError(`"${rel}" isn't a path inside this project`, "");
+  let parent = dir;
+  for (const part of rel.split("/").slice(0, -1)) {
+    parent = path.join(parent, part);
+    try { if ((await fs.promises.lstat(parent)).isSymbolicLink()) throw new GitError(`"${rel}" has a symlink parent`, ""); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
+}
 
 /**
  * Put the working tree back to a checkpoint.
  *
- * Two commands do the work. `read-tree -u --reset` makes the index and the
- * working tree agree with the captured tree — restoring what changed and
- * deleting what the checkpoint didn't have. `clean -fd` then removes the
- * directories git leaves behind. Neither is given `-x`, so ignored files are
- * not touched: your `node_modules` survives, and so does your `.env`.
- *
- * HEAD does not move. A checkpoint is a working tree, not a history, and
- * rewinding your files should not rewrite your commits. In Loom's store the
- * index is a temporary one seeded with the tree being replaced, so
- * `read-tree -u` knows which files to delete.
+ * Only paths in the captured trees move; an ignored file or Loom's journal
+ * cannot be removed by a broad clean/read-tree. A temporary index keeps checkout
+ * away from the user's staging area. HEAD does not move.
  */
-export async function restore(dir: string, id: string): Promise<RestoreResult> {
+export async function prepareRestore(dir: string, id: string): Promise<{ target: Checkpoint; undo: Checkpoint }> {
   const target = await find(dir, id);
   if (!target) throw new GitError(`no checkpoint "${id}" in this project`, "");
 
   // Before anything is lost: a checkpoint of what is about to be replaced.
   // Without this, rewind is a one-way door, and the one time it matters is
   // the time someone rewinds past work they meant to keep.
-  const undo = await capture(dir, `before rewinding to ${target.label.slice(0, 80)}`, { store: target.store });
+  const undo = await capture(dir, `before rewinding to ${target.label.slice(0, 80)}`, { store: target.store, prune: false });
   if (!undo) throw new GitError("couldn't save the current files before rewinding — nothing was changed", "");
-  const store = storeOf(dir, target);
+  await restorePaths(dir, target, undo);
+  return { target, undo };
+}
 
-  // What this rewind will actually do, from the two captured trees rather
-  // than from `git diff`, which cannot see an untracked file — and an
-  // untracked file is precisely what a rewind deletes.
-  const changed = (await quiet(["diff", "--name-only", `${undo.commit}..${target.commit}`], dir, store.env))
-    .split("\n")
-    .filter(Boolean);
+async function restorePaths(dir: string, target: Checkpoint, undo: Checkpoint): Promise<string[]> {
+  const store = await storeOf(dir, target);
+  const changed = (await run(["diff", "--relative", "--no-renames", "--name-only", "-z", `${undo.commit}..${target.commit}`, "--", "."], dir, store.env)).split("\0").filter(Boolean);
+  const paths: string[] = [];
+  for (const rel of changed) {
+    if (protectedPath(rel) || await run(["check-ignore", "--no-index", "--", rel], dir, store.env, undefined, true)) continue;
+    await safePath(dir, rel);
+    paths.push(rel);
+  }
+  return paths;
+}
 
-  if (store.kind === "git") {
-    await run(["read-tree", "-u", "--reset", target.commit], dir);
-    await run(["clean", "-f", "-d", "--", "."], dir);
-    // read-tree moved the index to the checkpoint's tree as well as the files,
-    // which would leave every restored change reading as *staged* — a rewind
-    // that silently runs `git add` on your behalf. Putting the index back to
-    // HEAD leaves `git status` saying what it would say if you had made those
-    // edits by hand: modified, and untracked. --mixed touches the index only.
-    await quiet(["reset", "-q", "--mixed", "HEAD"], dir);
-  } else {
-    const index = tmpIndex(store, `restore-${target.id}`);
-    const env = { ...store.env, GIT_INDEX_FILE: index };
-    try {
-      await run(["read-tree", undo.commit], dir, env);
-      await run(["read-tree", "-u", "--reset", target.commit], dir, env);
-      await run(["clean", "-f", "-d", "--", "."], dir, env);
-    } finally {
-      dropIndex(index);
+export async function restore(dir: string, id: string, prepared?: { target: Checkpoint; undo: Checkpoint }, beforeMutation?: () => void): Promise<RestoreResult> {
+  const { target, undo } = prepared ?? await prepareRestore(dir, id);
+  const store = await storeOf(dir, target);
+
+  // Recheck immediately before mutation, including on journal retries.
+  const paths = await restorePaths(dir, target, undo);
+  const present = new Set((await run(["ls-tree", "-rz", "--name-only", "--full-tree", target.commit], dir, store.env)).split("\0").filter(p => !store.prefix || p.startsWith(store.prefix)).map(p => store.prefix ? p.slice(store.prefix.length) : p));
+  if (paths.length) beforeMutation?.();
+  for (const rel of paths.filter(p => !present.has(p)).sort((a, b) => b.length - a.length)) {
+    await fs.promises.rm(path.join(dir, rel), { force: true });
+    for (let parent = path.dirname(path.join(dir, rel)); parent !== path.resolve(dir); parent = path.dirname(parent)) {
+      try { await fs.promises.rmdir(parent); } catch { break; } // only empty directories; ignored files survive
     }
   }
-  return { restored: target, undo, changed };
+  const index = tmpIndex(store, `restore-${target.id}`);
+  try {
+    for (let i = 0, files = paths.filter(p => present.has(p)); i < files.length; i += 200)
+      await run(["--literal-pathspecs", "checkout", target.commit, "--", ...files.slice(i, i + 200)], dir, { ...store.env, GIT_INDEX_FILE: index });
+
+  } finally { dropIndex(index); }
+  return { restored: target, undo, changed: paths };
 }
 
 /**
@@ -433,62 +454,55 @@ export async function restore(dir: string, id: string): Promise<RestoreResult> {
 export async function restoreFile(dir: string, id: string, file: string): Promise<{ restored: Checkpoint; undo: Checkpoint; path: string; removed: boolean }> {
   const target = await find(dir, id);
   if (!target) throw new GitError(`no checkpoint "${id}" in this project`, "");
-  const rel = file.replace(/^\.?\/+/, "");
-  if (!rel || rel.split("/").includes("..")) throw new GitError(`"${file}" isn't a path inside this project`, "");
-  const undo = await capture(dir, `before putting back ${rel.slice(0, 80)}`, { store: target.store });
+  const rel = file.replace(/^\.\//, "");
+  await safePath(dir, rel);
+  const targetStore = await storeOf(dir, target);
+  // Ignored content has no undo blob; absence from a tree cannot mean created.
+  if ((await run(["check-ignore", "--no-index", "--", rel], dir, targetStore.env, undefined, true)))
+    throw new GitError(`"${file}" is excluded from checkpoints`, "");
+  const undo = await capture(dir, `before putting back ${rel.slice(0, 80)}`, { store: target.store, prune: false });
   if (!undo) throw new GitError("couldn't save the current files first — nothing was changed", "");
-  const store = storeOf(dir, target);
-  const existed = (await quiet(["cat-file", "-t", `${target.commit}:${rel}`], dir, store.env)) === "blob";
-  if (store.kind === "git") {
-    if (existed) {
-      await run(["checkout", target.commit, "--", rel], dir);
-    } else {
-      await quiet(["rm", "-q", "--cached", "--ignore-unmatch", "--", rel], dir);
-      await fs.promises.rm(`${trimDir(dir)}/${rel}`, { force: true });
-    }
-    // checkout staged it; leave it reading as a plain edit, like a rewind does
-    await quiet(["reset", "-q", "HEAD", "--", rel], dir);
-  } else if (existed) {
+  const store = await storeOf(dir, target);
+  const present = (await run(["ls-tree", "-rz", "--name-only", "--full-tree", target.commit], dir, store.env)).split("\0");
+  const existed = present.includes(`${store.prefix ?? ""}${rel}`);
+  if (existed) {
     const index = tmpIndex(store, `file-${target.id}`);
     try {
-      await run(["checkout", target.commit, "--", rel], dir, { ...store.env, GIT_INDEX_FILE: index });
-    } finally {
-      dropIndex(index);
-    }
+      await run(["--literal-pathspecs", "checkout", target.commit, "--", rel], dir, { ...store.env, GIT_INDEX_FILE: index });
+    } finally { dropIndex(index); }
   } else {
-    await fs.promises.rm(`${trimDir(dir)}/${rel}`, { force: true });
+    await fs.promises.rm(path.join(dir, rel), { force: true });
   }
   return { restored: target, undo, path: rel, removed: !existed };
 }
 
 /**
  * What changed since a checkpoint in Loom's store, for the turn's diff card.
- * A git project's turn diff comes from `git status` (core/worktree.ts); a
- * project without git has none, so this compares the checkpoint with the tree
- * as it is now — which also gives new files their content. Null for a git
- * checkpoint, or when nothing changed.
+ * Both stores compare content with the checkpoint, so edits to a file already
+ * dirty before the turn are attributed too. Null when nothing changed.
  */
 export async function diffSince(dir: string, id: string): Promise<TurnDiff | null> {
   const target = await find(dir, id);
-  if (!target || target.store !== "loom") return null;
-  const store = loomStore(dir);
+  if (!target) return null;
+  const store = await storeOf(dir, target);
   try {
-    const now = await writeTree(store, `diff-${newId()}`, target.commit, false);
+    const now = await writeTree(store, `diff-${newId()}`, target.commit, store.kind === "loom");
     if (!now) return null;
-    const lines = (await run(["diff", "--name-status", "--no-renames", target.commit, now], dir, store.env)).split("\n").filter(Boolean);
+    const lines = (await run(["diff", "--relative", "--name-status", "-z", "--no-renames", target.commit, now, "--", "."], dir, store.env)).split("\0").filter(Boolean);
     if (!lines.length) return null;
-    const files = lines.map((line) => {
-      const [code, file] = line.split("\t");
-      return { status: code === "A" ? "??" : code === "D" ? " D" : " M", path: file ?? "" };
-    });
+    const files = [];
+    for (let i = 0; i < lines.length; i += 2) {
+      const code = lines[i];
+      files.push({ status: code === "A" ? "??" : code === "D" ? " D" : " M", path: lines[i + 1]! });
+    }
     let added = 0;
     let removed = 0;
-    for (const line of (await run(["diff", "--numstat", "--no-renames", target.commit, now], dir, store.env)).split("\n")) {
+    for (const line of (await run(["diff", "--relative", "--numstat", "--no-renames", target.commit, now, "--", "."], dir, store.env)).split("\n")) {
       const [a, r] = line.split("\t");
       added += Number(a) || 0;
       removed += Number(r) || 0;
     }
-    const patch = await run(["diff", "--no-renames", target.commit, now], dir, store.env);
+    const patch = await run(["diff", "--relative", "--no-renames", target.commit, now, "--", "."], dir, store.env);
     const truncated = patch.length > PATCH_EVENT_LIMIT;
     return { files, added, removed, patch: truncated ? patch.slice(0, PATCH_EVENT_LIMIT) + "\n… (truncated)" : patch, truncated };
   } catch {

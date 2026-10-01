@@ -32,7 +32,7 @@ export type InteractionMode = "default" | "plan";
 export type ProviderSessionStatus = "connecting" | "ready" | "running" | "error" | "closed";
 
 export interface ModelSelection {
-  model?: string;
+  model?: string | null;
   /** Reasoning effort, in the provider's own vocabulary (e.g. "high"). */
   effort?: string;
 }
@@ -47,6 +47,8 @@ export interface ProviderSession {
   model?: string;
   /** What resumes this session after the process is gone: the native thread/session id. */
   resumeCursor?: unknown;
+  /** POSIX process group owned by this warm session. */
+  processGroupId?: number;
   activeTurnId?: TurnId;
   createdAt: number;
   updatedAt: number;
@@ -105,6 +107,8 @@ export interface RollbackResult {
   resumeCursor: unknown;
   /** Whether the session is still live afterwards; when false, the next turn resumes `resumeCursor`. */
   live: boolean;
+  /** Forks may rewrite the retained message UUIDs. */
+  turnIds?: Record<string, string>;
 }
 
 // ---------------------------------------------------------------------------

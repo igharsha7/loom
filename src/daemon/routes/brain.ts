@@ -73,6 +73,13 @@ export function registerBrainRoutes(app: Express, withRuntime: WithRuntime): voi
       res.json({ search: brain.store.searchMode, rebuilt: true });
     } catch (error) { failure(res, error); }
   }));
+  app.post("/api/projects/:id/brain/continuity/compaction/reconcile", withRuntime(async (rt, req, res) => {
+    try {
+      const input = parseBounded(z.strictObject({ evidence: z.string().min(1).max(2000), quiescent: z.literal(true) }), req.body);
+      rt.reconcileCompaction(input.evidence);
+      res.json({ reconciled: true, replayed: false });
+    } catch (error) { failure(res, error); }
+  }));
   app.post("/api/projects/:id/brain/continuity/reconcile", withRuntime(async (rt, req, res) => {
     try {
       const input = parseBounded(z.strictObject({ receiptId: Id, evidence: z.string().min(1).max(2000),
@@ -101,6 +108,9 @@ export function registerBrainRoutes(app: Express, withRuntime: WithRuntime): voi
     withRuntime(async (rt, req, res) => {
       const { text } = (req.body ?? {}) as { text?: string };
       if (!text?.trim()) return void res.status(400).json({ error: "missing text" });
+      if (rt.continuity) {
+        try { requireIdle(rt); } catch (error) { failure(res, error); return; }
+      }
       const event = rt.log.append({ kind: "decision", payload: { text } });
       // Also a memory. The decision event stays because the projection and
       // forty other things read it; the memory is the addressable copy — the

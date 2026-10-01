@@ -73,19 +73,21 @@ interface SessionState {
   /** Streamed text per item, until the item completes. */
   text: Map<string, { kind: "assistant" | "reasoning"; text: string }>;
   lastReply: string;
+  finished: Set<string>;
   compacting: boolean;
   /** The turn asked a structured question, so "ends on a question mark" says nothing new. */
   asked: boolean;
 }
 
 export class RuntimeIngestion {
+  private readonly commandTags = new Map<string, TurnTags>();
   private readonly sessions = new Map<string, SessionState>();
   constructor(private readonly options: IngestionOptions) {}
 
   private state(threadId: string, instanceId: string): SessionState {
     const k = `${threadId}\u0000${instanceId}`;
     let s = this.sessions.get(k);
-    if (!s) { s = { text: new Map(), lastReply: "", compacting: false, asked: false }; this.sessions.set(k, s); }
+    if (!s) { s = { text: new Map(), lastReply: "", finished: new Set(), compacting: false, asked: false }; this.sessions.set(k, s); }
     return s;
   }
 
@@ -96,16 +98,27 @@ export class RuntimeIngestion {
 
   /** Drop the tags of a turn that never started. */
   untagTurn(threadId: ThreadId, instanceId: InstanceId): void {
-    this.state(threadId, instanceId).tags = undefined;
+    this.endTurn(this.state(threadId, instanceId));
   }
 
   /** Forget a session's state (after it stops). */
   forget(threadId: ThreadId, instanceId: InstanceId): void {
     this.sessions.delete(`${threadId}\u0000${instanceId}`);
+    const prefix = `${threadId}\0${instanceId}\0`;
+    for (const key of this.commandTags.keys()) if (key.startsWith(prefix)) this.commandTags.delete(key);
   }
 
   ingest(event: ProviderRuntimeEvent): void {
-    const s = this.state(event.threadId, event.instanceId);
+    let s = this.state(event.threadId, event.instanceId);
+    const commandKey = `${event.threadId}\0${event.instanceId}\0${event.turnId}\0${event.itemId}`;
+    const commandTags = event.type === "item.completed" ? this.commandTags.get(commandKey) : undefined;
+    if (commandTags) { this.commandTags.delete(commandKey); s = { ...s, tags: commandTags }; }
+    // A late terminal/item from an older turn must not clear or acquire the
+    // current turn's tags. Parked chats keep their own state.
+    if (!commandTags && event.turnId && s.tags && s.finished.has(event.turnId) && event.type !== "user-input.resolved") return;
+    if (!commandTags && event.turnId && s.turn?.id && event.turnId !== s.turn.id && event.type !== "turn.started" && event.type !== "user-input.resolved") return;
+    if (event.type === "item.started" && event.payload.itemType === "command_execution" && s.tags)
+      this.commandTags.set(commandKey, s.tags);
     const emit = (kind: IngestedEvent["kind"], payload: Record<string, unknown>) =>
       this.options.append({ kind, agentId: event.instanceId, chat: event.threadId, payload: s.tags ? { ...payload, ...s.tags } : payload });
     const status = (state: string, extra: Record<string, unknown> = {}) => emit("status", { state, ...extra });
@@ -155,7 +168,7 @@ export class RuntimeIngestion {
       case "thread.state.changed":
         if (event.payload.state === "compacted") {
           s.compacting = false;
-          status("native_compacted", { trigger: event.payload.trigger ?? "auto",
+          status("native_compacted", { session: s.providerThreadId ?? null, trigger: event.payload.trigger ?? "auto",
             ...(event.payload.beforeTokens !== undefined ? { preTokens: event.payload.beforeTokens } : {}),
             ...(event.payload.afterTokens !== undefined ? { postTokens: event.payload.afterTokens } : {}) });
         }
@@ -167,7 +180,7 @@ export class RuntimeIngestion {
         return;
       }
       case "account.rate-limits.updated":
-        if (event.payload.windows.length) status("usage_limits", { provider: PROVIDER_ACCOUNT[event.provider], windows: event.payload.windows,
+        status("usage_limits", { provider: PROVIDER_ACCOUNT[event.provider], windows: event.payload.windows,
           ...(event.payload.reached ? { reached: event.payload.reached } : {}) });
         return;
       case "user-input.requested": {
@@ -193,6 +206,7 @@ export class RuntimeIngestion {
         this.complete(event, s, emit, status);
         return;
       case "turn.aborted":
+        this.flushPartial(s, emit);
         emit("error", { message: event.payload.reason, ...(event.payload.detail?.stderr ? { stderr: event.payload.detail.stderr.slice(-2000) } : {}) });
         this.endTurn(s);
         return;
@@ -280,6 +294,7 @@ export class RuntimeIngestion {
     emit: (kind: IngestedEvent["kind"], payload: Record<string, unknown>) => void,
     status: (state: string, extra?: Record<string, unknown>) => void): void {
     const p = event.payload;
+    this.flushPartial(s, emit);
     if (p.totalCostUsd !== undefined) status("turn_cost", { costUsd: p.totalCostUsd });
     if (p.state === "completed") {
       // Blocked-on-human heuristic: the turn ended on a question.
@@ -294,10 +309,20 @@ export class RuntimeIngestion {
     } else {
       status("interrupted");
     }
+    this.flushPartial(s, emit);
     this.endTurn(s);
   }
 
+  private flushPartial(s: SessionState, emit: (kind: IngestedEvent["kind"], payload: Record<string, unknown>) => void): void {
+    for (const buf of s.text.values()) if (buf.kind === "assistant" && buf.text.trim()) emit("message", { text: buf.text, partial: true });
+    s.text.clear();
+  }
+
   private endTurn(s: SessionState): void {
+    if (s.turn?.id) {
+      s.finished.add(s.turn.id);
+      if (s.finished.size > 500) s.finished.delete(s.finished.values().next().value!);
+    }
     s.turn = undefined;
     s.tags = undefined;
     s.text.clear();

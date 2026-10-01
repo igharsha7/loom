@@ -411,6 +411,10 @@ export class DaemonClient {
   }
 
   /** Rewind (#101): points the working tree can be put back to. */
+  reconcileCompaction(id: string, evidence: string): Promise<{ reconciled: boolean }> {
+    return this.request("POST", `/api/projects/${encodeURIComponent(id)}/brain/continuity/compaction/reconcile`, { evidence, quiescent: true });
+  }
+
   checkpoints(id: string): Promise<{ checkpoints: Checkpoint[] }> {
     return this.request("GET", `/api/projects/${encodeURIComponent(id)}/checkpoints`);
   }

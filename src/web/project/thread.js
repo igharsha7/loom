@@ -8,7 +8,7 @@ import { maybeReloadPreview,onServerFrame,onSpecFrame } from '../preview.js';
 import { state } from '../state.js';
 import { drawStatusbar } from '../statusbar.js';
 import { onTeamFrame } from '../team.js';
-import { actSummary,avatarFor,durfmt,lineFor,relClock,untilText,whoHtml } from '../transcript.js';
+import { actSummary,avatarFor,durfmt,lineFor,relClock,settleQuestionCards,untilText,whoHtml } from '../transcript.js';
 import { observeUsage,usageMeter } from '../usage.js';
 import { ICONS } from '../icons.js';
 
@@ -323,6 +323,8 @@ export function createThread(view) {
         // A compaction that ended folds its "compacting…" row; flush first,
         // since the row may be in the html not yet inserted.
         var pl = e.payload || {};
+        settleQuestionCards(e, feed);
+        if (pl.state === "question_answered") state.lastQuestion = null;
         if (e.agentId && (pl.state === "native_compacted" || pl.state === "interrupted" || e.kind === "run_complete" || e.kind === "error")) {
           Array.prototype.forEach.call(feed.querySelectorAll(".sys.compacting"), function(row){
             if (row.getAttribute("data-agent") === e.agentId) row.parentNode.removeChild(row);
@@ -651,6 +653,7 @@ export function createThread(view) {
           var fromBottom = sc ? sc.scrollHeight - sc.scrollTop : 0;
           var anchor = btn ? btn.nextElementSibling : feed.firstElementChild;
           var hero = document.getElementById("threadempty"); if (hero) hero.remove();
+          evs.forEach(function(e){ settleQuestionCards(e, feed); });
           evs.forEach(function(e){
             if (!state.firstId || e.id < state.firstId) state.firstId = e.id;
             var html = lineFor(e);

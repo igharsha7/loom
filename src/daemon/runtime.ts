@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { processGroupIdentity, stopRecordedProcessGroup } from "../providers/process.js";
 import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -15,7 +17,7 @@ import { EventLog } from "../core/eventlog.js";
 import { ensureBranch, addWorktree as gitAddWorktree, readOut, worktreePath } from "../core/git.js";
 import { logbook } from "../core/logbook.js";
 import { probeMcpServer, probeMcpServers, writeMcpSession } from "../core/mcp.js";
-import { NativeUsage } from "./runtime/native-usage.js";
+import { NativeUsage, providerOf } from "./runtime/native-usage.js";
 import { notify } from "../core/notify.js";
 import { OrchestraEngine, type OrchestraCoordinator } from "../core/orchestra.js";
 import { isPermissionMode, permissionFor, unsupportedReason, type PermissionMode } from "../core/permissions.js";
@@ -92,12 +94,13 @@ import { RuntimeAgents } from './runtime/agents.js';
 import { RuntimeBriefings } from './runtime/briefings.js';
 import { RuntimeQueue } from './runtime/queue.js';
 import { RuntimeTurns, type RewindResult, type TurnOptions, type TurnResult } from './runtime/turns.js';
-import { ContinuityEngine } from "../core/continuity/engine.js";
-import { ContinuityError } from "../core/continuity/contracts.js";
+import { ContinuityEngine, packetBudget } from "../core/continuity/engine.js";
+import { droppedHistory } from "../core/continuity/store.js";
+import { ContinuityError, NativeDispatchRejected } from "../core/continuity/contracts.js";
 import { HarnessMonitor, isNativeKind } from "../core/continuity/capabilities.js";
 import { ProviderAgent } from "../providers/agent.js";
 import { LiveDeltaThrottle, type LiveFrame } from "../providers/live.js";
-import { AdapterBase, type AgentCheck } from "../adapters/base.js";
+import { AdapterBase, nativeChatOf, type AgentCheck } from "../adapters/base.js";
 import type { LiveText } from "../types.js";
 export { BudgetExceededError, CLOCK_TICK_MS, LOOM_ASK_TIMEOUT_MESSAGE, LOOM_ASK_TIMEOUT_MS, LoomAskTimeoutError, QuarantinedError, type ServerFrame, type TeamBrainHook, activityLine, planModeBriefing, relativeToProject, withLoomAskTimeout } from './runtime-support.js';
 
@@ -225,11 +228,19 @@ export class ProjectRuntime {
       staleTurnMs: ProjectRuntime.STALE_TURN_MS,
       get closed() { return runtime.closed; },
       agentDir: (...args) => this.agentDir(...args),
+      rollbackAgent: (id, provider, dir) => {
+        const cfg = this.config.agents.find(a => a.id === id);
+        return new ProviderAgent(id, provider, dir, cfg ? this.policyOptions(cfg) : {});
+      },
       get log() { return runtime.log; },
       get info() { return runtime.info; },
       extractMemory: (...args) => this.extractMemory(...args),
       get config() { return runtime.config; },
       chatBinding: (...args) => this.chatBinding(...args),
+      contextBudget: (agentId) => this.contextBudget(agentId),
+      get restoring() { return runtime.restoring || runtime.rewindPending(); },
+      switching: this.switching,
+      switchGeneration: this.switchGeneration,
       validHolder: (...args) => this.validHolder(...args),
       defaultAdapterId: (...args) => this.defaultAdapterId(...args),
       agent: (...args) => this.agent(...args),
@@ -359,6 +370,14 @@ export class ProjectRuntime {
       member: () => this.memberLogin,
       coordinator: () => this.coordinator,
     });
+
+    // Orchestra bypasses sendMessage; guard its public entry before worktrees
+    // or native agents are created, while the requested chat is still known.
+    const startOrchestra = this.orchestra.start.bind(this.orchestra);
+    this.orchestra.start = async (opts) => {
+      this.assertChatNotSwitching(opts.chat ?? MAIN_CHAT);
+      return startOrchestra(opts);
+    };
 
     this.queue = new PromptQueue(path.join(projectLoomDir(info.dir), "queue.json"), (q) => {
       for (const cb of this.queueCoordinator.queueListeners) cb(q);
@@ -850,8 +869,9 @@ export class ProjectRuntime {
     this.agentLifecycle.install(agent, (e) => {
       try {
       const runId = typeof e.payload.loomRunId === "string" ? e.payload.loomRunId : undefined;
-      const liveRun = runId ? this.continuity?.isLiveRun(runId) : true;
-      const chat = (runId ? this.continuity?.eventChat(runId) : undefined) ?? this.turns.turnChat.get(agent.id);
+      const nativeChat = nativeChatOf(e);
+      const liveRun = runId ? this.continuity?.isLiveRun(runId) : nativeChat === undefined || nativeChat === this.turns.turnChat.get(agent.id);
+      const chat = nativeChat ?? (runId ? this.continuity?.eventChat(runId) : undefined) ?? this.turns.turnChat.get(agent.id);
       let payload = e.payload;
       // Enrich the completed turn so its gen_ai span carries system + model +
       // cost (adapters only put tokens on run_complete). The kind is known
@@ -882,7 +902,7 @@ export class ProjectRuntime {
       // Any terminal event stops the stale-session clock — a turn that ended in
       // an error is over, not hung.
       const turnOver = e.kind === "run_complete" || e.kind === "error" || (e.kind === "status" && p.state === "interrupted");
-      if (turnOver && !this.continuity) {
+      if (turnOver && !this.continuity && !(agent instanceof ProviderAgent)) {
         this.turns.busySince.delete(agent.id);
       }
       if (keepsPartial) {
@@ -900,9 +920,10 @@ export class ProjectRuntime {
       });
       this.continuity?.ingest(event);
       this.nativeUsage.observe(event);
+      if (liveRun) this.offerSwitch(event, cfg.kind, chat);
       if (liveRun) this.afterAgentEvent(event);
       if (liveRun && e.kind === "message" && p.proposedPlan === true) this.saveProposedPlan(agent.id, chat, String(p.text ?? ""));
-      if (turnOver && !this.continuity) this.kickQueue();
+      if (turnOver && !this.continuity && !(agent instanceof ProviderAgent)) this.kickQueue();
       } catch {
         // A failed durable ingest is a project fault, not a disposable UI
         // observer. Stop foreground work and keep its receipt uncertain.
@@ -1547,6 +1568,154 @@ export class ProjectRuntime {
     return started;
   }
 
+  /** Dispatches waiting on harness discovery must notice a chat moving. */
+  private restoring = false;
+  private handoffs = 0;
+  private readonly switching = new Set<string>();
+  private readonly switchGeneration = new Map<string, number>();
+  private compactionOwned = false;
+  private compactionJournal(): string { return path.join(this.info.dir, ".loom", "compaction-pending.json"); }
+  private rewindPending(): boolean { return fs.existsSync(path.join(this.info.dir, ".loom", "rewind-pending.json")) || fs.existsSync(this.compactionJournal()); }
+  private assertChatNotSwitching(chat: string): void {
+    if (this.restoring || this.switching.has(chat)) throw new ContinuityError("conflict", "this chat is switching or rewinding; try again when it finishes");
+    if (fs.existsSync(this.compactionJournal())) throw new ContinuityError("recovery_required", "native compaction is unfinished; press Stop or run loom interrupt; legacy journals can be released with loom recover-compaction --evidence <details>");
+    if (this.rewindPending()) throw new ContinuityError("recovery_required", "an interrupted rewind must be retried; use loom rewind <checkpoint> --files-only to leave conversations as they stand");
+  }
+  /** As with uncertain Brain receipts, recovery needs explicit quiescence evidence. */
+  reconcileCompaction(evidence: string): void {
+    if (!evidence.trim()) throw new ContinuityError("invalid", "quiescence evidence is required");
+    if (this.anyBusy() || this.turns.isPreparing || this.queueCoordinator.dispatching.size)
+      throw new ContinuityError("conflict", "a native agent is still busy");
+    const file = this.compactionJournal();
+    if (!fs.existsSync(file)) throw new ContinuityError("conflict", "no unfinished native compaction");
+    let pending: { agentId?: string; chat?: string } = {};
+    try { const parsed = JSON.parse(fs.readFileSync(file, "utf8")); if (parsed && typeof parsed === "object") pending = parsed; } catch { /* a legacy torn write is still recoverable */ }
+    const chat = typeof pending.chat === "string" ? pending.chat : MAIN_CHAT;
+    this.log.append({ kind: "status", agentId: pending.agentId, ...(chat !== MAIN_CHAT ? { chat } : {}),
+      payload: { state: "compaction_reconciled", chat, evidence } });
+    if (this.continuity && pending.agentId) for (const binding of this.continuity.store.bindingsFor(chat, pending.agentId))
+      this.continuity.store.updateBinding({ ...binding, retention: "compacted" });
+    fs.rmSync(file);
+    this.compactionOwned = false;
+    this.kickQueue();
+  }
+
+  /** The usage limits each agent has been offered a switch for, until its turn ends. */
+  private readonly switchOffered = new Map<string, Set<string>>();
+
+  /**
+   * A provider says its usage limit is reached: say so in the chat, with the
+   * agents on another provider that could carry the chat on (their own limit
+   * not reached). Once per agent and limit, until the turn ends. Acting on it
+   * is switchChat.
+   */
+  private offerSwitch(event: LoomEvent, kind: string, chat?: string): void {
+    const agentId = event.agentId;
+    if (!agentId) return;
+    const p = event.payload;
+    if (event.kind === "run_complete" || event.kind === "error" || (event.kind === "status" && p.state === "interrupted")) {
+      this.switchOffered.delete(agentId);
+      return;
+    }
+    if (event.kind !== "status" || p.state !== "usage_limits" || typeof p.reached !== "string" || !p.reached) return;
+    const offered = this.switchOffered.get(agentId) ?? new Set<string>();
+    if (offered.has(p.reached)) return;
+    offered.add(p.reached);
+    this.switchOffered.set(agentId, offered);
+    const provider = providerOf(kind);
+    const alternatives = this.config.agents
+      .filter((a) => a.id !== agentId && isNativeKind(a.kind) && providerOf(a.kind) !== provider && this.agents.has(a.id) && isAdapter(this.agents.get(a.id)!) && !this.nativeUsage.limitsFor(a.kind)?.reached)
+      .map((a) => ({ agentId: a.id, kind: a.kind }));
+    const window = (Array.isArray(p.windows) ? (p.windows as Array<{ id?: unknown; resetsAt?: unknown }>) : []).find((w) => w.id === p.reached);
+    const where = chat ?? MAIN_CHAT;
+    this.log.append({
+      kind: "status",
+      agentId,
+      ...(where !== MAIN_CHAT ? { chat: where } : {}),
+      payload: { state: "switch_suggested", reason: "usage_limit", provider, limit: p.reached, chat: where, alternatives,
+        ...(typeof window?.resetsAt === "number" ? { resetsAt: window.resetsAt } : {}) },
+    });
+  }
+
+  /**
+   * Move a chat to another agent: the switch a usage limit offers, or any
+   * change of provider mid-chat. The outgoing agent's turn in this chat is
+   * stopped, and its native session stays parked (warm until the reaper) for
+   * a switch back. Main moves the baton; any other chat is re-pinned. With
+   * Brain continuity on, the next turn brings the new agent up to date on the
+   * chat. `resend` sends the chat's last message again, now to the new agent.
+   */
+  async switchChat(chat: string, agentId: string, opts: { resend?: boolean } = {}): Promise<{ from: string | null; resent?: TurnResult; requeued?: number }> {
+    if (this.restoring) throw new ContinuityError("conflict", "the project is rewinding; wait before switching");
+    const target = this.agent(agentId);
+    if (!isAdapter(target)) throw new Error(`"${agentId}" is a bridge — it can't answer in a thread`);
+    if (chat !== MAIN_CHAT && !this.chats().some((c) => c.id === chat)) throw new Error(`no chat "${chat}"`);
+    if (this.switching.has(chat)) throw new ContinuityError("conflict", "this chat is already switching agents");
+    if (this.queueCoordinator.dispatching.has(chat)) throw new ContinuityError("conflict", "a queued message is still dispatching in this chat; wait before switching");
+    const from = this.chatBinding(chat)?.agentId ?? this.validHolder();
+    // Only inferred targets follow the chat. Captured continuity requests are
+    // immutable intent: refuse rather than silently changing their target.
+    const follows = (i: QueueItem) => (i.chat ?? MAIN_CHAT) === chat && (i.followsChat || i.target?.kind === "auto");
+    const queued = this.queue.snapshot().items.filter(follows);
+    if (this.continuity && queued.length)
+      throw new ContinuityError("conflict", `this chat has ${queued.length} queued message${queued.length === 1 ? "" : "s"} for ${from ?? "its current agent"}; remove ${queued.length === 1 ? "it" : "them"} (or let ${queued.length === 1 ? "it" : "them"} run) before switching`);
+    // The queue holds still while the chat moves: stopping the outgoing turn
+    // would otherwise start the next queued prompt on the agent being left.
+    this.switchGeneration.set(chat, (this.switchGeneration.get(chat) ?? 0) + 1);
+    this.switching.add(chat);
+    this.queueCoordinator.hold();
+    let requeued = 0;
+    try {
+      // Whatever runs in this chat stops first, including a turn still being prepared.
+      await this.turns.stopChat(chat, agentId);
+      if (chat === MAIN_CHAT) {
+        if (from !== agentId) await this.handoffGuarded(agentId, {}, true);
+      } else {
+        this.setChatAgent(chat, agentId);
+      }
+      // Stop awaits: the human may have removed or explicitly retargeted an
+      // entry meanwhile. Only the entries that still follow this chat move.
+      for (const item of this.queue.snapshot().items.filter(follows)) {
+        this.queueCoordinator.editQueued(item.id, { target: { kind: "agent", agentId } }, { preserveFollowsChat: true });
+        requeued++;
+      }
+    } finally {
+      this.switching.delete(chat);
+      this.queueCoordinator.release();
+      this.kickQueue();
+    }
+    this.switchOffered.delete(from ?? "");
+    this.log.append({ kind: "status", agentId, ...(chat !== MAIN_CHAT ? { chat } : {}), payload: { state: "chat_switched", from, to: agentId, chat } });
+    const out = { from, ...(requeued ? { requeued } : {}) };
+    if (!opts.resend) return out;
+    const last = this.lastLiveMessage(chat);
+    if (!last) return out;
+    return { ...out, resent: await this.sendMessage(last, undefined, { chat }) };
+  }
+
+  /**
+   * The chat's latest message from you that is still part of the
+   * conversation: not in a turn a rewind dropped, and not one still waiting in
+   * the queue (a continuity request is logged when it is captured, before it runs).
+   */
+  private lastLiveMessage(chat: string): string | null {
+    const waiting = new Set(this.queue.snapshot().items.flatMap((i) => {
+      const event = i.continuity ? this.continuity?.store.requestEvent(i.continuity.requestId) : undefined;
+      return event ? [event.id] : [];
+    }));
+    const dropped = droppedHistory(this.log.list({ kinds: ["checkpoint"] }), chat);
+    const last = this.log.list({ chat, kinds: ["message"] }).reverse()
+      .find((e) => !e.agentId && e.payload.author !== "loom" && typeof e.payload.text === "string" && !waiting.has(e.id) &&
+        !dropped.isDropped(e.id));
+    return last ? String(last.payload.text) : null;
+  }
+
+  /** Tokens a Brain packet may add for this agent: sized by the context window it last reported. */
+  contextBudget(agentId: string): number {
+    const kind = this.config.agents.find((a) => a.id === agentId)?.kind ?? "";
+    return packetBudget(kind, this.nativeUsage.context(agentId)?.maxTokens);
+  }
+
   /** What a thread has pinned, if anything. */
   chatBinding(chat?: string): { agentId?: string; model?: string } {
     if (!chat || chat === MAIN_CHAT) return {};
@@ -1786,20 +1955,46 @@ export class ProjectRuntime {
   checkpoints(): Promise<checkpoints.Checkpoint[]> { return this.turns.checkpoints(); }
 
   /** Put the files back to a checkpoint, and the checkpoint's chat's conversations with them (see RuntimeTurns.rewind). */
-  async rewind(id: string, options: { conversation?: boolean } = {}): Promise<RewindResult> { return this.turns.rewind(id, options); }
+  async rewind(id: string, options: { conversation?: boolean } = {}): Promise<RewindResult> {
+    if (this.queueCoordinator.dispatching.size || this.turns.isPreparing || this.handoffs)
+      throw new ContinuityError("conflict", "a message is still dispatching or preparing; wait before rewinding");
+    if (this.restoring || this.switching.size || this.orchestra.runningScopes().length) throw new ContinuityError("conflict", "a chat is switching or rewinding, or an orchestra is running; wait before rewinding");
+    if (fs.existsSync(this.compactionJournal())) throw new ContinuityError("recovery_required", "native compaction has not settled");
+    const origin = this.log.list({ kinds: ["checkpoint"] }).find(e =>
+      (e.payload.id === id && e.payload.reason === "before_turn") || (e.payload.undo === id && e.payload.reason === "rewound"));
+    const chat = typeof origin?.payload.chat === "string" ? origin.payload.chat : origin?.chat ?? MAIN_CHAT;
+    // Reuse the chat mutation barrier and invalidate sends awaiting harness
+    // discovery; queue holds cover the entire restore and native rollback.
+    for (const id of new Set([MAIN_CHAT, chat, ...this.chats().map(c => c.id)]))
+      this.switchGeneration.set(id, (this.switchGeneration.get(id) ?? 0) + 1);
+    this.switching.add(chat);
+    this.restoring = true;
+    this.queueCoordinator.hold();
+    try { return await this.turns.rewind(id, options); }
+    finally {
+      this.switching.delete(chat);
+      this.restoring = false;
+      this.queueCoordinator.release();
+      this.kickQueue();
+    }
+  }
 
   /** Put one file back as a checkpoint had it (see checkpoints.restoreFile). */
   async rewindFile(id: string, file: string): Promise<Awaited<ReturnType<typeof checkpoints.restoreFile>>> {
-    const busy = [...this.turns.busySince.keys()];
-    if (busy.length) {
-      throw new Error(`${busy.join(", ")} ${busy.length === 1 ? "is" : "are"} mid-turn — stop the turn first, or the file changes underneath it`);
-    }
-    const out = await checkpoints.restoreFile(this.info.dir, id, file);
-    this.log.append({
-      kind: "checkpoint",
-      payload: { id: out.restored.id, label: `${out.path} only`, at: Date.now(), reason: "rewound", files: 1, undo: out.undo.id, path: out.path },
-    });
-    return out;
+    if (this.restoring || this.switching.size || this.queueCoordinator.dispatching.size || this.turns.isPreparing ||
+      this.anyBusy() || this.handoffs || this.continuity?.store.activeReceipts().length)
+      throw new ContinuityError("conflict", "finish dispatching, preparing or running turns before rewinding files");
+    this.restoring = true;
+    // Invalidate sends that have not registered while harness discovery awaits.
+    for (const chat of new Set([MAIN_CHAT, ...this.chats().map(c => c.id)]))
+      this.switchGeneration.set(chat, (this.switchGeneration.get(chat) ?? 0) + 1);
+    this.queueCoordinator.hold();
+    try {
+      const workspace = this.turns.checkpointWorkspace(id);
+      const out = await checkpoints.restoreFile(workspace.dir, id, file);
+      this.log.append({ kind: "checkpoint", ...(workspace.agentId ? { agentId: workspace.agentId } : {}), payload: { cwd: workspace.dir, id: out.restored.id, label: `${out.path} only`, at: Date.now(), reason: "rewound", files: 1, undo: out.undo.id, path: out.path } });
+      return out;
+    } finally { this.restoring = false; this.queueCoordinator.release(); this.kickQueue(); }
   }
 
   async turnFacts(agentId: string): Promise<TurnFacts> { return this.turns.turnFacts(agentId); }
@@ -2167,18 +2362,46 @@ export class ProjectRuntime {
   async answerQuestion(agentId: string, chat: string, requestId: string, answers: Record<string, unknown>): Promise<void> {
     const agent = this.agents.get(agentId);
     if (!(agent instanceof ProviderAgent)) throw new Error(`agent "${agentId}" can't take answers to questions`);
-    this.releaseQuestionHold(agentId);
     await agent.respondToUserInput(chat, requestId, answers);
+    if (Object.keys(answers).length) this.log.append({ kind: "message", ...(chat !== MAIN_CHAT ? { chat } : {}),
+      payload: { author: "user", requestId, text: `Answer to ${requestId}: ${JSON.stringify(answers)}` } });
+    this.releaseQuestionHold(agentId);
   }
 
   /** Compact an agent's native context for a chat now, instead of waiting for the harness to. */
   async compactAgent(agentId: string, chat: string = MAIN_CHAT): Promise<void> {
+    this.assertChatNotSwitching(chat);
     const agent = this.agents.get(agentId);
     if (!(agent instanceof ProviderAgent)) throw new Error(`agent "${agentId}" can't be compacted from Loom`);
-    if (agent.busy() || this.turns.busySince.has(agentId)) throw new Error(`"${agentId}" is mid-turn — wait for it to finish, then compact`);
-    await this.ensureStarted(agentId);
-    this.turns.turnChat.set(agentId, chat);
-    await agent.compact(chat);
+    if (agent.busy() || this.turns.busySince.size || this.continuity?.store.activeReceipts().length)
+      throw new Error(`"${agentId}" cannot compact while a writer is active`);
+    this.turns.busySince.set(agentId, Date.now());
+    try {
+      await this.ensureStarted(agentId);
+      this.assertChatNotSwitching(chat);
+      this.turns.turnChat.set(agentId, chat);
+      const journal = this.compactionJournal();
+      try { await agent.compact(chat, session => {
+        // Publish a complete intent only once the session exists, before the
+        // native request. Stop can fence this process group after a restart.
+        const processIdentity = session.processGroupId ? processGroupIdentity(session.processGroupId) : undefined;
+        if (processIdentity === null) throw new NativeDispatchRejected("native process exited before compaction submission");
+        const tmp = `${journal}.${randomUUID()}.tmp`;
+        const fd = fs.openSync(tmp, "wx", 0o600);
+        try { fs.writeFileSync(fd, JSON.stringify({ agentId, chat, cwd: agent.workspaceDir, processGroupId: session.processGroupId, processIdentity })); fs.fsyncSync(fd); }
+        finally { fs.closeSync(fd); }
+        try { fs.renameSync(tmp, journal); } finally { fs.rmSync(tmp, { force: true }); }
+        const parent = fs.openSync(path.dirname(journal), "r");
+        try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
+        this.compactionOwned = true;
+      }); }
+      catch (error) {
+        if (error instanceof NativeDispatchRejected) { fs.rmSync(journal, { force: true }); this.compactionOwned = false; }
+        throw error;
+      }
+      fs.rmSync(journal, { force: true });
+      this.compactionOwned = false;
+    } finally { this.turns.busySince.delete(agentId); }
   }
 
   /**
@@ -2193,10 +2416,11 @@ export class ProjectRuntime {
       const slug = heading.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "plan";
       const day = new Date().toISOString().slice(0, 10);
       const dir = path.join(this.agentDir(agentId), "plans");
+      if (fs.existsSync(dir) && fs.lstatSync(dir).isSymbolicLink()) throw new Error("plans has a symlink parent");
       fs.mkdirSync(dir, { recursive: true });
       let file = path.join(dir, `${day}-${slug}.md`);
       for (let n = 2; fs.existsSync(file); n++) file = path.join(dir, `${day}-${slug}-${n}.md`);
-      fs.writeFileSync(file, `---\ntitle: ${JSON.stringify(heading.trim())}\nstatus: proposed\nagent: ${agentId}\n---\n\n${markdown.trim()}\n`);
+      fs.writeFileSync(file, `---\ntitle: ${JSON.stringify(heading.trim())}\nstatus: proposed\nagent: ${agentId}\n---\n\n${markdown.trim()}\n`, { flag: "wx" });
       this.log.append({ kind: "status", agentId, ...(chat ? { chat } : {}),
         payload: { state: "plan_saved", path: path.relative(this.agentDir(agentId), file) } });
     } catch (error) {
@@ -2211,6 +2435,9 @@ export class ProjectRuntime {
   onQueueChange(cb: (q: QueueState) => void): () => void { return this.queueCoordinator.onQueueChange(cb); }
 
   enqueue(input: QueueInput): QueueItem {
+    this.assertChatNotSwitching(input.chat ?? MAIN_CHAT);
+    // Only an unnamed target follows the chat; an orchestra goal is not an agent's.
+    input = { ...input, ...(!input.target || input.target.kind === "auto" ? { followsChat: true } : {}) };
     if (this.continuity) {
       this.queue.assertCanAdd(input);
       if (!this.chats().some(c => c.id === (input.chat ?? MAIN_CHAT)))
@@ -2222,7 +2449,7 @@ export class ProjectRuntime {
       if (!cfg || !["codex", "claude-code"].includes(cfg.kind)) throw new ContinuityError("unsupported", "queued native continuity needs a supported harness");
       const captured = this.continuity.capture({ id: newId(16), text: input.text, conversationId: input.chat ?? MAIN_CHAT,
         agentInstanceId: target, source: input.source ?? "user", model: bound.agentId === target ? bound.model ?? null : null,
-        plan: Boolean(input.plan), targetAddedTokens: 6000 });
+        plan: Boolean(input.plan), targetAddedTokens: this.contextBudget(target) });
       input = { ...input, target: { kind: "agent", agentId: target }, continuity: { requestId: captured.request.id, model: captured.request.model } };
     }
     return this.queueCoordinator.enqueue(input);
@@ -2570,10 +2797,27 @@ export class ProjectRuntime {
     }
   }
 
-  async handoff(
-    to: string,
-    opts: { source?: "user" | "route" } = {},
-  ): Promise<{ from: string | null; merge?: MergeOutcome }> {
+  async handoff(to: string, opts: { source?: "user" | "route" } = {}): Promise<{ from: string | null; merge?: MergeOutcome }> {
+    return this.handoffGuarded(to, opts, false);
+  }
+
+  private async handoffGuarded(to: string, opts: { source?: "user" | "route" }, duringSwitch: boolean): Promise<{ from: string | null; merge?: MergeOutcome }> {
+    if (!duringSwitch) this.assertChatNotSwitching(MAIN_CHAT);
+    this.handoffs++;
+    try { return await this.performHandoff(to, opts, duringSwitch); }
+    finally { this.handoffs--; }
+  }
+
+  private async performHandoff(to: string, opts: { source?: "user" | "route" }, duringSwitch: boolean): Promise<{ from: string | null; merge?: MergeOutcome }> {
+    const generation = this.switchGeneration.get(MAIN_CHAT) ?? 0;
+    const route = opts.source === "route" ? this.routes.state() : null;
+    const checkRoute = () => {
+      const active = this.routes.state();
+      if (generation !== (this.switchGeneration.get(MAIN_CHAT) ?? 0) ||
+        (route && (!active || active.id !== route.id || active.status !== "running")))
+        throw new ContinuityError("conflict", "handoff was superseded; the chat or route changed");
+      if (!duringSwitch) this.assertChatNotSwitching(MAIN_CHAT);
+    };
     if (this.continuity?.store.activeReceipts().some(r => r.execution === "unknown"))
       throw new ContinuityError("recovery_required", "reconcile uncertain native writers before handoff or merge");
     const target = this.agent(to);
@@ -2604,6 +2848,7 @@ export class ProjectRuntime {
       }
       // After the outgoing agent has stopped (its last commit is in), before
       // the briefing is written — so the briefing can carry the result.
+      checkRoute();
       merge = await this.mergeForHandoff(holder, to);
       if (merge) handoffMeta = { ...handoffMeta, merge };
     }
@@ -2616,15 +2861,18 @@ export class ProjectRuntime {
     if (this.continuity) {
       // New context is assembled from the selected chat at dispatch, never
       // from global history or private bridge memory on a picker click.
+      checkRoute();
       this.briefings.pendingBriefings.delete(to);
       const { from } = this.baton.handoff(to, { ...handoffMeta, projected: false, continuity: 1 });
       await this.ensureStarted(to);
       return { from, ...(merge ? { merge } : {}) };
     }
     const prepared = await this.briefings.prepareHandoff(to, holder, mergeNote, bridgeIds);
+    checkRoute();
     if (this.closed || this.agents.get(to) !== target) throw new Error("handoff target is no longer active");
     await target.injectMemory(prepared.memory);
     if (this.closed || this.agents.get(to) !== target) throw new Error("handoff target is no longer active");
+    checkRoute();
     writeMemoryFile(this.info.dir, to, prepared.memory);
     this.briefings.pendingBriefings.set(to, prepared.briefing);
     if (prepared.mode === "llm") {
@@ -2635,13 +2883,27 @@ export class ProjectRuntime {
     }
     if (this.closed || this.agents.get(to) !== target) throw new Error("handoff target is no longer active");
 
+    checkRoute();
     const { from } = this.baton.handoff(to, handoffMeta);
     await this.ensureStarted(to);
     return { from, ...(merge ? { merge } : {}) };
   }
   async interrupt(
     opts: { source?: "user" | "route" } = {},
-  ): Promise<{ interrupted: string | null }> { return this.turns.interrupt(opts); }
+  ): Promise<{ interrupted: string | null }> {
+    if (fs.existsSync(this.compactionJournal())) {
+      let pending: { agentId?: string; processGroupId?: number; processIdentity?: string } = {};
+      try { const parsed = JSON.parse(fs.readFileSync(this.compactionJournal(), "utf8")); if (parsed && typeof parsed === "object") pending = parsed; } catch { /* recover via CLI evidence */ }
+      const agent = pending.agentId ? this.agents.get(pending.agentId) : undefined;
+      if (agent && isAdapter(agent)) await agent.stop();
+      if (!(await stopRecordedProcessGroup(pending)) && !this.compactionOwned)
+        throw new ContinuityError("recovery_required", "compaction process identity cannot be verified; stop its native process, then run loom recover-compaction --evidence <details>");
+      if (this.anyBusy()) throw new ContinuityError("conflict", "wait for compaction to settle, then press Stop again");
+      if (fs.existsSync(this.compactionJournal())) this.reconcileCompaction("Stop confirmed native process group termination");
+      return { interrupted: pending.agentId ?? null };
+    }
+    return this.turns.interrupt(opts);
+  }
 
   // -------------------------------------------------------------------------
   // Routing
@@ -2689,6 +2951,7 @@ export class ProjectRuntime {
     router?: RouterKind;
     maxHops?: number;
   }): Promise<RouteState> {
+    this.assertChatNotSwitching(MAIN_CHAT);
     if (this.continuity) throw new ContinuityError("unsupported", "autonomous route continuity is not verified; select a native agent directly");
     this.snapshotBeforeRoute();
     if (typeof opts.spec === "string" && opts.spec.trim() === "auto") {
@@ -2802,9 +3065,10 @@ export class ProjectRuntime {
     const lastUserMsg = [...recent]
       .reverse()
       .find((e) => e.kind === "message" && !e.agentId);
-    const lastNeedsInput = [...recent].reverse().find((e) => e.kind === "needs_input");
+    const resolved = new Set(recent.filter(e => e.kind === "status" && e.payload.state === "question_answered").map(e => e.payload.requestId));
+    const lastNeedsInput = [...recent].reverse().find((e) => e.kind === "needs_input" && (!e.payload.requestId || !resolved.has(e.payload.requestId)));
     const needsInput = Boolean(
-      lastNeedsInput && (!lastUserMsg || lastNeedsInput.id > lastUserMsg.id),
+      lastNeedsInput && (lastNeedsInput.payload.requestId || !lastUserMsg || lastNeedsInput.id > lastUserMsg.id),
     );
     return {
       id: this.info.id,
@@ -3025,15 +3289,26 @@ export class ProjectRuntime {
     this.live.close();
     this.briefings.close();
     if (this.mcpTimer) { clearInterval(this.mcpTimer); this.mcpTimer = null; }
-    await this.agentLifecycle.close();
+    let stopError: unknown;
+    try { await this.agentLifecycle.close(); } catch (error) { stopError = error; }
     // A dev server outlives the daemon that started it unless we say otherwise,
     // and an orphan holding port 3000 is a bad thing to leave behind.
     if (this.queueCoordinator.clockTimer) { clearInterval(this.queueCoordinator.clockTimer); this.queueCoordinator.clockTimer = null; }
     await this.servers.closeAll().catch(() => { });
     for (const proxy of this.proxies.values()) await proxy.close().catch(() => { });
     this.proxies.clear();
+    if (!stopError && fs.existsSync(this.compactionJournal())) {
+      try {
+        const pending = JSON.parse(fs.readFileSync(this.compactionJournal(), "utf8")) as { processGroupId?: number; processIdentity?: string };
+        if (await stopRecordedProcessGroup(pending)) {
+          fs.rmSync(this.compactionJournal(), { force: true });
+          this.compactionOwned = false;
+        } else if (this.compactionOwned) { fs.rmSync(this.compactionJournal(), { force: true }); this.compactionOwned = false; }
+      } catch (error) { if (!(error instanceof SyntaxError)) stopError = error; }
+    }
     this.brain.close(); // unsubscribes before the log drops its listeners
     this.log.close();
+    if (stopError) throw stopError;
   }
 
   private closed = false;

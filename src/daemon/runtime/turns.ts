@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { BatonManager, NotHolderError } from "../../core/baton.js";
 import * as checkpoints from "../../core/checkpoint.js";
 import type { EventJournal } from "../../core/eventlog.js";
@@ -13,7 +15,7 @@ import { agentAllowed, type TeamPolicy } from "../../core/team-policy.js";
 import { type MergeOutcome } from "../../core/worktree-merge.js";
 import {
   diffSinceSnapshot,
-  porcelainStatus,
+  turnSnapshot,
   type TurnDiff
 } from "../../core/worktree.js";
 import type {
@@ -27,6 +29,8 @@ import { MAIN_CHAT, isAdapter } from "../../types.js";
 import { planModeBriefing } from '../runtime-support.js';
 import { ProviderAgent } from "../../providers/agent.js";
 import type { ProviderKind } from "../../providers/contracts.js";
+import { FileSessionDirectory } from "../../providers/directory.js";
+import { worktreePath } from "../../core/git.js";
 import type { RollbackStep } from "../../providers/service.js";
 
 /** A rewind: the files put back, and each conversation that went back with them. */
@@ -35,17 +39,33 @@ export interface RewindResult extends checkpoints.RestoreResult {
   conversation: Array<{ agentId: string; provider: ProviderKind; turns: number; error?: string }>;
 }
 
+/**
+ * Point Brain's bindings for (chat, agent) at the native session a rollback
+ * left, in a new epoch. The accepted packets of the old epoch no longer say
+ * what the session holds (the rollback removed some of them, and with them
+ * what they delivered), so the next packet is a full reconstruction rather
+ * than a delta that trusts them.
+ */
+export function followRollback(brain: ContinuityEngine, chat: string, agentId: string, cursor: string | null, scope: { workspaceId: string; previousCursor: string | null }): void {
+  for (const binding of brain.store.bindingsFor(chat, agentId)) {
+    if (binding.nativeSessionId === null || binding.workspaceId !== scope.workspaceId || binding.nativeSessionId !== scope.previousCursor) continue;
+    brain.store.updateBinding({ ...binding, nativeSessionId: cursor, sessionEpoch: binding.sessionEpoch + 1, retention: "unknown" });
+  }
+}
+
 /** A rewind refused before anything changed, because a conversation can't go back with the files. */
 export class RewindRefused extends Error {
   readonly code = "conversation_refused";
 }
 import { randomUUID } from "node:crypto";
-import { ContinuityError, NativeDispatchRejected } from "../../core/continuity/contracts.js";
+import { ContinuityError, NativeDispatchRejected, digest } from "../../core/continuity/contracts.js";
 import type { ContinuityEngine } from "../../core/continuity/engine.js";
 import type { HarnessHealth } from "../../core/continuity/capabilities.js";
 
 export interface TurnOptions {
   source?: "user" | "route"; chat?: string; plan?: boolean; fromQueue?: boolean;
+  /** Queue dispatch preserves whether a target was inferred from the chat. */
+  followsChat?: true;
   /** How long you asked this one answer to be. */
   length?: "brief" | "detailed";
   requestId?: string; capturedModel?: string | null; resume?: boolean; contextTarget?: number;
@@ -93,11 +113,17 @@ export interface RuntimeTurnsHost {
   dispatchFailed: (agent: AnyAgent, chat: string, error: unknown) => void;
   consumePendingBriefing: (agentId: string) => string | undefined;
   activeSkillsBlock: () => string;
+  /** Tokens a Brain packet may add for this agent (sized by its context window). */
+  contextBudget: (agentId: string) => number;
+  restoring?: boolean;
+  switching: ReadonlySet<string>;
+  switchGeneration: ReadonlyMap<string, number>;
   /** The agent's standing instructions block ("" when it has none). */
   agentInstructions: (agentId: string) => string;
   healthyMcps: () => McpServerConfig[];
   appendIfOpen: (event: Parameters<EventJournal["append"]>[0]) => void;
   agents: ReadonlyMap<string, AnyAgent>;
+  rollbackAgent?: (id: string, provider: ProviderKind, dir: string) => ProviderAgent;
   handoff: (to: string, opts?: { source?: "user" | "route"; }) => Promise<{ from: string | null; merge?: MergeOutcome; }>;
   pendingBriefings: Map<string, string>;
 }
@@ -153,6 +179,7 @@ export class RuntimeTurns {
    */
   busySince = new Map<string, number>();
   private readonly preparing = new Map<string, AbortController>();
+  get isPreparing(): boolean { return this.preparing.size > 0; }
   /** Native requests between capture and settlement (or queueing). */
   private readonly inFlight = new Set<string>();
 
@@ -165,7 +192,8 @@ export class RuntimeTurns {
    * a project that isn't a git repo simply doesn't get one. What it must
    * never do is stop the turn.
    */
-  async checkpointBefore(agentId: string, prompt: string, chat: string = MAIN_CHAT): Promise<void> {
+  async checkpointBefore(agentId: string, prompt: string, chat: string = MAIN_CHAT, turnEvent?: number): Promise<void> {
+    let associated = false;
     try {
       const label = prompt.replace(/\s+/g, " ").trim().slice(0, 120) || `a turn by ${agentId}`;
       const cp = await checkpoints.capture(this.host.agentDir(agentId), label);
@@ -175,21 +203,52 @@ export class RuntimeTurns {
       // client by "the checkpoint nearest above this card" would be right
       // until the day two turns interleave.
       this.turnCheckpoint.set(agentId, cp.id);
-      // The chat is what a rewind to this point rolls back.
+      // The chat is what a rewind to this point rolls back, from the turn's own
+      // checkpoint on, with the user message tracked separately.
       this.host.log.append({
         kind: "checkpoint",
         agentId,
         ...(chat !== MAIN_CHAT ? { chat } : {}),
-        payload: { id: cp.id, label: cp.label, at: cp.at, dirty: cp.dirty, branch: cp.branch, reason: "before_turn", chat },
+        payload: { id: cp.id, label: cp.label, at: cp.at, dirty: cp.dirty, branch: cp.branch, reason: "before_turn", chat,
+          ...(turnEvent !== undefined ? { turnEvent } : {}), store: cp.store, cwd: this.host.agentDir(agentId) },
       });
+      associated = true;
     } catch {
       /* never the reason a turn doesn't run */
+    } finally {
+      // Conversation history still needs the association when no files could
+      // be captured. A status marker never advertises a restorable checkpoint.
+      if (!associated && turnEvent !== undefined && !this.host.closed)
+        this.host.log.append({ kind: "status", agentId, ...(chat !== MAIN_CHAT ? { chat } : {}),
+          payload: { state: "turn_association", chat, turnEvent } });
     }
   }
 
   /** Every point this project's files can be put back to, newest first. */
   checkpoints(): Promise<checkpoints.Checkpoint[]> {
     return checkpoints.list(this.host.info.dir);
+  }
+
+  checkpointWorkspace(id: string): { dir: string; agentId?: string } {
+    const event = this.host.log.list({ kinds: ["checkpoint"] }).find(e =>
+      (e.payload.id === id && e.payload.reason === "before_turn") || (e.payload.undo === id && e.payload.reason === "rewound"));
+    // Linked worktrees share checkpoint refs, but their working files differ.
+    // Undo checkpoints inherit the checkout their rewind actually restored.
+    const agentId = event?.agentId;
+    const saved = event?.payload.cwd;
+    if (typeof saved === "string") {
+      if (!fs.existsSync(saved)) throw new RewindRefused(`checkpoint checkout ${saved} no longer exists`);
+      return { dir: saved, ...(agentId ? { agentId } : {}) };
+    }
+    // Older checkpoints recorded the branch rather than cwd. Use that only
+    // when it identifies the agent checkout; refuse ambiguous provenance.
+    const linked = agentId ? worktreePath(this.host.info.dir, `agent-${agentId}`) : null;
+    if (agentId && event?.payload.branch === `agent/${agentId}`) {
+      if (!linked || !fs.existsSync(linked)) throw new RewindRefused("the checkpoint's agent checkout no longer exists");
+      return { dir: linked, agentId };
+    }
+    if (linked && fs.existsSync(linked)) throw new RewindRefused("this older checkpoint does not identify which checkout to restore");
+    return { dir: this.host.info.dir, ...(agentId ? { agentId } : {}) };
   }
 
   /**
@@ -200,6 +259,12 @@ export class RuntimeTurns {
    * read this turn, and the damage lands in whatever it writes next.
    */
   async rewind(id: string, options: { conversation?: boolean } = {}): Promise<RewindResult> {
+    const temporary: ProviderAgent[] = [];
+    try { return await this.performRewind(id, options, temporary); }
+    finally { await Promise.all(temporary.map(agent => agent.stop())); }
+  }
+
+  private async performRewind(id: string, options: { conversation?: boolean }, temporary: ProviderAgent[]): Promise<RewindResult> {
     if (this.host.continuity?.store.activeReceipts().length)
       throw new ContinuityError("recovery_required", "finish or reconcile native writers before rewinding files");
     const busy = [...this.busySince.keys()];
@@ -212,12 +277,56 @@ export class RuntimeTurns {
     // back: every Codex and Claude session in it drops the turns it ran since
     // (t3code's checkpoint revert). All of it is planned before any file moves,
     // so a conversation that can't be rolled back refuses the whole rewind.
-    const chat = options.conversation === false ? null : this.checkpointChat(id);
+    const journal = path.join(this.host.info.dir, ".loom", "rewind-pending.json");
+    let pending: { id: string; origin: ReturnType<RuntimeTurns["checkpointOrigin"]>; steps: RollbackStep[]; workspace?: { dir: string; agentId?: string }; prepared?: { target: checkpoints.Checkpoint; undo: checkpoints.Checkpoint } } | null = null;
+    if (fs.existsSync(journal)) {
+      try {
+        pending = JSON.parse(fs.readFileSync(journal, "utf8"));
+        if (!pending || typeof pending.id !== "string" || !Array.isArray(pending.steps)) throw new Error("invalid rewind intent");
+      } catch {
+        if (options.conversation !== false) throw new ContinuityError("recovery_required", "rewind intent is unreadable; use loom rewind <checkpoint> --files-only to release it");
+        fs.rmSync(journal);
+        pending = null;
+      }
+    }
+    // Files-only is also the ordinary escape from an interrupted conversation
+    // rewind. The user accepts the native histories as they stand, even when
+    // the original checkout or provider is no longer available.
+    if (pending && (options.conversation === false || pending.prepared?.undo.id === id)) {
+      fs.rmSync(journal);
+      pending = null;
+      options = { conversation: false };
+    }
+    if (pending && pending.id !== id) throw new ContinuityError("recovery_required", `retry rewind ${pending.id} before another rewind`);
+    const origin = pending ? pending.origin : (options.conversation === false ? null : this.checkpointOrigin(id));
+    const chat = origin?.chat ?? null;
     const cutoff = checkpoints.capturedAt(id);
     const steps: Array<{ agent: ProviderAgent; step: RollbackStep }> = [];
-    if (chat !== null && cutoff !== null) {
-      for (const agent of this.host.agents.values()) {
-        if (!(agent instanceof ProviderAgent)) continue;
+    const candidates = [...this.host.agents.values()].filter((a): a is ProviderAgent => a instanceof ProviderAgent);
+    const getAgent = (id: string, provider: ProviderKind, dir: string): ProviderAgent => {
+      const found = candidates.find(a => a.id === id && a.provider === provider && a.workspaceDir === dir);
+      if (found) return found;
+      const agent = this.host.rollbackAgent?.(id, provider, dir);
+      if (!agent) throw new RewindRefused(`restore agent ${id} before retrying the rewind`);
+      candidates.push(agent); temporary.push(agent);
+      return agent;
+    };
+    if (!pending && chat !== null) {
+      const dirs = new Set([this.host.info.dir, ...this.host.config.agents.map(a => this.host.agentDir(a.id)),
+        ...this.host.config.agents.map(a => worktreePath(this.host.info.dir, `agent-${a.id}`)),
+        ...this.host.log.list({ kinds: ["checkpoint"] }).flatMap(e => typeof e.payload.cwd === "string" ? [e.payload.cwd] : [])]);
+      for (const dir of dirs) if (fs.existsSync(path.join(dir, ".loom", "providers", "sessions.json"))) {
+        const directory = new FileSessionDirectory(path.join(dir, ".loom"), () => {});
+        for (const binding of directory.list({ threadId: chat })) getAgent(binding.instanceId, binding.provider, dir);
+      }
+    }
+    if (pending) {
+      for (const step of pending.steps) {
+        const agent = getAgent(step.instanceId, step.provider, step.cwd);
+        steps.push({ agent, step });
+      }
+    } else if (chat !== null && cutoff !== null) {
+      for (const agent of candidates) {
         let step: RollbackStep | null;
         try { step = await agent.planRollback(chat, cutoff); }
         catch (error) {
@@ -226,20 +335,54 @@ export class RuntimeTurns {
         if (step) steps.push({ agent, step });
       }
     }
-    const out = await checkpoints.restore(this.host.info.dir, id);
+    const workspace = pending?.workspace ?? this.checkpointWorkspace(id);
+    const prepared = pending?.prepared ?? await checkpoints.prepareRestore(workspace.dir, id);
+    const saveIntent = (remaining: RollbackStep[]) => {
+      fs.mkdirSync(path.dirname(journal), { recursive: true });
+      const tmp = `${journal}.${randomUUID()}.tmp`;
+      const fd = fs.openSync(tmp, "wx", 0o600);
+      try { fs.writeFileSync(fd, JSON.stringify({ id, origin, workspace, prepared, steps: remaining })); fs.fsyncSync(fd); }
+      finally { fs.closeSync(fd); }
+      fs.renameSync(tmp, journal);
+      const parent = fs.openSync(path.dirname(journal), "r");
+      try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
+    };
+    if (!pending) saveIntent(steps.map(s => s.step));
+    let out: checkpoints.RestoreResult;
+    let filesMayHaveChanged = false;
+    try { out = await checkpoints.restore(workspace.dir, id, prepared, () => { filesMayHaveChanged = true; }); }
+    catch (error) {
+      // Preflight refusals must not wedge an unchanged workspace. Once writes
+      // start, retain the intent and undo point for retry or files-only escape.
+      if (!filesMayHaveChanged) fs.rmSync(journal, { force: true });
+      throw error;
+    }
     // The files are back; a conversation that fails now is reported, and the
     // rewind itself can still be undone.
     const conversation: RewindResult["conversation"] = [];
-    for (const { agent, step } of steps) {
+    for (const { agent, step } of [...steps]) {
       try {
+        const previousCursor = step.nativeSessionId ?? new FileSessionDirectory(path.join(step.cwd, ".loom"), () => {})
+          .get(step.threadId, step.instanceId)?.resumeCursor;
         await agent.rollbackConversation(step);
+        // Brain's binding follows the native session the rollback left (a
+        // Claude fork, or none), or its next turn would go back to the old one.
+        if (this.host.continuity) followRollback(this.host.continuity, step.threadId, agent.id, agent.sessionCursor(step.threadId),
+          { workspaceId: digest(fs.realpathSync(step.cwd)), previousCursor: typeof previousCursor === "string" ? previousCursor : null });
+        saveIntent(steps.filter(s => s.step !== step).map(s => s.step));
+        steps.splice(steps.findIndex(s => s.step === step), 1);
         conversation.push({ agentId: agent.id, provider: step.provider, turns: step.turns });
       } catch (error) {
         conversation.push({ agentId: agent.id, provider: step.provider, turns: 0, error: error instanceof Error ? error.message : String(error) });
       }
     }
-    this.host.log.append({
+    const keep = this.host.queue.snapshot().items.filter(i => i.chat === chat).flatMap(i => {
+      const event = i.continuity ? this.host.continuity?.store.requestEvent(i.continuity.requestId) : undefined;
+      return event ? [event.id] : [];
+    });
+    const rewound = this.host.log.append({
       kind: "checkpoint",
+      ...(workspace.agentId ? { agentId: workspace.agentId } : {}),
       ...(chat && chat !== MAIN_CHAT ? { chat } : {}),
       payload: {
         id: out.restored.id,
@@ -248,19 +391,39 @@ export class RuntimeTurns {
         reason: "rewound",
         files: out.changed.length,
         undo: out.undo.id,
+        cwd: workspace.dir,
         ...(chat ? { chat } : {}),
+        // Queued messages precede their checkpoint; the earlier turn's answer
+        // must survive, as must requests still waiting to take their own turn.
+        // Every turn from this one on is dropped, and a later turn's message may
+        // also precede this checkpoint (it was queued earlier), so each is named.
+        ...(origin?.turnEvent !== undefined ? { dropped: { from: origin.eventId,
+          turns: this.host.log.list({ kinds: ["checkpoint", "status"] }).flatMap(e => e.id >= origin.eventId && (e.payload.reason === "before_turn" || e.payload.state === "turn_association") &&
+            (typeof e.payload.chat === "string" ? e.payload.chat : e.chat ?? MAIN_CHAT) === chat && typeof e.payload.turnEvent === "number" && !keep.includes(e.payload.turnEvent) ? [e.payload.turnEvent] : []),
+          keep } } : {}),
         ...(conversation.length ? { conversation } : {}),
       },
     });
+    // Reviewed context resting on the dropped turns goes with them.
+    if (chat && origin?.turnEvent !== undefined && this.host.continuity) {
+      const retired = this.host.continuity.store.retireDropped(chat);
+      if (retired.length) this.host.log.append({ kind: "status", ...(chat !== MAIN_CHAT ? { chat } : {}),
+        payload: { state: "brain_items_retired", items: retired, rewind: rewound.id, chat } });
+    }
+    if (!conversation.some(c => c.error)) fs.rmSync(journal);
     return { ...out, conversation };
   }
 
-  /** The chat whose turn a checkpoint was taken before; null for other checkpoints (a rewind's undo point). */
-  private checkpointChat(id: string): string | null {
+  /**
+   * The chat whose turn a checkpoint was taken before, and that turn's message;
+   * null for other checkpoints (a rewind's undo point).
+   */
+  private checkpointOrigin(id: string): { chat: string; eventId: number; turnEvent?: number } | null {
     const taken = this.host.log.list({ kinds: ["checkpoint"] })
       .find((e) => e.payload.id === id && e.payload.reason === "before_turn");
     if (!taken) return null;
-    return typeof taken.payload.chat === "string" ? taken.payload.chat : taken.chat ?? MAIN_CHAT;
+    const chat = typeof taken.payload.chat === "string" ? taken.payload.chat : taken.chat ?? MAIN_CHAT;
+    return { chat, eventId: taken.id, ...(typeof taken.payload.turnEvent === "number" ? { turnEvent: taken.payload.turnEvent } : {}) };
   }
 
   /** What an agent's last turn changed — for route step conditions. */
@@ -292,8 +455,7 @@ export class RuntimeTurns {
     // A project without git has no status to compare; its checkpoint (in
     // Loom's own store) says what the turn changed instead.
     const dir = this.host.agentDir(agentId);
-    const pending = diffSinceSnapshot(dir, before)
-      .then((diff) => diff ?? (checkpoint ? checkpoints.diffSince(dir, checkpoint) : null))
+    const pending = (checkpoint ? checkpoints.diffSince(dir, checkpoint) : diffSinceSnapshot(dir, before))
       .catch(() => null);
     this.lastTurnDiff.set(agentId, pending);
     const finalized = pending
@@ -381,6 +543,7 @@ export class RuntimeTurns {
     agentId?: string,
     opts: TurnOptions = {},
   ): Promise<TurnResult> {
+    if (this.host.restoring || this.host.switching.has(opts.chat ?? MAIN_CHAT)) throw new ContinuityError("conflict", "this chat is switching or rewinding; try again when it finishes");
     if (this.host.continuity) return this.sendContinuity(text, agentId, opts);
     const source = opts.source ?? "user";
     const chat = opts.chat ?? MAIN_CHAT;
@@ -429,6 +592,7 @@ export class RuntimeTurns {
         text,
         target: { kind: "agent", agentId: target },
         chat,
+        ...(agentId === undefined || opts.followsChat ? { followsChat: true } : {}),
         source,
         ...(opts.plan ? { plan: true } : {}),
         ...(opts.length ? { length: opts.length } : {}),
@@ -446,7 +610,7 @@ export class RuntimeTurns {
     // everything this turn produces belongs to the chat you sent from
     this.turnChat.set(target, chat);
     this.busySince.set(target, Date.now()); // the stale-session clock starts
-    this.host.log.append({
+    const said = this.host.log.append({
       kind: "message",
       chat,
       payload: { text, author: source === "route" ? "loom" : "user", ...(opts.fromQueue ? { fromQueue: true } : {}) },
@@ -491,11 +655,11 @@ export class RuntimeTurns {
         });
       }
       // Snapshot the tree so this prompt's changes can be attributed to it.
-      this.preTurnTree.set(target, await porcelainStatus(this.host.agentDir(target)));
+      this.preTurnTree.set(target, await turnSnapshot(this.host.agentDir(target)));
       // …and a checkpoint you can actually go back to. The porcelain snapshot
       // above only says *which* paths changed; this holds their content, so
       // "undo what that turn did" is a click rather than a re-typing (#101).
-      await this.checkpointBefore(target, text, chat);
+      await this.checkpointBefore(target, text, chat, said.id);
       // Fire-and-notify: the turn runs in the background; progress streams
       // into the log and completion lands as run_complete.
       if (!this.host.isCurrentAgent(agent)) throw new Error(`agent "${target}" is no longer active`);
@@ -508,7 +672,14 @@ export class RuntimeTurns {
         // The config file exists for exactly this turn. Cleaned up whether the
         // turn succeeded, failed or was interrupted — a temp file per turn that
         // nothing removes is a slow leak of the project's server URLs.
-        .finally(() => mcp?.cleanup());
+        .finally(async () => {
+          mcp?.cleanup();
+          if (agent instanceof ProviderAgent) {
+            await this.postTurn.get(target);
+            this.postTurn.delete(target);
+            if (!this.host.closed && this.host.isCurrentAgent(agent)) { this.busySince.delete(target); this.host.kickQueue(); }
+          }
+        });
       return { agentId: target };
     } catch (error) {
       mcp?.cleanup();
@@ -521,6 +692,8 @@ export class RuntimeTurns {
     const brain = this.host.continuity!;
     const chat = opts.chat ?? MAIN_CHAT, source = opts.source ?? "user";
     if (!this.host.chatExists(chat)) throw new ContinuityError("invalid", "conversation is missing or deleted; create a chat before dispatching");
+    if (this.host.restoring || this.host.switching.has(chat)) throw new ContinuityError("conflict", "this chat is switching or rewinding; try again when it finishes");
+    const generation = this.host.switchGeneration.get(chat);
     const bound = this.host.chatBinding(chat);
     const target = agentId ?? bound.agentId ?? this.host.validHolder() ?? this.host.defaultAdapterId();
     const agent = this.host.agent(target);
@@ -536,11 +709,15 @@ export class RuntimeTurns {
     // Every check that can refuse the turn runs before the request enters the
     // conversation: a refused request must not become history.
     const health = await this.host.harness(target);
+    // A switch can finish while harness discovery awaits, before stopChat can
+    // see this send. Resolve again before capturing intent for the old agent.
+    if (this.host.switchGeneration.get(chat) !== generation) return this.sendContinuity(text, opts.followsChat ? undefined : agentId, opts);
+    if (this.host.restoring || this.host.switching.has(chat)) throw new ContinuityError("conflict", "this chat is switching or rewinding; try again when it finishes");
     if (!health.available) throw new ContinuityError("unsupported", health.error ?? `${cfg.kind} CLI is not reachable`);
     if (this.busySince.size && (!opts.requestId || !brain.store.request(opts.requestId))) this.host.queue.assertCanAdd({ text });
     const captured = brain.capture({ id: opts.requestId ?? randomUUID(), conversationId: chat, agentInstanceId: target,
       text, source, model: opts.capturedModel !== undefined ? opts.capturedModel : bound.agentId === target ? bound.model ?? null : null,
-      plan: Boolean(opts.plan), targetAddedTokens: 6000 });
+      plan: Boolean(opts.plan), targetAddedTokens: (opts.requestId ? brain.store.request(opts.requestId)?.targetAddedTokens : undefined) ?? this.host.contextBudget(target) });
     const request = captured.request;
     const previous = brain.store.receipts(request.id).at(-1);
     const status = (continuityStatus: string): TurnResult => ({ agentId: target, requestId: request.id, continuityStatus,
@@ -557,6 +734,7 @@ export class RuntimeTurns {
     if (this.busySince.size) {
       if (opts.fromQueue) throw new ContinuityError("conflict", "another foreground turn is preparing or running");
       const item = this.host.queue.add({ text, target: { kind: "agent", agentId: target }, chat, source,
+        ...(agentId === undefined || opts.followsChat ? { followsChat: true } : {}),
         ...(opts.plan ? { plan: true } : {}), ...(opts.length ? { length: opts.length } : {}), continuity: { requestId: request.id, model: request.model } });
       return { agentId: target, queued: this.host.queue.length, queueId: item.id, requestId: request.id };
     }
@@ -575,8 +753,8 @@ export class RuntimeTurns {
       assertPrepared();
       if (!this.host.isCurrentAgent(agent)) throw new Error("native target was replaced before dispatch");
       // Snapshot/checkpoint is complete before the frozen context is observed.
-      this.preTurnTree.set(target, await porcelainStatus(this.host.agentDir(target)));
-      await this.checkpointBefore(target, text, chat);
+      this.preTurnTree.set(target, await turnSnapshot(this.host.agentDir(target)));
+      await this.checkpointBefore(target, text, chat, captured.event.id);
       assertPrepared();
       const nativePlan = Boolean(opts.plan) && agent instanceof ProviderAgent;
       const supplement = [this.host.agentInstructions(target), this.host.activeSkillsBlock(), opts.plan && !nativePlan ? planModeBriefing(text) : "", lengthLine(opts.length)].filter(Boolean).join("\n");
@@ -738,6 +916,33 @@ export class RuntimeTurns {
       return { interrupted: holder };
     }
     return { interrupted: null };
+  }
+
+  /**
+   * Stop every turn running (or being prepared) in `chat`, except `keep`'s,
+   * and wait until each has settled. A turn in preparation is cancelled; one
+   * whose harness is running is interrupted, including one that only starts
+   * running while this waits.
+   */
+  async stopChat(chat: string, keep?: string, timeoutMs = 30_000): Promise<string[]> {
+    const inChat = () => [...this.busySince.keys()].filter((id) => id !== keep && this.turnChat.get(id) === chat);
+    const stopping = inChat();
+    const interrupted = new Set<string>();
+    const end = Date.now() + timeoutMs;
+    for (;;) {
+      const left = inChat().filter((id) => stopping.includes(id));
+      if (!left.length) return stopping;
+      if (Date.now() > end) throw new Error(`${left.join(", ")} didn't stop in time — try again, or stop the turn first`);
+      for (const id of left) {
+        this.preparing.get(id)?.abort();
+        const agent = this.host.agents.get(id);
+        if (!interrupted.has(id) && agent && isAdapter(agent) && agent.busy()) {
+          interrupted.add(id);
+          await agent.interrupt().catch(() => {});
+        }
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
   }
 
   /** The chat an agent's current (or last) turn belongs to, if any. */

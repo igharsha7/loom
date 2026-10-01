@@ -109,7 +109,7 @@ export async function isRepo(dir: string): Promise<boolean> {
 export async function stage(dir: string, paths: string[]): Promise<{ staged: string[] }> {
   const rels = checkAll(dir, paths);
   // `--` ends the flags: a file called "-f" is a file, not an option.
-  await git(["add", "--", ...rels], dir);
+  await git(["--literal-pathspecs", "add", "--", ...rels], dir);
   logbook.info("git", `staged ${rels.length} file${rels.length === 1 ? "" : "s"}`, rels.join("\n"));
   return { staged: rels };
 }

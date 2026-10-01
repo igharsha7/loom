@@ -10,10 +10,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { ClaudeCodeAdapter, CodexAdapter, stopAllProviderSessions } from "../../src/providers/agent.js";
+import { nativeChatOf } from "../../src/adapters/base.js";
 import { readProjectState, writeProjectState } from "../../src/core/registry.js";
 import { MAIN_CHAT, type AdapterEvent } from "../../src/types.js";
 import type { LiveDelta } from "../../src/providers/ingestion.js";
-import { makeProjectDir } from "../helpers.js";
+import { makeProjectDir, waitUntil } from "../helpers.js";
 import {
   CLAUDE_OK, CODEX_OK, callsOf, claudeInit, claudeResult, codexDone, codexItem, codexNotify, codexTokens, fakeClaude, fakeCodex,
   rpcOf, stdinOf, turnsOf, type Step,
@@ -265,4 +266,153 @@ describe("claude · warm sessions", () => {
       await agent.stop();
     } finally { setApprovalBroker(null); }
   });
+});
+
+describe("provider event association regression", () => {
+  it("does not stamp a parked chat's message with the active chat's run (#5)", () => {
+    const { agent, events } = codexAgent(fakeCodex());
+    const internals = agent as unknown as { beginContinuity: (input: unknown) => void; endContinuity: () => void;
+      ingestion: { ingest: (event: unknown) => void } };
+    internals.beginContinuity({ continuity: { runId: "B", bindingId: "binding-B", sessionEpoch: 1 } });
+    internals.ingestion.ingest({ eventId: "old", type: "item.completed", provider: "codex", instanceId: "codex", threadId: "A", turnId: "turn-A", createdAt: Date.now(), payload: { itemType: "assistant_message", detail: "private A" } });
+    expect(events.at(-1)!.payload).toEqual({ text: "private A" });
+    expect(nativeChatOf(events.at(-1)!)).toBe("A");
+    expect(JSON.parse(JSON.stringify(events.at(-1)!))).toEqual({ kind: "message", payload: { text: "private A" } });
+    expect(events.at(-1)!.payload).not.toHaveProperty("loomRunId");
+    internals.endContinuity();
+  });
+});
+
+import { vi } from "vitest";
+import { ProviderError } from "../../src/providers/errors.js";
+import { NativeQuiescenceUnknown } from "../../src/core/continuity/contracts.js";
+
+it("keeps unknown submission failures distinct from ordinary failures (#1)", () => {
+  const { agent } = codexAgent(fakeCodex());
+  const internal = agent as unknown as { dispatchError: (error: unknown, continuity: boolean) => Error };
+  expect(internal.dispatchError(new ProviderError("transport", "sendTurn", "lost acknowledgement", { mayHaveStarted: true }), true))
+    .toBeInstanceOf(NativeQuiescenceUnknown);
+});
+
+it("retains ProviderAgent ownership after unregister rejects (#7)", async () => {
+  const { agent } = codexAgent(fakeCodex()); await agent.send({ text: "one" });
+  const internal = agent as unknown as { providers: { service: { unregister: (id: string) => Promise<void> } }; adapter: unknown };
+  const providers = internal.providers, adapter = internal.adapter;
+  const spy = vi.spyOn(providers.service, "unregister").mockRejectedValueOnce(new Error("containment failed"));
+  try {
+    await expect(agent.stop()).rejects.toThrow("containment failed");
+    expect(internal.providers).toBe(providers); expect(internal.adapter).toBe(adapter);
+    await agent.stop(); expect(internal.providers).toBeNull();
+  } finally { spy.mockRestore(); }
+});
+
+it("resets a cleared chat model to the native default on both warm providers (#12)", async () => {
+  const cx = fakeCodex({ model: "native-default" }), cl = fakeClaude();
+  const codex = codexAgent(cx).agent, claude = claudeAgent(cl).agent;
+  for (const agent of [codex, claude]) {
+    await agent.send({ text: "override first", model: "chat-override" });
+    await agent.send({ text: "default again" });
+  }
+  expect(rpcOf(cx, "thread/start")[0]).toMatchObject({ model: "chat-override" });
+  expect(rpcOf(cx, "turn/start").map(p => p.model)).toEqual(["chat-override", "native-default"]);
+  const selections = stdinOf(cl).filter(m => (m.request as Record<string, unknown> | undefined)?.subtype === "set_model");
+  expect(callsOf(cl)[0]?.join(" ")).toContain("chat-override");
+  expect(selections).toHaveLength(1);
+  expect(selections[0]?.request).not.toHaveProperty("model");
+  await codex.stop(); await claude.stop();
+});
+
+it("publishes completion after outstanding commands complete (#11)", async () => {
+  const bin = fakeCodex({ script: [
+    codexNotify("turn/started", { turn: { id: "$TURN" } }),
+    codexNotify("item/started", { item: { id: "cmd", type: "commandExecution", command: "write", status: "inProgress" } }),
+    codexDone(), { sleep: 150 },
+    codexNotify("item/completed", { item: { id: "cmd", type: "commandExecution", command: "write", status: "completed", exitCode: 0, aggregatedOutput: "done" } }),
+  ] });
+  const { agent, events } = codexAgent(bin);
+  await agent.send({ text: "work" });
+  expect(events.findIndex(e => e.kind === "run_complete")).toBeGreaterThan(events.findIndex(e => e.kind === "tool_call"));
+  await agent.stop();
+});
+
+it("keeps Stop during a lost turn acknowledgement outcome unknown (audit #1)", async () => {
+  const bin = fakeCodex({ startAckExit: true });
+  const { agent } = codexAgent(bin);
+  const sending = agent.send({ text: "work", continuity: { runId: "r", bindingId: "b", sessionEpoch: 1, nativeSessionId: null, context: "" } });
+  const rejected = expect(sending).rejects.toBeInstanceOf(NativeQuiescenceUnknown);
+  await waitUntil(() => rpcOf(bin, "turn/start").length > 0);
+  const stopping = agent.interrupt();
+  await rejected; await stopping; await agent.stop();
+});
+
+it("keeps a Claude Bash command unresolved when result has no tool result (audit #4)", async () => {
+  const bin = fakeClaude({ script: [
+    { out: { type: "assistant", message: { content: [{ type: "tool_use", id: "bash", name: "Bash", input: { command: "write" } }] }, parent_tool_use_id: null } },
+    claudeResult(),
+  ] });
+  const { agent, events } = claudeAgent(bin, undefined, { commandSettleMs: 20 });
+  await expect(agent.send({ text: "work" })).rejects.toBeInstanceOf(NativeQuiescenceUnknown);
+  expect(of(events, "tool_call")).toEqual([]);
+  expect(of(events, "run_complete")).toEqual([]);
+  await agent.stop();
+});
+
+it("flushes timed-out partial text under its own run before a later completion (audit #10)", async () => {
+  const bin = fakeCodex({ scripts: [[
+    codexNotify("turn/started", { turn: { id: "$TURN" } }),
+    codexNotify("item/agentMessage/delta", { itemId: "partial", delta: "old partial" }),
+    codexNotify("item/started", { item: { id: "cmd", type: "commandExecution", command: "write", status: "inProgress" } }),
+    codexDone(), { sleep: 50 },
+    codexNotify("item/completed", { item: { id: "cmd", type: "commandExecution", command: "write", status: "completed", exitCode: 0 } }),
+  ], CODEX_OK] });
+  const { agent, events } = codexAgent(bin, undefined, { commandSettleMs: 20 });
+  const continuity = (runId: string) => ({ runId, bindingId: "b", sessionEpoch: 1, nativeSessionId: null, context: "" });
+  await expect(agent.send({ text: "one", continuity: continuity("old") })).rejects.toBeInstanceOf(NativeQuiescenceUnknown);
+  expect(of(events, "message").find(p => p.text === "old partial")).toMatchObject({ loomRunId: "old", partial: true });
+  await new Promise(resolve => setTimeout(resolve, 100));
+  await agent.send({ text: "two", continuity: { ...continuity("new"), nativeSessionId: turnsOf(bin)[0]!.thread } });
+  expect(of(events, "message").filter(p => p.text === "old partial")).toHaveLength(1);
+  await agent.stop();
+});
+
+it("waits for a late Claude tool result after the turn result (audit #4)", async () => {
+  const bin = fakeClaude({ script: [
+    { out: { type: "assistant", message: { content: [{ type: "tool_use", id: "bash", name: "Bash", input: { command: "write" } }] }, parent_tool_use_id: null } },
+    claudeResult(), { sleep: 50 },
+    { out: { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "bash", content: "finished" }] }, parent_tool_use_id: null } },
+  ] });
+  const { agent, events } = claudeAgent(bin, undefined, { commandSettleMs: 1000 });
+  await agent.send({ text: "work", continuity: { runId: "r", bindingId: "b", sessionEpoch: 1, nativeSessionId: null, context: "" } });
+  expect(of(events, "tool_call")[0]).toMatchObject({ tool: "shell", loomRunId: "r", output: "finished" });
+  expect(events.findIndex(e => e.kind === "tool_call")).toBeLessThan(events.findIndex(e => e.kind === "run_complete"));
+  await agent.stop();
+});
+
+it("Stop during initialization never submits the prompt (#1)", async () => {
+  const bin = fakeCodex({ initializeDelayMs: 150 }), { agent } = codexAgent(bin);
+  const sending = agent.send({ text: "must never run" });
+  const outcome = sending.catch(error => error);
+  await waitUntil(() => rpcOf(bin, "initialize").length > 0);
+  await agent.interrupt();
+  expect((await outcome).message).toMatch(/interrupted before/);
+  expect(rpcOf(bin, "turn/start")).toHaveLength(0);
+  await agent.stop();
+});
+
+it("keeps manual compaction alive across idle reaper sweeps (#9)", async () => {
+  const bin = fakeCodex({ compactDelayMs: 150 }), { agent } = codexAgent(bin);
+  await agent.send({ text: "one" });
+  const providers = (agent as unknown as { providers: { service: import("../../src/providers/service.js").ProviderService; reaper: import("../../src/providers/reaper.js").SessionReaper } }).providers;
+  const old = Date.now() - 31 * 60_000;
+  const binding = providers.service.directory.get("main", "codex")!;
+  providers.service.directory.upsert({ ...binding, lastSeenAt: old });
+  const compacting = agent.compact();
+  await waitUntil(() => rpcOf(bin, "thread/compact/start").length > 0);
+  expect(providers.service.directory.get("main", "codex")!.lastSeenAt).toBeGreaterThan(old);
+  // Even a stale timestamp cannot make a busy compaction reapable.
+  providers.service.directory.upsert({ ...providers.service.directory.get("main", "codex")!, lastSeenAt: old });
+  expect(await providers.reaper.sweep()).toBe(0);
+  await compacting;
+  expect(providers.service.directory.get("main", "codex")!.lastSeenAt).toBeGreaterThan(old);
+  await agent.stop();
 });

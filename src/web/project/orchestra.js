@@ -346,6 +346,7 @@ export function createOrchestra(view) {
     function needsInputClick(ev){
       var card = ev.target.closest && ev.target.closest(".nicard");
       if (!card) return false;
+      if (card.classList.contains("done")) return true;
       var pick = ev.target.closest("[data-nipick]");
       if (pick) { answerAgent(card, pick.getAttribute("data-nipick"), pick.getAttribute("data-niqid")); return true; }
       if (ev.target.closest(".nisend")) {
@@ -398,18 +399,25 @@ export function createOrchestra(view) {
     function answerRequest(card, text, qid){
       var blocks = Array.prototype.slice.call(card.querySelectorAll(".niqb"));
       var answer = String(text || "").trim();
-      if (!answer) { var box = card.querySelector(".nitext"); if (box) box.focus(); return; }
-      // Typed words answer the first question still open.
+      var multi = blocks.some(function(b){ return b.getAttribute("data-nimulti") === "true"; });
+      if (!answer && (qid || !multi)) { var box = card.querySelector(".nitext"); if (box) box.focus(); return; }
       var target = qid || (blocks.filter(function(b){ return !b.getAttribute("data-nians"); })[0] || blocks[0]).getAttribute("data-niqid");
-      blocks.forEach(function(b){
+      if (answer) blocks.forEach(function(b){
         if (b.getAttribute("data-niqid") !== target) return;
-        b.setAttribute("data-nians", answer);
-        Array.prototype.forEach.call(b.querySelectorAll("[data-nipick]"), function(o){ o.classList.toggle("sel", o.getAttribute("data-nipick") === answer); });
+        if (qid && b.getAttribute("data-nimulti") === "true") {
+          var selected = JSON.parse(b.getAttribute("data-nians") || "[]"), at = selected.indexOf(answer);
+          if (at < 0) selected.push(answer); else selected.splice(at, 1);
+          if (selected.length) b.setAttribute("data-nians", JSON.stringify(selected)); else b.removeAttribute("data-nians");
+          Array.prototype.forEach.call(b.querySelectorAll("[data-nipick]"), function(o){ o.classList.toggle("sel", selected.indexOf(o.getAttribute("data-nipick")) >= 0); });
+        } else {
+          b.setAttribute("data-nians", b.getAttribute("data-nimulti") === "true" ? JSON.stringify([answer]) : answer);
+          Array.prototype.forEach.call(b.querySelectorAll("[data-nipick]"), function(o){ o.classList.toggle("sel", o.getAttribute("data-nipick") === answer); });
+        }
       });
       var t = card.querySelector(".nitext"); if (t && !qid) t.value = "";
-      if (blocks.some(function(b){ return !b.getAttribute("data-nians"); })) return;
+      if (blocks.some(function(b){ return !b.getAttribute("data-nians"); }) || (multi && qid)) return;
       var answers = {};
-      blocks.forEach(function(b){ answers[b.getAttribute("data-niqid")] = b.getAttribute("data-nians"); });
+      blocks.forEach(function(b){ var value = b.getAttribute("data-nians"); answers[b.getAttribute("data-niqid")] = b.getAttribute("data-nimulti") === "true" ? JSON.parse(value) : value; });
       var who = card.getAttribute("data-niask");
       var where = card.getAttribute("data-nichat") || view.chatId;
       Array.prototype.forEach.call(card.querySelectorAll("button,input"), function(el){ el.disabled = true; });

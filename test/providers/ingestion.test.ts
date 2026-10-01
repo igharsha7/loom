@@ -162,7 +162,7 @@ describe("ingestion · context, compaction, limits, questions", () => {
       ev("thread.state.changed", { state: "compacted", beforeTokens: 180_000, afterTokens: 12_000, trigger: "auto" }),
     ]);
     expect(kinds(out)).toEqual(["status:compacting", "status:native_compacted"]);
-    expect(out[1]!.payload).toEqual({ state: "native_compacted", trigger: "auto", preTokens: 180_000, postTokens: 12_000 });
+    expect(out[1]!.payload).toEqual({ state: "native_compacted", session: null, trigger: "auto", preTokens: 180_000, postTokens: 12_000 });
   });
 
   it("reports context in use and account limits", () => {
@@ -278,4 +278,75 @@ describe("LiveDeltaThrottle", () => {
     expect(sent).toEqual([{ itemId: "m1", delta: "Hello" }, { itemId: "m2", delta: "x" }]);
     t.close();
   });
+});
+
+describe("ingestion regressions", () => {
+  it("keeps interrupted and failed partial text (#20)", () => {
+    for (const end of [ev("turn.completed", { state: "interrupted" }), ev("turn.aborted", { reason: "crashed" })]) {
+      const { run } = ingest([]);
+      const out = run([ev("turn.started", {}), ev("content.delta", { streamKind: "assistant_text", delta: "unfinished" }), end]);
+      expect(out.find(e => e.kind === "message")!.payload).toMatchObject({ text: "unfinished", partial: true });
+    }
+  });
+  it("ignores an old turn's terminal event instead of clearing the new turn (#5)", () => {
+    const { run, ingestion, out } = ingest([]);
+    ingestion.tagTurn("main", "cx", { loomRunId: "new", loomBindingId: "binding", loomSessionEpoch: 2 });
+    run([ev("turn.started", {}, { turnId: "new-turn" }), ev("turn.completed", { state: "completed" }, { turnId: "old-turn" }),
+      ev("item.completed", { itemType: "assistant_message", detail: "new reply" }, { turnId: "new-turn" })]);
+    expect(out.filter(e => e.kind === "run_complete")).toHaveLength(0);
+    expect(out.find(e => e.kind === "message")!.payload).toMatchObject({ loomRunId: "new" });
+  });
+});
+
+it("does not retag a finished turn while the next turn waits to start (#5)", () => {
+  const { run, ingestion, out } = ingest([]);
+  run([ev("turn.started", {}), ev("turn.completed", { state: "completed" })]);
+  ingestion.tagTurn("main", "cx", { loomRunId: "new", loomBindingId: "binding", loomSessionEpoch: 2 });
+  run([ev("turn.completed", { state: "completed" }), ev("turn.started", {}, { turnId: "t2" }),
+    ev("item.completed", { itemType: "assistant_message", detail: "new reply" }, { turnId: "t2" })]);
+  expect(out.filter(e => e.kind === "run_complete")).toHaveLength(1);
+  expect(out.find(e => e.kind === "message")!.payload).toMatchObject({ loomRunId: "new" });
+});
+
+it("preserves the original command tags after terminal and next-turn tagging (#16)", () => {
+  const { ingestion, out } = ingest([]);
+  const tags = { loomRunId: "old-run", loomBindingId: "old-binding", loomSessionEpoch: 1 };
+  ingestion.tagTurn("main", "cx", tags);
+  ingestion.ingest(ev("turn.started", {}));
+  ingestion.ingest(ev("item.started", { itemType: "command_execution" }, { itemId: "late-command" }));
+  ingestion.ingest(ev("turn.completed", { state: "completed" }));
+  ingestion.tagTurn("main", "cx", { ...tags, loomRunId: "new-run" });
+  ingestion.ingest(ev("turn.started", {}, { turnId: "t2" }));
+  ingestion.ingest(ev("item.completed", { itemType: "command_execution", status: "completed", data: { command: "write", output: "late output", exitCode: 0 } }, { itemId: "late-command", turnId: "t1" }));
+  expect(out.find(e => e.kind === "tool_call")?.payload).toMatchObject({ ...tags, output: "late output", outcome: "success" });
+});
+
+it("rejects an old command start before it can acquire the next run's tags (audit #9)", () => {
+  const { ingestion, out } = ingest([]);
+  const tags = (loomRunId: string) => ({ loomRunId, loomBindingId: "b", loomSessionEpoch: 1 });
+  ingestion.tagTurn("main", "cx", tags("old"));
+  ingestion.ingest(ev("turn.started", {}));
+  ingestion.ingest(ev("turn.completed", { state: "completed" }));
+  ingestion.tagTurn("main", "cx", tags("new"));
+  ingestion.ingest(ev("turn.started", {}, { turnId: "t2" }));
+  ingestion.ingest(ev("item.started", { itemType: "command_execution" }, { itemId: "late" }));
+  ingestion.ingest(ev("item.completed", { itemType: "command_execution", status: "completed" }, { itemId: "late" }));
+  expect(out.filter(e => e.kind === "tool_call")).toEqual([]);
+});
+
+it("clears partial buffers when a failed dispatch is untagged (audit #10)", () => {
+  const { ingestion, out } = ingest([]);
+  ingestion.tagTurn("main", "cx", { loomRunId: "old", loomBindingId: "b", loomSessionEpoch: 1 });
+  ingestion.ingest(ev("turn.started", {}));
+  ingestion.ingest(ev("content.delta", { streamKind: "assistant_text", delta: "old partial" }));
+  ingestion.untagTurn("main", "cx");
+  ingestion.tagTurn("main", "cx", { loomRunId: "new", loomBindingId: "b", loomSessionEpoch: 1 });
+  ingestion.ingest(ev("turn.started", {}, { turnId: "t2" }));
+  ingestion.ingest(ev("turn.completed", { state: "completed" }, { turnId: "t2" }));
+  expect(out.filter(e => e.kind === "message")).toEqual([]);
+});
+
+it("forwards empty Codex account snapshots so recovery can clear reached reasons (audit #12)", () => {
+  const { run } = ingest([ev("account.rate-limits.updated", { windows: [] })]);
+  expect(run().at(-1)?.payload).toEqual({ state: "usage_limits", provider: "codex", windows: [] });
 });

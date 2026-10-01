@@ -142,6 +142,8 @@ interface Session {
   providerThreadId: string;
   pending: Map<RequestId, PendingRequest>;
   inputs: Map<RequestId, PendingInput>;
+  asyncQuestions?: Set<string>;
+  defaultModel?: string;
   /** Whether a turn ran in plan mode; the next default turn must say so to leave it. */
   planMode: boolean;
   /** Turns that already finished; a turn can finish before turn/start answers. */
@@ -201,7 +203,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
     const now = Date.now();
     const session: Session = {
       info: { provider: this.provider, instanceId: this.instanceId, threadId: input.threadId, status: "connecting",
-        runtimeMode: input.runtimeMode, cwd: input.cwd, createdAt: now, updatedAt: now,
+        runtimeMode: input.runtimeMode, cwd: input.cwd, processGroupId: proc.child.pid, createdAt: now, updatedAt: now,
         ...(input.modelSelection?.model ? { model: input.modelSelection.model } : {}) },
       proc, rpc: undefined as unknown as CodexRpc, providerThreadId: "", pending: new Map(), inputs: new Map(), planMode: false, finished: new Set(),
       baseline: null, turnUsage: null, compacting: false, stopping: false,
@@ -217,12 +219,21 @@ export class CodexProviderAdapter implements ProviderAdapter {
       if (!session.info.activeTurnId) this.emit(input.threadId, "runtime.error", { message: error.message, class: "transport_error" });
       void this.stopSession(input.threadId).catch(() => {});
     });
-    void proc.closed.then(({ code }) => this.exited(session, code));
+    void proc.closed.then(({ code, quiescenceError }) => this.exited(session, code, quiescenceError));
 
     try {
       await session.rpc.request("initialize", { clientInfo: { name: "loom", title: "Loom", version: VERSION },
         capabilities: { experimentalApi: true, requestAttestation: false } });
       session.rpc.notify("initialized");
+      // Read the harness default independently of this chat's override.
+      const config = await session.rpc.request("config/read", {}).catch(() => ({} as Json));
+      const configured = (config.config as Json | undefined)?.model;
+      if (typeof configured === "string" && configured) session.defaultModel = configured;
+      else {
+        const catalog = await session.rpc.request("model/list", {}).catch(() => ({} as Json));
+        const defaultModel = (Array.isArray(catalog.data) ? catalog.data as Json[] : []).find(m => m.isDefault === true);
+        if (typeof defaultModel?.model === "string") session.defaultModel = defaultModel.model;
+      }
       const params = this.threadParams(input);
       const cursor = typeof input.resumeCursor === "string" && input.resumeCursor ? input.resumeCursor : undefined;
       let opened: Json;
@@ -243,7 +254,12 @@ export class CodexProviderAdapter implements ProviderAdapter {
         ...(typeof opened.cwd === "string" && opened.cwd ? { cwd: opened.cwd } : {}) };
     } catch (error) {
       session.stopping = true;
-      await stopHarness(proc).catch(() => {});
+      try { await stopHarness(proc); }
+      catch (containment) {
+        this.sessions.set(input.threadId, session);
+        this.containmentFailed(session, containment);
+        throw containment;
+      }
       if (error instanceof ProviderError) {
         const stderr = proc.stderr().trim();
         if (stderr && !error.details.stderr) error.details.stderr = stderr;
@@ -251,6 +267,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
       }
       throw fail("transport", codexFailure(`codex app-server failed to start: ${(error as Error).message}`, proc.stderr()), error);
     }
+    session.defaultModel ??= input.modelSelection?.model ? undefined : session.info.model;
     this.sessions.set(input.threadId, session);
     this.emit(input.threadId, "session.started", cursorPayload(input.resumeCursor));
     this.emit(input.threadId, "thread.started", { providerThreadId: session.providerThreadId });
@@ -271,6 +288,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
     const s = this.sessions.get(threadId);
     if (!s || s.stopping) throw new ProviderError("not_found", operation, `no live codex session for chat "${threadId}"`,
       { provider: this.provider, instanceId: this.instanceId, threadId, mayHaveStarted: false });
+    if (s.failure?.includes("quiescence unknown")) throw new ProviderError("validation", operation, s.failure);
     return s;
   }
 
@@ -278,7 +296,9 @@ export class CodexProviderAdapter implements ProviderAdapter {
     const s = this.session(input.threadId, "sendTurn");
     if (s.info.activeTurnId) throw new ProviderError("validation", "sendTurn", "a codex turn is already running in this chat",
       { provider: this.provider, instanceId: this.instanceId, threadId: input.threadId, mayHaveStarted: false });
-    const model = input.modelSelection?.model ?? s.info.model;
+    const model = input.modelSelection?.model === null ? s.defaultModel : input.modelSelection?.model ?? s.info.model;
+    if (input.modelSelection?.model === null && !model)
+      throw new ProviderError("request", "sendTurn", "codex did not report its default model; cannot clear the chat override", { mayHaveStarted: false });
     const effort = input.modelSelection?.effort;
     s.baseline = null;
     s.turnUsage = null;
@@ -288,12 +308,13 @@ export class CodexProviderAdapter implements ProviderAdapter {
     const mode = input.interactionMode === "plan" ? "plan" : s.planMode ? "default" : undefined;
     const collaboration = mode ? { collaborationMode: { mode, settings: { model: model ?? "gpt-5-codex",
       reasoning_effort: effort ?? "medium", developer_instructions: codexDeveloperInstructions(mode) } } } : {};
+    const answeredQuestions = [...s.asyncQuestions ?? []];
     let response: Json;
     try {
       response = await s.rpc.request("turn/start", { threadId: s.providerThreadId,
         input: [{ type: "text", text: input.input, text_elements: [] }],
         ...(input.clientTurnId ? { clientUserMessageId: input.clientTurnId } : {}),
-        ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...collaboration });
+        ...(model ? { model } : input.modelSelection?.model === null ? { model: null } : {}), ...(effort ? { effort } : {}), ...collaboration });
     } catch (error) {
       // An error *response* is a refusal: the server did not start the turn.
       // A dead process or a timeout is not — that outcome stays unknown.
@@ -302,6 +323,10 @@ export class CodexProviderAdapter implements ProviderAdapter {
         codexFailure(refused ? `codex refused the turn: ${(error as Error).message}` : `${(error as Error).message}; native outcome is unknown`, s.proc.stderr()),
         { provider: this.provider, instanceId: this.instanceId, threadId: input.threadId, mayHaveStarted: !refused, cause: error,
           ...(s.proc.stderr().trim() ? { stderr: s.proc.stderr().trim() } : {}) });
+    }
+    for (const requestId of answeredQuestions) {
+      s.asyncQuestions?.delete(requestId);
+      this.emit(input.threadId, "user-input.resolved", { answers: {} }, { requestId });
     }
     if (mode) s.planMode = mode === "plan";
     const turnId = String((response.turn as Json | undefined)?.id ?? "");
@@ -352,20 +377,58 @@ export class CodexProviderAdapter implements ProviderAdapter {
    * history refuses it; for that one the older `thread/rollback` drops a count
    * of turns from the end, counted on the thread as Codex reads it.
    */
-  async rollbackThread(threadId: ThreadId, beforeTurnId: TurnId): Promise<RollbackResult> {
+  private async history(s: Session): Promise<Json[]> {
+    const metadata = await s.rpc.request("thread/read", { threadId: s.providerThreadId, includeTurns: false });
+    if ((metadata.thread as Json | undefined)?.historyMode !== "paginated") {
+      const read = await s.rpc.request("thread/read", { threadId: s.providerThreadId, includeTurns: true });
+      const turns = (read.thread as Json | undefined)?.turns;
+      if (!Array.isArray(turns)) throw new Error("codex returned no thread history");
+      return turns as Json[];
+    }
+    const turns: Json[] = [];
+    const seen = new Set<string | null>();
+    let cursor: string | null = null;
+    do {
+      if (seen.has(cursor)) throw new Error("codex history pagination repeated a cursor");
+      seen.add(cursor);
+      const page = await s.rpc.request("thread/turns/list", { threadId: s.providerThreadId, cursor, limit: 100, sortDirection: "asc", itemsView: "full" });
+      if (!Array.isArray(page.data) || (page.nextCursor !== null && typeof page.nextCursor !== "string")) throw new Error("codex returned invalid history pagination");
+      turns.push(...page.data as Json[]);
+      cursor = page.nextCursor as string | null;
+    } while (cursor !== null);
+    return turns;
+  }
+
+  async validateRollback(threadId: ThreadId, beforeTurnId: TurnId): Promise<string[]> {
+    const s = this.session(threadId, "rollbackThread");
+    const turns = await this.history(s);
+    const cut = turns.findIndex(t => t.id === beforeTurnId);
+    if (cut < 0)
+      throw new ProviderError("request", "rollbackThread", "the turn isn't in codex's thread history, so the conversation can't be put back to before it");
+    return turns.slice(0, cut).map(t => String(t.id));
+  }
+
+  async rollbackThread(threadId: ThreadId, beforeTurnId: TurnId, retainedTurnIds?: string[]): Promise<RollbackResult> {
     const s = this.session(threadId, "rollbackThread");
     const fail = (message: string, cause?: unknown) => new ProviderError("request", "rollbackThread", message,
       { provider: this.provider, instanceId: this.instanceId, threadId, cause });
     if (s.info.activeTurnId) throw new ProviderError("validation", "rollbackThread", "a codex turn is running in this chat",
       { provider: this.provider, instanceId: this.instanceId, threadId });
+    // Verify before mutation. A lost acknowledgement can leave the native cut
+    // complete while Loom's ledger still contains the removed boundary.
+    const existing = await this.history(s);
+    if (!existing.some(t => t.id === beforeTurnId)) {
+      if (retainedTurnIds && JSON.stringify(existing.map(t => t.id)) === JSON.stringify(retainedTurnIds))
+        return { resumeCursor: s.providerThreadId, live: true };
+      throw fail(`codex history has no turn ${beforeTurnId} and does not match the retained prefix`);
+    }
     try {
       await s.rpc.request("thread/revert", { threadId: s.providerThreadId, beforeTurnId });
     } catch (error) {
       if ((error as RpcError).code === undefined) throw fail(`codex did not answer the rollback: ${(error as Error).message}`, error);
       let turns: Json[];
       try {
-        const read = await s.rpc.request("thread/read", { threadId: s.providerThreadId, includeTurns: true });
-        turns = ((read.thread as Json | undefined)?.turns ?? []) as Json[];
+        turns = await this.history(s);
       } catch (readError) {
         throw fail(`codex could not roll back its thread: ${(error as Error).message}`, readError);
       }
@@ -387,17 +450,27 @@ export class CodexProviderAdapter implements ProviderAdapter {
     s.stopping = true;
     this.settlePending(s, "cancel");
     try { await stopHarness(s.proc); }
-    finally {
-      if (this.sessions.get(threadId) === s) this.sessions.delete(threadId);
-      s.rpc.close(new Error("session stopped"));
-      if (s.info.activeTurnId) {
-        if (s.failure) this.emit(threadId, "turn.aborted", { reason: `${s.failure}; native outcome is unknown` }, { turnId: s.info.activeTurnId });
-        else this.emit(threadId, "turn.completed", { state: "interrupted", stopReason: "session stopped" }, { turnId: s.info.activeTurnId });
-      }
-      s.info = { ...s.info, status: "closed", updatedAt: Date.now() };
-      delete s.info.activeTurnId;
-      this.emit(threadId, "session.exited", s.failure ? { reason: s.failure, exitKind: "error", recoverable: true } : { reason: "session stopped", exitKind: "graceful" });
+    catch (error) { this.containmentFailed(s, error); throw error; }
+    if (this.sessions.get(threadId) === s) this.sessions.delete(threadId);
+    s.rpc.close(new Error("session stopped"));
+    if (s.info.activeTurnId) {
+      if (s.failure) this.emit(threadId, "turn.aborted", { reason: `${s.failure}; native outcome is unknown` }, { turnId: s.info.activeTurnId });
+      else this.emit(threadId, "turn.completed", { state: "interrupted", stopReason: "session stopped" }, { turnId: s.info.activeTurnId });
     }
+    s.info = { ...s.info, status: "closed", updatedAt: Date.now() };
+    delete s.info.activeTurnId;
+    this.emit(threadId, "session.exited", s.failure ? { reason: s.failure, exitKind: "error", recoverable: true } : { reason: "session stopped", exitKind: "graceful" });
+  }
+
+  private containmentFailed(s: Session, error: unknown): void {
+    s.stopping = false;
+    s.failure = `${error instanceof Error ? error.message : String(error)}; quiescence unknown`;
+    s.info = { ...s.info, status: "error", updatedAt: Date.now() };
+    if (s.info.activeTurnId) {
+      this.emit(s.info.threadId, "turn.aborted", { reason: s.failure }, { turnId: s.info.activeTurnId });
+      delete s.info.activeTurnId;
+    }
+    this.emit(s.info.threadId, "runtime.error", { message: s.failure, class: "transport_error" });
   }
 
   async stopAll(): Promise<void> {
@@ -407,7 +480,8 @@ export class CodexProviderAdapter implements ProviderAdapter {
   }
 
   /** The process went away on its own. */
-  private exited(s: Session, code: number | null): void {
+  private exited(s: Session, code: number | null, quiescenceError?: Error): void {
+    if (quiescenceError) { this.containmentFailed(s, quiescenceError); return; }
     s.rpc.close(new Error(`codex app-server exited${code === null ? "" : ` ${code}`}`));
     if (s.stopping) return; // stopSession reports it
     s.stopping = true;
@@ -545,10 +619,12 @@ export class CodexProviderAdapter implements ProviderAdapter {
     // person's next message is the answer.
     if (type === "item.completed" && itemType === "assistant_message" && item.delivery === "async" && Array.isArray(item.questions) && item.questions.length) {
       this.emit(threadId, "item.completed", { itemType, status: "completed", ...describeItem(itemType, item) }, extra);
+      const requestId = `codex-async:${threadId}:${itemId ?? randomUUID()}`;
+      (s.asyncQuestions ??= new Set()).add(requestId);
       this.emit(threadId, "user-input.requested", { responseMode: "message", questions: (item.questions as Json[]).map((q, index) => ({
         id: String(index), header: "Question", question: String(q.title ?? ""), allowCustomAnswer: true, multiSelect: false,
         options: (Array.isArray(q.options) ? q.options : []).map(label => ({ label: String(label), description: "" })) })) },
-      { ...at, requestId: `codex-async:${threadId}:${itemId ?? randomUUID()}` });
+      { ...at, requestId });
       return;
     }
     if (itemType === "plan") {
@@ -597,7 +673,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
       return [{ id: key, usedPercent: w.usedPercent, ...(typeof w.windowDurationMins === "number" ? { windowMinutes: w.windowDurationMins } : {}),
         ...(typeof w.resetsAt === "number" ? { resetsAt: w.resetsAt * 1000 } : {}) }];
     });
-    if (windows.length) this.emit(s.info.threadId, "account.rate-limits.updated", { windows,
+    if (windows.length || snapshot.rateLimitReachedType) this.emit(s.info.threadId, "account.rate-limits.updated", { windows,
       ...(typeof snapshot.rateLimitReachedType === "string" ? { reached: snapshot.rateLimitReachedType } : {}) });
   }
 
@@ -609,6 +685,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
   private async serverRequest(s: Session, method: string, params: Json): Promise<Json> {
     switch (method) {
       case "item/commandExecution/requestApproval":
+      case "item/fileRead/requestApproval":
       case "item/fileChange/requestApproval": {
         const decision = await this.ask(s, method, params);
         return { decision };

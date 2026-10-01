@@ -451,3 +451,12 @@ describe("ref safety — a leading dash is a flag, not a ref", () => {
     await expect(addWorktree(dir, { slug: "c", branch: "-x" })).rejects.toThrow(/valid branch/);
   });
 });
+
+it("stages checkpoint filenames literally rather than as pathspecs (audit #14)", async () => {
+  const dir = repo();
+  write(dir, ":(top)*", "literal"); write(dir, "unrelated.txt", "leave alone");
+  const { stageAndCommitFiles } = await import("../src/core/git.js");
+  await stageAndCommitFiles(dir, [":(top)*"], "literal only");
+  expect(execFileSync("git", ["ls-tree", "--name-only", "HEAD"], { cwd: dir, encoding: "utf8" }).trim()).toBe(":(top)*");
+  expect(fs.readFileSync(path.join(dir, "unrelated.txt"), "utf8")).toBe("leave alone");
+});

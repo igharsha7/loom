@@ -145,17 +145,78 @@ Claude settings); override per session through the protocol instead.
 - Not done: other chats' conversations are left alone even though their files were
   put back too (decided; see notes). An undo of a rewind restores files only.
 
-## Phase 5 — Cross-provider switching
+## Phase 5 — Cross-provider switching (with Brain continuity on) ✅ (2026-09-30)
 
-- [ ] Park/resume sessions across providers within a chat; Brain packet sized by the
-  target's context window; switch offered at a usage limit; revert across a provider
-  boundary; continuity on by default.
-- [ ] Carried over from Phase 4: the log still holds the turns a rewind dropped.
-  Anything that rebuilds context from the log (Brain packets for the switched-to
-  provider, briefings) must skip a chat's events between a `before_turn`
-  checkpoint and the `rewound` event that went back to it. The per-(chat, agent)
-  rollback already covers "revert across a provider boundary", since each
-  provider's session in the chat is rolled back on its own.
+- [x] Park/resume across providers within a chat: each (chat, agent) keeps its own
+  warm session; switching away leaves it parked (warm until the reaper), and a
+  switch back gets a delta on the same session. Brain builds a reconstruction for
+  a target whose session is new, including the other agent's work.
+- [x] `switchChat(chat, agentId, { resend })` + `POST /api/projects/:id/chats/:chat/switch`:
+  stops the outgoing turn in that chat, moves Main's baton or re-pins the chat,
+  logs `chat_switched`; `resend` sends the chat's last message to the new agent.
+- [x] Packet sized by the target's context window: `packetBudget(kind, window)` =
+  10% of the last reported window (defaults: Codex 272k, Claude 200k), clamped to
+  6k–40k, instead of a fixed 6000.
+- [x] Switch offered at a usage limit: a `usage_limits` report with `reached` logs
+  `status · switch_suggested` (provider, limit, resetsAt, alternatives on another
+  provider whose limit isn't reached), once per agent and limit per turn. Works
+  with continuity on or off.
+- [x] Rewind × Brain (Phase 4 carry-over): checkpoints record the turn's message
+  (`turnEvent`); the `rewound` event records `dropped.from`; Brain's queries
+  (protected user sources, observations, holes) skip dropped ranges; Brain's
+  bindings follow the session a rollback left (`followRollback`), which fixes a
+  Claude rewind being undone by the next continuity turn.
+- [x] Tests: `test/providers/switching.test.ts` (8 at first, 48 after the audit). Full suite green.
+- [x] Live check (read-only, scratch git project, continuity on): one chat
+  Codex (`gpt-6-astra`) → Claude → Codex. Claude answered BLUE from a
+  reconstruction packet; Codex answered BLUE from a delta on its parked session.
+  Project untouched.
+- [ ] Open decision: continuity on by default. Continuity today refuses parallel
+  orchestra and turns off semantic briefings and memory extraction, so switching
+  it on for everyone changes those features. Without it, a switched-to agent
+  starts the chat with no history. Needs the user's call.
+- [ ] Web UI for the switch offer and the switch itself (Phase 7).
+
+## Audit of Phases 1–5 (Sol, GPT 6.1 Sol via Codex) ✅ (2026-10-01)
+
+A second agent audited the port; Claude checked each round's findings against the
+code, Sol fixed them, Claude reviewed and ran the suite. Rounds 1–4 covered Phase 5
+only; rounds 5–8 covered all five phases, including what earlier fixes introduced.
+Findings per round: 5, 4, 6, 4, then 25, 24, 14, 10. All fixed, each with a
+regression test.
+
+- [x] Phase 5: dropped turns are named explicitly (`dropped: { from, turns, keep }`
+  from the turn's `before_turn` checkpoint, or a `turn_association` status when
+  no checkpoint could be taken); switching holds the queue with a counter (never
+  the user's pause) and refuses sends, enqueues, rewinds and handoffs that
+  straddle it; inferred queue targets carry `followsChat`.
+- [x] Checkpoints: restore touches only captured paths, never `.loom`/`.git`,
+  refuses symlinked parents and ignored files, keeps the user's index, works in
+  linked worktrees and repo subdirectories, treats git failures as failures, and
+  takes literal filenames (also in auto-commit staging). Turn diffs compare
+  content, so edits to already-dirty files count.
+- [x] Sessions and settlement: Brain's writer lease, diffs, commits and routes
+  wait for command settlement; Claude no longer invents completions for
+  unfinished commands; Stop before or during submission is honoured; a failed
+  containment keeps its handles and retries; shutdown fences pending starts;
+  late events keep their own chat and run.
+- [x] Rewind recovery: an interrupted rewind is journalled and holds dispatch
+  until it is retried, undone, or finished `--files-only`; a manual compaction is
+  owned until it completes, released by Stop, `loom interrupt`, shutdown, or
+  `loom recover-compaction`. Disabled agents' sessions and Brain bindings are
+  rolled back too, per workspace.
+- [x] Interaction: structured answers count as user evidence and resolve the
+  question everywhere (routes, status, reloaded cards); multi-select questions;
+  Codex file-read approvals; sparse Claude and Codex limit reports; per-window
+  limit state.
+- [x] Tests: 1732 passing (plus 132 DOM). Known unrelated: `daemon.test.ts`
+  "real models" depends on the live Codex catalog; `app-queue-dom` is
+  occasionally flaky. `codex.test.ts` "interrupts the running turn" failed once
+  under full-suite load and couldn't be reproduced (6 runs alone, 2 full runs).
+- [ ] UI for the recovery states (pending rewind, pending compaction) — Phase 7.
+  Today the way out is the CLI or the API.
+- [ ] Next audits go area by area (checkpoints, sessions, Brain) rather than
+  across the whole port.
 
 ## Phase 6 — Provider management
 

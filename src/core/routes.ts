@@ -196,6 +196,8 @@ const ROLE_INSTRUCTIONS: Record<AgentRole, string> = {
 export class RouteEngine {
   private host: RouteHost;
   private sawNeedsInput = false;
+  private readonly pendingQuestions = new Set<string>();
+  private unstructuredQuestion = false;
   private lastQuestion: string | undefined;
   private stepTimer: NodeJS.Timeout | null = null;
 
@@ -377,6 +379,7 @@ export class RouteEngine {
     if (!r || r.status !== "waiting_human") return;
     if (targetAgentId !== r.steps[r.current]) return;
     this.sawNeedsInput = false;
+    this.pendingQuestions.clear(); this.unstructuredQuestion = false;
     delete r.pendingQuestion;
     r.status = "running";
     this.write(r);
@@ -393,7 +396,14 @@ export class RouteEngine {
     const currentAgent = r.steps[r.current];
     if (!event.agentId || event.agentId !== currentAgent) return;
 
+    if (event.kind === "status" && event.payload.state === "question_answered" && typeof event.payload.requestId === "string") {
+      this.pendingQuestions.delete(event.payload.requestId);
+      this.sawNeedsInput = this.unstructuredQuestion || this.pendingQuestions.size > 0;
+      return;
+    }
     if (event.kind === "needs_input") {
+      if (typeof event.payload.requestId === "string") this.pendingQuestions.add(event.payload.requestId);
+      else this.unstructuredQuestion = true;
       this.sawNeedsInput = true;
       this.lastQuestion = String(event.payload.question ?? "");
       return;
@@ -569,6 +579,7 @@ export class RouteEngine {
   private async beginStep(r: RouteState): Promise<void> {
     const agent = r.steps[r.current]!;
     this.sawNeedsInput = false;
+    this.pendingQuestions.clear(); this.unstructuredQuestion = false;
     this.lastQuestion = undefined;
     this.host.log.append({
       kind: "route_step",
@@ -583,6 +594,9 @@ export class RouteEngine {
     this.armTimer(r.id, r.current);
     try {
       const outcome = await this.host.handoff(agent);
+      // A manual switch can abort this step while its handoff awaits.
+      const active = this.read();
+      if (!active || active.id !== r.id || active.current !== r.current || active.status !== "running") return;
       // A conflicted merge leaves conflict markers in the tree this step was
       // about to work in. Prompting on top of that produces work nobody can
       // review, so the route stops here and names the files. The merge is
@@ -601,7 +615,7 @@ export class RouteEngine {
       await this.host.send(this.instruction(r), agent);
     } catch (err) {
       const fresh = this.read();
-      if (fresh && fresh.id === r.id) {
+      if (fresh && fresh.id === r.id && fresh.status === "running") {
         this.finish(
           fresh,
           "failed",

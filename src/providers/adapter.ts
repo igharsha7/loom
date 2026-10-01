@@ -40,7 +40,8 @@ export interface ProviderAdapter {
    * turn to drop, because a chat's native turns and Loom's turns don't line up
    * one to one (compaction turns, a provider switch in between).
    */
-  rollbackThread?(threadId: ThreadId, beforeTurnId: TurnId): Promise<RollbackResult>;
+  validateRollback?(threadId: ThreadId, beforeTurnId: TurnId): Promise<string[] | void>;
+  rollbackThread?(threadId: ThreadId, beforeTurnId: TurnId, retainedTurnIds?: string[]): Promise<RollbackResult>;
   /** Stop one session and wait for its process to be gone. */
   stopSession(threadId: ThreadId): Promise<void>;
   stopAll(): Promise<void>;

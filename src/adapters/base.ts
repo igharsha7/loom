@@ -21,6 +21,15 @@ import { AgentStateStore } from "../core/agent-state.js";
 type EventCb = (e: AdapterEvent) => void;
 type StreamCb = (d: StreamDelta) => void;
 
+// Native sessions can emit after another chat takes the foreground. Routing
+// belongs to the adapter envelope, never its public or persisted payload.
+const nativeChats = new WeakMap<AdapterEvent, string>();
+export function withNativeChat(event: AdapterEvent, chat: string): AdapterEvent {
+  nativeChats.set(event, chat);
+  return event;
+}
+export function nativeChatOf(event: AdapterEvent): string | undefined { return nativeChats.get(event); }
+
 export abstract class AgentBase {
   readonly id: string;
   readonly kind: string;
@@ -105,7 +114,7 @@ export abstract class AdapterBase extends AgentBase implements Adapter {
   }
   protected endContinuity(): void { this.continuityTurn = undefined; }
   protected override emit(event: AdapterEvent): void {
-    const turn = this.continuityTurn;
+    const turn = nativeChatOf(event) === undefined ? this.continuityTurn : undefined;
     super.emit(turn ? { ...event, payload: { ...event.payload, loomRunId: turn.runId,
       loomBindingId: turn.bindingId, loomSessionEpoch: turn.sessionEpoch } } : event);
   }

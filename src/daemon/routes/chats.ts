@@ -138,6 +138,24 @@ export function registerChatsRoutes(app: Express, withRuntime: WithRuntime): voi
     }),
   );
 
+  /**
+   * Move a chat to another agent mid-conversation: { agentId, resend? }. The
+   * outgoing turn stops; with Brain continuity the new agent is brought up to
+   * date on its next turn. `resend` sends the last message again to it.
+   */
+  app.post(
+    "/api/projects/:id/chats/:chatId/switch",
+    withRuntime(async (rt, req, res) => {
+      const { agentId, resend } = (req.body ?? {}) as { agentId?: string; resend?: boolean };
+      if (!agentId) return void res.status(400).json({ error: "switch to which agent? send { agentId }" });
+      try {
+        res.json(await rt.switchChat(String(req.params.chatId), String(agentId), { resend: resend === true }));
+      } catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+      }
+    }),
+  );
+
   app.post(
     "/api/projects/:id/chats/:chatId/rename",
     withRuntime(async (rt, req, res) => {

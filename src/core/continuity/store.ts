@@ -11,9 +11,31 @@ import { BindingV1, ContextItemV1, ContextPacketV1, DeliveryReceiptV1, RenderedB
 
 type Row = Record<string, string | number | null>;
 const decode = <T>(row: Row | undefined): T | undefined => row ? JSON.parse(String(row.data)) as T : undefined;
+const eventFromRow = (r: Row): LoomEvent => ({ id: Number(r.id), ts: Number(r.ts), kind: String(r.kind) as LoomEvent["kind"],
+  ...(r.agent_id ? { agentId: String(r.agent_id) } : {}), ...(r.chat ? { chat: String(r.chat) } : {}),
+  payload: JSON.parse(String(r.payload)) });
 export const eventText = (e: LoomEvent): string => typeof e.payload.text === "string" ? e.payload.text : JSON.stringify(e.payload);
 export const isUser = (e: LoomEvent): boolean => !e.agentId &&
   ((e.kind === "message" && e.payload.author !== "loom") || (e.kind === "decision" && e.payload.auto !== true && (e.payload.author === undefined || e.payload.author === "user")));
+/** Rewinds keep the journal intact; queued messages inside a dropped turn stay live.
+ * Old {from}-only records still mean the plain half-open range. SQL and memory
+ * checks share the parsed specs so reconstruction and resend cannot disagree. */
+export function droppedHistory(events: LoomEvent[], chat: string): { isDropped: (id: number) => boolean; sql: string; args: Array<number | string> } {
+  const specs = events.flatMap(e => {
+    const d = e.payload.dropped as { from?: unknown; turns?: unknown; keep?: unknown } | undefined;
+    if (e.kind !== "checkpoint" || e.payload.reason !== "rewound" || (e.payload.chat ?? e.chat ?? MAIN_CHAT) !== chat || typeof d?.from !== "number") return [];
+    const ids = (v: unknown): number[] => Array.isArray(v) ? v.filter((id): id is number => typeof id === "number") : [];
+    return [{ from: d.from, to: e.id, turns: ids(d.turns), keep: ids(d.keep) }];
+  });
+  return { isDropped: id => specs.some(s => (id >= s.from && id < s.to && !s.keep.includes(id)) || s.turns.includes(id)),
+    // One JSON parameter keeps SQL depth and parameter count independent of rewind count.
+    sql: specs.length ? ` AND NOT EXISTS (SELECT 1 FROM json_each(?) AS rewind
+      WHERE (events.id>=json_extract(rewind.value,'$.from') AND events.id<json_extract(rewind.value,'$.to')
+        AND events.id NOT IN (SELECT value FROM json_each(rewind.value,'$.keep')))
+        OR events.id IN (SELECT value FROM json_each(rewind.value,'$.turns')))` : "",
+    args: specs.length ? [JSON.stringify(specs)] : [] };
+
+}
 const USER_SOURCE = `agent_id IS NULL AND ((kind='decision' AND coalesce(json_extract(payload,'$.auto'),0)!=1
   AND coalesce(json_extract(payload,'$.author'),'user')='user') OR (kind='message' AND coalesce(json_extract(payload,'$.author'),'user')!='loom'))`;
 // A captured request is conversation history only once it may have reached a
@@ -174,9 +196,7 @@ export class ContinuityStore {
   }
   event(id: number): LoomEvent | undefined {
     const r = this.db.prepare("SELECT * FROM events WHERE id=?").get(id) as Row | undefined;
-    return r ? { id: Number(r.id), ts: Number(r.ts), kind: String(r.kind) as LoomEvent["kind"],
-      ...(r.agent_id ? { agentId: String(r.agent_id) } : {}), ...(r.chat ? { chat: String(r.chat) } : {}),
-      payload: JSON.parse(String(r.payload)) } : undefined;
+    return r ? eventFromRow(r) : undefined;
   }
   source(event: LoomEvent, projectId: string): SourceRef {
     return { projectId, eventId: event.id, hash: digest(eventText(event)) };
@@ -187,18 +207,26 @@ export class ContinuityStore {
       ORDER BY id LIMIT ?`).all(chat, since, through, limit) as Row[];
     return rows.map(r => this.event(Number(r.id))!);
   }
+  dropped(chat: string): ReturnType<typeof droppedHistory> {
+    const rows = this.db.prepare("SELECT * FROM events WHERE kind='checkpoint' AND json_extract(payload,'$.reason')='rewound'").all() as Row[];
+    return droppedHistory(rows.map(eventFromRow), chat);
+  }
+  isDropped(chat: string, eventId: number): boolean { return this.dropped(chat).isDropped(eventId); }
+  private notDropped(chat: string): { sql: string; args: Array<number | string> } { return this.dropped(chat); }
   protectedEvents(chat: string, through: number): LoomEvent[] {
-    const rows = this.db.prepare(`SELECT id FROM events WHERE coalesce(chat,'${MAIN_CHAT}')=? AND id<=?
+    const live = this.notDropped(chat);
+    const rows = this.db.prepare(`SELECT id FROM events WHERE coalesce(chat,'${MAIN_CHAT}')=? AND id<=?${live.sql}
       AND (kind='message' OR kind='decision') AND ${USER_SOURCE}
       AND id NOT IN (${CHECKPOINTED}) AND id NOT IN (${UNSENT_REQUESTS}) ORDER BY id LIMIT 10001`)
-      .all(chat, through, chat, chat) as Row[];
+      .all(chat, through, ...live.args, chat, chat) as Row[];
     return rows.map(r => this.event(Number(r.id))!);
   }
   /** Governing user evidence after a snapshot. A newly queued request is not
    * governing: it runs as its own turn after the current one. */
   hasNewUserSources(chat: string, through: number): boolean {
-    return Boolean(this.db.prepare(`SELECT id FROM events WHERE coalesce(chat,'${MAIN_CHAT}')=? AND id>?
-      AND ${USER_SOURCE} AND id NOT IN (${UNSENT_REQUESTS}) LIMIT 1`).get(chat, through, chat));
+    const live = this.notDropped(chat);
+    return Boolean(this.db.prepare(`SELECT id FROM events WHERE coalesce(chat,'${MAIN_CHAT}')=? AND id>?${live.sql}
+      AND ${USER_SOURCE} AND id NOT IN (${UNSENT_REQUESTS}) LIMIT 1`).get(chat, through, ...live.args, chat));
   }
   /** Sources already placed in one native session by accepted packets. */
   delivered(bindingId: string, epoch: number): { messages: Set<number>; evidence: Set<number> } {
@@ -224,6 +252,11 @@ export class ContinuityStore {
   updateBinding(binding: Binding): void {
     this.assertOwner(); BindingV1.parse(binding);
     this.db.prepare("UPDATE continuity_bindings SET data=? WHERE id=?").run(JSON.stringify(binding), binding.id);
+  }
+  /** Every binding of one agent in one chat (one per workspace and configuration). */
+  bindingsFor(chat: string, agentId: string): Binding[] {
+    return (this.db.prepare(`SELECT data FROM continuity_bindings WHERE json_extract(data,'$.conversationId')=?
+      AND json_extract(data,'$.agentInstanceId')=?`).all(chat, agentId) as Row[]).map(r => BindingV1.parse(JSON.parse(String(r.data))));
   }
   bindingById(id: string): Binding | undefined {
     return decode(this.db.prepare("SELECT data FROM continuity_bindings WHERE id=?").get(id) as Row | undefined);
@@ -261,6 +294,27 @@ export class ContinuityStore {
     });
   }
   revision(chat: string): number { return Number(this.meta(`revision:${chat}`) ?? 0); }
+  /**
+   * Retire reviewed items that rest on a turn a rewind dropped: each gets a new
+   * revision marked superseded, so packets stop carrying it and its other
+   * sources count as conversation again. Returns the retired item ids.
+   */
+  retireDropped(chat: string): string[] {
+    this.assertOwner();
+    const dropped = this.dropped(chat).isDropped;
+    const retired: string[] = [];
+    this.transaction(() => {
+      for (const item of this.items(chat)) {
+        if (item.status === "superseded" || !item.sources.some(s => dropped(s.eventId))) continue;
+        const next: ContextItem = { ...item, revision: item.revision + 1, status: "superseded" };
+        this.db.prepare("UPDATE continuity_items SET data=? WHERE id=?").run(JSON.stringify(next), item.id);
+        this.db.prepare("INSERT INTO continuity_item_revisions VALUES (?,?,?)").run(item.id, next.revision, JSON.stringify(next));
+        retired.push(item.id);
+      }
+      if (retired.length) this.setMeta(`revision:${chat}`, String(this.revision(chat) + 1));
+    });
+    return retired;
+  }
   // A source disposition is an explicit user-reviewed checkpoint. Original text
   // stays in events; deferred/uncertain discussion cannot disappear via top-K.
   dispose(eventId: number, chat: string, itemId: string): void {
@@ -287,15 +341,17 @@ export class ContinuityStore {
   }
   /** Observation candidates (agent/tool output), newest first. */
   observations(chat: string, since: number, through: number, limit: number): LoomEvent[] {
-    const rows = this.db.prepare(`SELECT id FROM events WHERE coalesce(chat,'${MAIN_CHAT}')=? AND id>? AND id<=?
+    const live = this.notDropped(chat);
+    const rows = this.db.prepare(`SELECT id FROM events WHERE coalesce(chat,'${MAIN_CHAT}')=? AND id>? AND id<=?${live.sql}
       AND kind IN ('message','tool_call','file_edit','turn_diff','run_complete','error') AND NOT (${USER_SOURCE})
-      ORDER BY id DESC LIMIT ?`).all(chat, since, through, limit) as Row[];
+      ORDER BY id DESC LIMIT ?`).all(chat, since, through, ...live.args, limit) as Row[];
     return rows.map(r => this.event(Number(r.id))!);
   }
   countObservations(chat: string, since: number, through: number): number {
-    return Number((this.db.prepare(`SELECT count(*) AS n FROM events WHERE coalesce(chat,'${MAIN_CHAT}')=? AND id>? AND id<=?
+    const live = this.notDropped(chat);
+    return Number((this.db.prepare(`SELECT count(*) AS n FROM events WHERE coalesce(chat,'${MAIN_CHAT}')=? AND id>? AND id<=?${live.sql}
       AND kind IN ('message','tool_call','file_edit','turn_diff','run_complete','error') AND NOT (${USER_SOURCE})`)
-      .get(chat, since, through) as Row).n);
+      .get(chat, since, through, ...live.args) as Row).n);
   }
   savePacket(packet: ContextPacket, rendered: RenderedBriefing, receipt: Receipt): void {
     this.assertOwner(); parseBounded(ContextPacketV1, packet); parseBounded(RenderedBriefingV1, rendered); DeliveryReceiptV1.parse(receipt);

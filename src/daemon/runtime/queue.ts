@@ -43,6 +43,13 @@ export class RuntimeQueue {
   queueListeners = new Set<(s: QueueState) => void>();
 
   draining = false;
+  /** A shifted prompt is still dispatching while harness discovery awaits. */
+  readonly dispatching = new Set<string>();
+
+  /** Internal holds nest without changing a pause the user owns. */
+  holds = 0;
+  hold(): void { this.holds++; }
+  release(): void { this.holds--; }
 
   /** When the project last went quiet, for a "after N quiet minutes" condition. */
   quietSince = 0;
@@ -66,9 +73,9 @@ export class RuntimeQueue {
 
   /** Change a waiting prompt. A target this project can't run is refused now,
    * not when the queue reaches it and has to stop. */
-  editQueued(itemId: string, patch: { text?: string; target?: QueueTarget; plan?: boolean; when?: QueueCondition | null }): QueueItem {
+  editQueued(itemId: string, patch: { text?: string; target?: QueueTarget; plan?: boolean; when?: QueueCondition | null }, opts: { preserveFollowsChat?: true } = {}): QueueItem {
     if (patch.target?.kind === "agent") this.mustTakeTurns(patch.target.agentId);
-    const item = this.host.queue.edit(itemId, patch);
+    const item = this.host.queue.edit(itemId, patch, opts);
     this.kickQueue();
     return item;
   }
@@ -181,22 +188,26 @@ export class RuntimeQueue {
   }
 
   kickQueue(): void {
-    if (this.host.closed || this.draining || this.host.queue.paused || !this.host.queue.length) return;
+    if (this.host.closed || this.draining || this.holds > 0 || this.host.queue.paused || !this.host.queue.length) return;
     queueMicrotask(() => void this.drainPromptQueue());
   }
 
   /** Send the head of the queue if it may go; then look again. */
   async drainPromptQueue(): Promise<void> {
-    if (this.host.closed || this.draining || this.host.queue.paused) return;
+    if (this.host.closed || this.draining || this.holds > 0 || this.host.queue.paused) return;
     const head = this.host.queue.peek();
     if (!head || this.queueBlocker(head)) return;
     this.draining = true;
+    this.dispatching.add(head.chat);
     // Out of the queue, then sent: what you can still see is what hasn't gone.
     // (Leaving it in place until the send returns would survive a crash
     // mid-dispatch, at the price of a prompt you can edit or remove after it
     // has already reached the agent — a worse thing to be wrong about.)
-    const item = this.host.queue.shift()!;
+    // shift notifies listeners after removing the head; retain it even if
+    // notification throws, and release dispatch state on that path too.
+    const item = head;
     try {
+      this.host.queue.shift();
       await this.dispatchQueued(item);
     } catch (err) {
       // refused (budget, quarantine, policy, a missing agent): keep it where it
@@ -208,6 +219,7 @@ export class RuntimeQueue {
         this.host.appendIfOpen({ kind: "error", chat: item.chat, payload: { message: `queued prompt not sent: ${message}` } });
       }
     } finally {
+      this.dispatching.delete(head.chat);
       this.draining = false;
     }
     this.kickQueue();
@@ -238,6 +250,7 @@ export class RuntimeQueue {
     const holder = this.host.validHolder();
     if (to && holder && holder !== to) await this.host.handoff(to, { source: item.source });
     await this.host.sendMessage(item.text, to, { source: item.source, chat: item.chat, fromQueue: true,
+      ...(item.followsChat ? { followsChat: true } : {}),
       requestId: item.continuity?.requestId ?? (item.editedAt ? `queue:${item.id}:edit:${item.editedAt}` : `queue:${item.id}`),
       ...(item.continuity ? { capturedModel: item.continuity.model } : {}),
       ...(item.plan ? { plan: true } : {}),

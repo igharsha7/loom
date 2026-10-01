@@ -6,7 +6,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ProviderRuntimeEvent } from "../../src/providers/contracts.js";
 import { FileSessionDirectory, MemorySessionDirectory } from "../../src/providers/directory.js";
 import { ProviderError } from "../../src/providers/errors.js";
@@ -254,4 +254,118 @@ describe("FileSessionDirectory", () => {
     directory.touch("a", "x", 200);
     expect(directory.get("a", "x")!.lastSeenAt).toBe(200);
   });
+});
+
+describe("service lifecycle and ledger regressions", () => {
+  it("joins pending starts before stopAll, unregister and stopSession (#15)", async () => {
+    for (const stop of ["all", "instance", "session"]) {
+      const { service, codex } = setup({ startDelay: 30 });
+      const starting = service.ensureSession({ threadId: "main", instanceId: "codex", ...base });
+      await (stop === "all" ? service.stopAll() : stop === "instance" ? service.unregister("codex") : service.stopSession("main", "codex"));
+      await starting;
+      expect(codex.listSessions()).toEqual([]);
+    }
+  });
+  it("records a native turn even when its acknowledgement is lost (#14)", async () => {
+    const { service, codex, directory } = setup();
+    const send = codex.sendTurn.bind(codex);
+    codex.sendTurn = async input => { await send(input); throw new ProviderError("transport", "sendTurn", "lost acknowledgement", { mayHaveStarted: true }); };
+    const cutoff = Date.now();
+    await expect(service.sendTurn({ threadId: "main", instanceId: "codex", input: "one", ...base })).rejects.toThrow(/acknowledgement/);
+    expect(directory.get("main", "codex")!.turnLedger!.turns).toHaveLength(1);
+    expect(service.planRollback("main", "codex", cutoff, "/repo")!.turns).toBe(1);
+    await service.stopAll();
+  });
+  it("refuses rollback after an uncertain dispatch without a native id (#14)", async () => {
+    const { service, codex } = setup();
+    codex.sendTurn = async () => { throw new ProviderError("transport", "sendTurn", "lost acknowledgement", { mayHaveStarted: true }); };
+    const cutoff = Date.now();
+    await expect(service.sendTurn({ threadId: "main", instanceId: "codex", input: "one", ...base })).rejects.toThrow();
+    expect(() => service.planRollback("main", "codex", cutoff, "/repo")).toThrow(/aren't on record/);
+    await service.stopAll();
+  });
+  it("does not inherit a cleared model override from the directory (#18)", async () => {
+    const { service, codex } = setup();
+    await service.ensureSession({ threadId: "main", instanceId: "codex", ...base, model: "old" });
+    await service.stopSession("main", "codex");
+    await service.ensureSession({ threadId: "main", instanceId: "codex", ...base, model: null });
+    expect(codex.calls.filter(c => c.op === "startSession").at(-1)!.args[0]).not.toHaveProperty("modelSelection");
+    await service.stopAll();
+  });
+});
+
+it("shares overlapping stops while a session is starting (#15)", async () => {
+  const { service, codex } = setup({ startDelay: 30 });
+  const starting = service.ensureSession({ threadId: "main", instanceId: "codex", ...base });
+  const first = service.stopSession("main", "codex"), second = service.stopSession("main", "codex");
+  await Promise.all([starting, first, second]);
+  expect(codex.calls.filter(c => c.op === "stopSession")).toHaveLength(1);
+  expect(service.listSessions()).toEqual([]);
+});
+
+describe("port audit service regressions", () => {
+  it("retains the adapter when unregister containment fails and retries (#7)", async () => {
+    const { service, codex } = setup();
+    await service.ensureSession({ threadId: "main", instanceId: "codex", ...base });
+    const stop = codex.stopAll.bind(codex); let tries = 0;
+    codex.stopAll = async () => { if (++tries === 1) throw new Error("containment failed"); await stop(); };
+    await expect(service.unregister("codex")).rejects.toThrow("containment failed");
+    expect(service.instances()).toContain("codex");
+    expect(service.listSessions()).toHaveLength(1);
+    await service.unregister("codex");
+    expect(tries).toBe(2); expect(service.instances()).not.toContain("codex");
+  });
+  it("publishes a terminal event even if the directory write fails (#13)", async () => {
+    const { service, codex, directory, events } = setup();
+    await service.ensureSession({ threadId: "main", instanceId: "codex", ...base });
+    const touch = directory.touch; directory.touch = () => { throw new Error("disk full"); };
+    codex.emit("main", "turn.completed", { state: "completed" }, { turnId: "finished" });
+    expect(events.at(-1)?.type).toBe("turn.completed");
+    directory.touch = touch; await service.stopAll();
+  });
+  it("does not submit across a same-tick stopAll barrier (#14)", async () => {
+    const { service, codex } = setup();
+    await service.ensureSession({ threadId: "main", instanceId: "codex", ...base });
+    const sending = service.sendTurn({ threadId: "main", instanceId: "codex", input: "one", ...base });
+    const stopping = service.stopAll();
+    await expect(sending).rejects.toThrow("stopping"); await stopping;
+    expect(codex.calls.some(c => c.op === "sendTurn")).toBe(false);
+  });
+  it("persists uncertainty before native submission and preserves it on reload (#15)", async () => {
+    const dir = tmpDir("submission"), directory = new FileSessionDirectory(dir);
+    const { service, codex } = setup({}, directory);
+    await service.ensureSession({ threadId: "main", instanceId: "codex", ...base });
+    // Put the cutoff strictly between session activity and submission. Under
+    // load, Date.now() - 1 can land here instead of before session activity.
+    const cutoff = directory.get("main", "codex")!.lastSeenAt + 1;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(cutoff + 1);
+    const assertUncertain = () => {
+      const reloaded = new FileSessionDirectory(dir);
+      const recovered = new ProviderService(reloaded); recovered.register(new FakeAdapter("codex"));
+      expect(() => recovered.planRollback("main", "codex", cutoff, "/repo")).toThrow(/aren't on record/);
+      expect(reloaded.get("main", "codex")).toMatchObject({ turnLedger: null, lastSeenAt: cutoff + 1 });
+    };
+    try {
+      codex.sendTurn = async () => {
+        assertUncertain();
+        throw new ProviderError("transport", "sendTurn", "unknown", { mayHaveStarted: true });
+      };
+      await expect(service.sendTurn({ threadId: "main", instanceId: "codex", input: "one", ...base })).rejects.toThrow("unknown");
+      assertUncertain();
+    } finally {
+      clock.mockRestore();
+      await service.stopAll();
+    }
+  });
+});
+
+it("checks cancellation after session initialization, before native submission (#1)", async () => {
+  const { service, codex, directory } = setup({ startDelay: 40 });
+  let cancelled = false;
+  const sending = service.sendTurn({ threadId: "main", instanceId: "codex", input: "must never run", ...base, cancelled: () => cancelled });
+  cancelled = true;
+  await expect(sending).rejects.toMatchObject({ notSubmitted: true });
+  expect(codex.calls.filter(c => c.op === "sendTurn")).toHaveLength(0);
+  expect(directory.get("main", "codex")?.turnLedger?.turns).toEqual([]);
+  await service.stopAll();
 });
