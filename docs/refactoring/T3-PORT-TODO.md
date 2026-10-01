@@ -182,7 +182,7 @@ Claude settings); override per session through the protocol instead.
 A second agent audited the port; Claude checked each round's findings against the
 code, Sol fixed them, Claude reviewed and ran the suite. Rounds 1–4 covered Phase 5
 only; rounds 5–8 covered all five phases, including what earlier fixes introduced.
-Findings per round: 5, 4, 6, 4, then 25, 24, 14, 10. All fixed, each with a
+Findings per round: 5, 4, 6, 4, then 25, 24, 14, 10, 16. All fixed, each with a
 regression test.
 
 - [x] Phase 5: dropped turns are named explicitly (`dropped: { from, turns, keep }`
@@ -209,10 +209,23 @@ regression test.
   question everywhere (routes, status, reloaded cards); multi-select questions;
   Codex file-read approvals; sparse Claude and Codex limit reports; per-window
   limit state.
-- [x] Tests: 1732 passing (plus 132 DOM). Known unrelated: `daemon.test.ts`
+- [x] Tests: 1764 passing (plus 132 DOM). Known unrelated: `daemon.test.ts`
   "real models" depends on the live Codex catalog; `app-queue-dom` is
   occasionally flaky. `codex.test.ts` "interrupts the running turn" failed once
   under full-suite load and couldn't be reproduced (6 runs alone, 2 full runs).
+- [x] Round 9 (all phases, deepest on checkpoints; 16 findings, all fixed):
+  per-turn auto-commit no longer commits the user's staged work (it skips the
+  commit when a touched file has staged changes); sibling projects in one repo
+  keep separate checkpoint refs and pruning; undo of an interrupted rewind
+  restores into the journalled checkout, and a failed retry keeps the journal;
+  a files-only release with the checkout gone succeeds with `recoveryReleased`;
+  Claude background Bash/agents count as running until their task ends; an
+  unsettled legacy turn is stopped before ownership is released, and Stop
+  cancels a turn still being prepared; switching honours pending journals;
+  routes wait for diff/commit finalization; submodules and embedded repos report
+  `checkpoint_unavailable`; a tracked `.loom/log.db` no longer invalidates
+  Brain's packets; large restores batch git work (20k paths in seconds) and
+  oversize patches keep the file list.
 - [ ] UI for the recovery states (pending rewind, pending compaction) — Phase 7.
   Today the way out is the CLI or the API.
 - [ ] Next audits go area by area (checkpoints, sessions, Brain) rather than

@@ -77,7 +77,7 @@ export interface TurnDiff {
 }
 
 /** Loom's own bookkeeping inside the project — never an agent's work. */
-const isLoomState = (path: string) => path === ".loom" || path.startsWith(".loom/");
+const isLoomState = (path: string) => path.split("/").includes(".loom");
 
 /**
  * Changes attributable to one turn: files whose porcelain line differs from
@@ -94,24 +94,27 @@ export async function diffSinceSnapshot(dir: string, before: string): Promise<Tu
   const current = next ? JSON.parse(next).loomTurnTree as typeof snapshot : null;
   const after = await porcelainStatus(dir);
   const beforeSet = new Set(before.split("\n").filter(Boolean));
-  const changedLines = current && snapshot ? [...new Set([...Object.keys(snapshot), ...Object.keys(current)])]
+  const root = (await git(["rev-parse", "--show-toplevel"], dir)).trim() || dir;
+  const prefix = path.relative(root, fs.realpathSync(dir)).split(path.sep).join("/");
+  const entries = current && snapshot ? [...new Set([...Object.keys(snapshot), ...Object.keys(current)])]
     .filter(p => JSON.stringify(snapshot[p]) !== JSON.stringify(current[p]))
-    .map(p => `${current[p]?.status ?? " M"} ${p}`) : after.split("\n").filter(l => l && !beforeSet.has(l) && !isLoomState(l.slice(3).trim()));
-  if (!changedLines.length) return null;
-  const files = parsePorcelain(changedLines.join("\n"));
-  const paths = files.map((f) => f.path);
+    .map(p => ({ status: current[p]?.status ?? " M", path: p }))
+    : (await git(["status", "--porcelain", "-z", "--no-renames", "-uall"], dir)).split("\0").filter(Boolean).map(line => ({ status: line.slice(0, 2), path: line.slice(3) })).filter(f => !beforeSet.has(`${f.status} ${f.path}`) && !isLoomState(f.path));
+  const scoped = entries.filter(f => !prefix || f.path.startsWith(prefix + "/"));
+  if (!scoped.length) return null;
+  const paths = scoped.map(f => f.path);
+  const files = scoped.map(f => ({ ...f, path: prefix ? f.path.slice(prefix.length + 1) : f.path }));
 
   let added = 0;
   let removed = 0;
-  const root = (await git(["rev-parse", "--show-toplevel"], dir)).trim() || dir;
-  const numstat = await git(["diff", "HEAD", "--numstat", "--", ...paths], root);
+  const numstat = await git(["--literal-pathspecs", "diff", "HEAD", "--numstat", "--", ...paths], root);
   for (const line of numstat.split("\n")) {
     const [a, r] = line.split("\t");
     added += Number(a) || 0;
     removed += Number(r) || 0;
   }
 
-  let patch = await git(["diff", "HEAD", "--", ...paths], root);
+  let patch = await git(["--literal-pathspecs", "diff", "HEAD", "--", ...paths], root);
   const untracked = files.filter((f) => f.status === "??").map((f) => f.path);
   if (untracked.length) {
     patch += (patch ? "\n" : "") + untracked.map((p) => `?? new file: ${p}`).join("\n");

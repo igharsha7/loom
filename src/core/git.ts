@@ -223,8 +223,15 @@ export async function stageAndCommitFiles(
   message: string,
 ): Promise<CommitResult> {
   if (!paths.length) throw new GitError("no files to commit", "");
-  await stage(dir, paths);
-  return commit(dir, message);
+  const rels = checkAll(dir, paths);
+  const staged = (await git(["--literal-pathspecs", "diff", "--cached", "--relative", "--name-only", "-z", "--", ...rels], dir)).split("\0").filter(Boolean);
+  if (staged.length) throw new GitError("turn commit skipped: a touched file has user-staged changes; commit or unstage it first", "");
+  const text = message.trim();
+  if (!text) throw new GitError("a commit needs a message", "");
+  await stage(dir, rels);
+  // --only commits these working files and preserves unrelated index entries.
+  await git(["--literal-pathspecs", "commit", "--only", "-m", text, "--", ...rels], dir);
+  return { sha: (await git(["rev-parse", "--short", "HEAD"], dir)).trim(), subject: firstLine(text), files: rels.length };
 }
 
 export async function status(dir: string): Promise<GitStatus> {

@@ -674,3 +674,13 @@ it("queries protected sources and observations after more than 1000 rewinds (aud
   expect(brain.store.observations("main", 0, log.lastId(), 10)).toEqual([]);
   expect(brain.store.countObservations("main", 0, log.lastId())).toBe(0);
 });
+
+it("can submit when Loom's changing log database is tracked (finding #13)", async () => {
+  const { dir, brain } = await setup();
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: dir });
+  git("init", "-q"); git("config", "user.email", "t@t"); git("config", "user.name", "t");
+  git("add", "-f", ".loom/log.db"); git("commit", "-qm", "tracked log");
+  const req = request(brain, "safe dispatch");
+  const prepared = await brain.prepare(req, "codex", dir, { bin: fakeCodex() });
+  expect(await brain.submit(prepared)).toMatchObject({ runId: prepared.receipt.runId });
+});

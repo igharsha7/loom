@@ -168,3 +168,13 @@ describe("rewinding through the daemon", () => {
     expect(read("app.ts")).toBeTruthy();
   }, 60_000);
 });
+
+it("rewinds a filename with leading whitespace literally through HTTP (finding #11)", async () => {
+  fs.writeFileSync(path.join(dir, " report.txt"), "literal before\n");
+  const { capture } = await import("../src/core/checkpoint.js");
+  const cp = (await capture(dir, "whitespace"))!;
+  fs.writeFileSync(path.join(dir, " report.txt"), "literal after\n");
+  fs.writeFileSync(path.join(dir, "report.txt"), "different file\n");
+  await api("POST", `/checkpoints/${cp.id}/rewind-file`, { path: " report.txt" });
+  expect(read(" report.txt")).toBe("literal before\n"); expect(read("report.txt")).toBe("different file\n");
+});

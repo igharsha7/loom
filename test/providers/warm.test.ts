@@ -8,7 +8,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { ClaudeCodeAdapter, CodexAdapter, stopAllProviderSessions } from "../../src/providers/agent.js";
 import { nativeChatOf } from "../../src/adapters/base.js";
 import { readProjectState, writeProjectState } from "../../src/core/registry.js";
@@ -283,7 +283,6 @@ describe("provider event association regression", () => {
   });
 });
 
-import { vi } from "vitest";
 import { ProviderError } from "../../src/providers/errors.js";
 import { NativeQuiescenceUnknown } from "../../src/core/continuity/contracts.js";
 
@@ -415,4 +414,73 @@ it("keeps manual compaction alive across idle reaper sweeps (#9)", async () => {
   await compacting;
   expect(providers.service.directory.get("main", "codex")!.lastSeenAt).toBeGreaterThan(old);
   await agent.stop();
+});
+
+it.each(["Bash", "Agent"])("waits for background %s task notification after its placeholder (finding #3)", async name => {
+  const bin = fakeClaude({ script: [
+    { out: { type: "assistant", message: { content: [{ type: "tool_use", id: "tool-bg", name, input: { command: "write", run_in_background: true } }] }, parent_tool_use_id: null } },
+    { out: { type: "system", subtype: "task_started", task_id: "bg", tool_use_id: "tool-bg", description: "writes", is_backgrounded: true } },
+    { out: { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tool-bg", content: "running in background" }] }, parent_tool_use_id: null } },
+    claudeResult(), { sleep: 150 },
+    { out: { type: "system", subtype: "task_notification", task_id: "bg", tool_use_id: "tool-bg", status: "completed", summary: "done", output_file: "out" } },
+  ] });
+  const { agent, events } = claudeAgent(bin, undefined, { commandSettleMs: 1000 });
+  const sending = agent.send({ text: "background write" });
+  await waitUntil(() => of(events, "tool_call").length > 0);
+  expect(agent.busy()).toBe(true); expect(of(events, "run_complete")).toHaveLength(0);
+  await sending; expect(of(events, "run_complete")).toHaveLength(1); await agent.stop();
+});
+
+it("uses the background roster without depending on edge order (finding #3)", async () => {
+  const bin = fakeClaude({ script: [
+    { out: { type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "bg", task_type: "local_agent", description: "writes" }] } },
+    { out: { type: "system", subtype: "task_notification", task_id: "bg", status: "completed", summary: "edge arrives first" } },
+    claudeResult(), { sleep: 100 },
+    { out: { type: "system", subtype: "background_tasks_changed", tasks: [] } },
+    { out: { type: "system", subtype: "task_started", task_id: "bg", description: "late edge" } },
+  ] });
+  const { agent, events } = claudeAgent(bin, undefined, { commandSettleMs: 1000 });
+  const sending = agent.send({ text: "roster" });
+  await waitUntil(() => agent.busy());
+  await sending; expect(of(events, "run_complete")).toHaveLength(1); await agent.stop();
+});
+
+it("stops a legacy session before releasing an unresolved command's writer lock (finding #4)", async () => {
+  const bin = fakeCodex({ script: [
+    codexNotify("turn/started", { turn: { id: "$TURN" } }),
+    codexNotify("item/started", { item: { id: "cmd", type: "commandExecution", command: "write", status: "inProgress" } }),
+    codexDone(),
+  ] });
+  const { agent } = codexAgent(bin, undefined, { commandSettleMs: 20 });
+  await expect(agent.send({ text: "legacy" })).rejects.toBeInstanceOf(NativeQuiescenceUnknown);
+  const providers = (agent as unknown as { providers: { service: import("../../src/providers/service.js").ProviderService } }).providers;
+  expect(providers.service.directory.get("main", "codex")?.status).toBe("stopped");
+  expect(agent.busy()).toBe(false);
+  await agent.send({ text: "ordinary retry" }).catch(() => {}); await agent.stop();
+});
+
+it("keeps a failed session stop owned and lets ordinary Stop retry it (finding #4)", async () => {
+  const bin = fakeCodex({ scripts: [CODEX_OK, [
+    codexNotify("turn/started", { turn: { id: "$TURN" } }),
+    codexNotify("item/started", { item: { id: "cmd", type: "commandExecution", command: "write", status: "inProgress" } }), codexDone(),
+  ]] });
+  const { agent } = codexAgent(bin, undefined, { commandSettleMs: 20 });
+  await agent.send({ text: "attach" });
+  const service = (agent as unknown as { providers: { service: import("../../src/providers/service.js").ProviderService } }).providers.service;
+  const stop = vi.spyOn(service, "stopSession").mockRejectedValueOnce(new Error("stop temporarily failed"));
+  try {
+    await expect(agent.send({ text: "unsettled" })).rejects.toBeInstanceOf(NativeQuiescenceUnknown);
+    expect(agent.busy()).toBe(true);
+    await expect(agent.send({ text: "unsafe" })).rejects.toThrow(/busy/);
+    await agent.interrupt(); expect(agent.busy()).toBe(false); expect(stop).toHaveBeenCalledTimes(2);
+  } finally { stop.mockRestore(); await agent.stop(); }
+});
+
+it("does not leave a foreground agent task waiting for a background notification (finding #3)", async () => {
+  const bin = fakeClaude({ script: [
+    { out: { type: "system", subtype: "task_started", task_id: "fg", description: "foreground agent", is_backgrounded: false } },
+    claudeResult(),
+  ] });
+  const { agent, events } = claudeAgent(bin, undefined, { commandSettleMs: 20 });
+  await agent.send({ text: "foreground" }); expect(of(events, "run_complete")).toHaveLength(1); await agent.stop();
 });

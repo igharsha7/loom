@@ -164,3 +164,17 @@ describe("branch per task", () => {
     }
   });
 });
+
+it("preserves unrelated staging and refuses partial staging on touched files (finding #5)", async () => {
+  const { stageAndCommitFiles } = await import("../src/core/git.js");
+  fs.writeFileSync(path.join(dir, "user.txt"), "user staged\n"); git(dir, "add", "user.txt");
+  fs.writeFileSync(path.join(dir, "agent.txt"), "agent\n");
+  await stageAndCommitFiles(dir, ["agent.txt"], "agent only");
+  expect(git(dir, "show", "--format=", "--name-only", "HEAD").trim()).toBe("agent.txt");
+  expect(git(dir, "diff", "--cached", "--name-only").trim()).toBe("user.txt");
+  fs.writeFileSync(path.join(dir, "agent.txt"), "user staged part\n"); git(dir, "add", "agent.txt");
+  fs.writeFileSync(path.join(dir, "agent.txt"), "later agent edit\n");
+  const index = git(dir, "diff", "--cached"), head = git(dir, "rev-parse", "HEAD");
+  await expect(stageAndCommitFiles(dir, ["agent.txt"], "must skip")).rejects.toThrow(/user-staged/);
+  expect(git(dir, "diff", "--cached")).toBe(index); expect(git(dir, "rev-parse", "HEAD")).toBe(head);
+});

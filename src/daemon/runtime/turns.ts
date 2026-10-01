@@ -34,10 +34,17 @@ import { worktreePath } from "../../core/git.js";
 import type { RollbackStep } from "../../providers/service.js";
 
 /** A rewind: the files put back, and each conversation that went back with them. */
-export interface RewindResult extends checkpoints.RestoreResult {
-  /** Per provider agent in the checkpoint's chat: turns dropped, or why its rollback failed. */
+export type RewindResult = (checkpoints.RestoreResult & {
+  recoveryReleased?: false;
+  /** Per provider agent: turns dropped, or why its rollback failed. */
   conversation: Array<{ agentId: string; provider: ProviderKind; turns: number; error?: string }>;
-}
+}) | {
+  /** Explicit files-only recovery succeeded, but the checkout no longer exists. */
+  recoveryReleased: true;
+  message: string;
+  changed: [];
+  conversation: Array<{ agentId: string; provider: ProviderKind; turns: number; error?: string }>;
+};
 
 /**
  * Point Brain's bindings for (chat, agent) at the native session a rollback
@@ -193,6 +200,7 @@ export class RuntimeTurns {
    * never do is stop the turn.
    */
   async checkpointBefore(agentId: string, prompt: string, chat: string = MAIN_CHAT, turnEvent?: number): Promise<void> {
+    this.turnCheckpoint.delete(agentId);
     let associated = false;
     try {
       const label = prompt.replace(/\s+/g, " ").trim().slice(0, 120) || `a turn by ${agentId}`;
@@ -213,8 +221,8 @@ export class RuntimeTurns {
           ...(turnEvent !== undefined ? { turnEvent } : {}), store: cp.store, cwd: this.host.agentDir(agentId) },
       });
       associated = true;
-    } catch {
-      /* never the reason a turn doesn't run */
+    } catch (error) {
+      this.host.appendIfOpen({ kind: "status", agentId, payload: { state: "checkpoint_unavailable", message: error instanceof Error ? error.message : String(error) } });
     } finally {
       // Conversation history still needs the association when no files could
       // be captured. A status marker never advertises a restorable checkpoint.
@@ -292,8 +300,23 @@ export class RuntimeTurns {
     // Files-only is also the ordinary escape from an interrupted conversation
     // rewind. The user accepts the native histories as they stand, even when
     // the original checkout or provider is no longer available.
-    if (pending && (options.conversation === false || pending.prepared?.undo.id === id)) {
+    if (pending?.workspace && !fs.existsSync(pending.workspace.dir) && options.conversation === false) {
+      // The checkout is gone, so there are no files there to finish restoring.
+      // Explicit files-only accepts the native histories and releases this gate;
+      // it must never redirect the lost checkout's restore into Main.
+      const message = "rewind recovery released; the original checkout no longer exists, so no files were restored";
+      this.host.log.append({ kind: "status", payload: { state: "rewind_recovery_released", id, cwd: pending.workspace.dir, message } });
       fs.rmSync(journal);
+      return { recoveryReleased: true, message, changed: [], conversation: [] };
+    }
+    let releasedWorkspace: { dir: string; agentId?: string } | undefined;
+    let releasedPending = false;
+    let releasedPrepared: NonNullable<typeof pending>["prepared"];
+    if (pending && (options.conversation === false || pending.prepared?.undo.id === id)) {
+      releasedPending = true;
+      if (id === pending.id) releasedPrepared = pending.prepared;
+      if (id === pending.id || id === pending.prepared?.undo.id)
+        releasedWorkspace = pending.workspace ?? this.checkpointWorkspace(pending.id);
       pending = null;
       options = { conversation: false };
     }
@@ -335,8 +358,8 @@ export class RuntimeTurns {
         if (step) steps.push({ agent, step });
       }
     }
-    const workspace = pending?.workspace ?? this.checkpointWorkspace(id);
-    const prepared = pending?.prepared ?? await checkpoints.prepareRestore(workspace.dir, id);
+    const workspace = pending?.workspace ?? releasedWorkspace ?? this.checkpointWorkspace(id);
+    const prepared = pending?.prepared ?? releasedPrepared ?? await checkpoints.prepareRestore(workspace.dir, id);
     const saveIntent = (remaining: RollbackStep[]) => {
       fs.mkdirSync(path.dirname(journal), { recursive: true });
       const tmp = `${journal}.${randomUUID()}.tmp`;
@@ -349,7 +372,7 @@ export class RuntimeTurns {
     };
     if (!pending) saveIntent(steps.map(s => s.step));
     let out: checkpoints.RestoreResult;
-    let filesMayHaveChanged = false;
+    let filesMayHaveChanged = Boolean(pending || releasedPending);
     try { out = await checkpoints.restore(workspace.dir, id, prepared, () => { filesMayHaveChanged = true; }); }
     catch (error) {
       // Preflight refusals must not wedge an unchanged workspace. Once writes
@@ -615,9 +638,13 @@ export class RuntimeTurns {
       chat,
       payload: { text, author: source === "route" ? "loom" : "user", ...(opts.fromQueue ? { fromQueue: true } : {}) },
     });
+    const preparation = new AbortController();
+    this.preparing.set(target, preparation);
+    const assertPrepared = () => { if (preparation.signal.aborted) throw new Error("dispatch preparation was interrupted"); };
     let mcp: ReturnType<typeof writeMcpSession> = null;
     try {
       await this.host.ensureStarted(target);
+      assertPrepared();
       if (!this.host.isCurrentAgent(agent)) throw new Error(`agent "${target}" is no longer active`);
 
       const pendingBriefing = this.host.consumePendingBriefing(target);
@@ -659,13 +686,17 @@ export class RuntimeTurns {
       // …and a checkpoint you can actually go back to. The porcelain snapshot
       // above only says *which* paths changed; this holds their content, so
       // "undo what that turn did" is a click rather than a re-typing (#101).
+      assertPrepared();
       await this.checkpointBefore(target, text, chat, said.id);
+      assertPrepared();
       // Fire-and-notify: the turn runs in the background; progress streams
       // into the log and completion lands as run_complete.
       if (!this.host.isCurrentAgent(agent)) throw new Error(`agent "${target}" is no longer active`);
       void Promise.resolve()
         .then(() => {
           if (!this.host.isCurrentAgent(agent)) throw new Error(`agent "${target}" is no longer active`);
+          assertPrepared();
+          if (this.preparing.get(target) === preparation) this.preparing.delete(target);
           return agent.send(input);
         })
         .catch((error) => this.host.dispatchFailed(agent, chat, error))
@@ -673,15 +704,17 @@ export class RuntimeTurns {
         // turn succeeded, failed or was interrupted — a temp file per turn that
         // nothing removes is a slow leak of the project's server URLs.
         .finally(async () => {
+          if (this.preparing.get(target) === preparation) this.preparing.delete(target);
           mcp?.cleanup();
           if (agent instanceof ProviderAgent) {
             await this.postTurn.get(target);
             this.postTurn.delete(target);
-            if (!this.host.closed && this.host.isCurrentAgent(agent)) { this.busySince.delete(target); this.host.kickQueue(); }
+            if (!agent.busy() && !this.host.closed && this.host.isCurrentAgent(agent)) { this.busySince.delete(target); this.host.kickQueue(); }
           }
         });
       return { agentId: target };
     } catch (error) {
+      if (this.preparing.get(target) === preparation) this.preparing.delete(target);
       mcp?.cleanup();
       this.host.dispatchFailed(agent, chat, error);
       throw error;
@@ -823,6 +856,16 @@ export class RuntimeTurns {
     }
   }
 
+  /** Routes advance after the outgoing writer and its diff/commit settle. */
+  async waitForFinalization(agentId: string, check: () => void = () => {}): Promise<void> {
+    await this.postTurn.get(agentId);
+    while (this.busySince.has(agentId)) {
+      check();
+      if (this.host.closed) throw new Error("project closed during finalization");
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  }
+
   /** Adapters that look hung: busy far longer than any plausible turn. */
   staleSessions(now = Date.now()): Array<{ agentId: string; busyMs: number }> {
     const out: Array<{ agentId: string; busyMs: number }> = [];
@@ -913,9 +956,17 @@ export class RuntimeTurns {
     }
     if (isAdapter(agent) && agent.busy()) {
       await agent.interrupt();
+      await this.finishStopped(agent);
       return { interrupted: holder };
     }
     return { interrupted: null };
+  }
+
+  /** Release a stopped provider only after its remaining app writes finish. */
+  async finishStopped(agent: AnyAgent): Promise<void> {
+    if (!(agent instanceof ProviderAgent) || agent.busy()) return;
+    await this.postTurn.get(agent.id);
+    if (!agent.busy()) { this.busySince.delete(agent.id); this.host.kickQueue(); }
   }
 
   /**
@@ -939,6 +990,7 @@ export class RuntimeTurns {
         if (!interrupted.has(id) && agent && isAdapter(agent) && agent.busy()) {
           interrupted.add(id);
           await agent.interrupt().catch(() => {});
+          await this.finishStopped(agent);
         }
       }
       await new Promise((r) => setTimeout(r, 25));

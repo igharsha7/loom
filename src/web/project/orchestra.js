@@ -463,6 +463,7 @@ export function createOrchestra(view) {
           return api(url, { method: "POST", body: JSON.stringify({ conversation: false }) });
         })
         .then(function(j){
+          if (j && j.recoveryReleased) { toast(j.message); state.checkpoints = null; return; }
           var n = (j && j.changed || []).length;
           var turns = (j && j.conversation || []).reduce(function(a, c){ return a + (c.error ? 0 : c.turns); }, 0);
           var failed = (j && j.conversation || []).filter(function(c){ return c.error; });

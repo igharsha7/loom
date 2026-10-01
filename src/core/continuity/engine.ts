@@ -37,7 +37,7 @@ export async function observeWorkspace(dir: string): Promise<{ workspace: Worksp
     const [h, s] = await Promise.all([
       exec("git", ["rev-parse", "--verify", "HEAD"], { cwd: checkout, timeout: 5000, maxBuffer: 1_000_000 })
         .catch(error => { if (/needed a single revision/i.test(String(error.stderr))) return { stdout: "" }; throw error; }),
-      exec("git", ["status", "--porcelain=v1", "-z"], { cwd: checkout, timeout: 5000, maxBuffer: 1_000_000 }),
+      exec("git", ["status", "--porcelain=v1", "-z", "--no-renames", "--", ".", ":(exclude)**/.loom/**", ":(exclude).loom/**"], { cwd: checkout, timeout: 5000, maxBuffer: 1_000_000 }),
     ]);
     head = h.stdout.trim() || null; dirty = Boolean(s.stdout); state = s.stdout;
   } catch (error) {
@@ -61,15 +61,15 @@ export async function observeWorkspace(dir: string): Promise<{ workspace: Worksp
   const dirtyContent: Array<[string, string]> = [];
   if (dirty) {
     try {
-      const diff = await exec("git", ["diff", ...(head ? ["HEAD"] : ["--cached"]), "--no-ext-diff", "--binary"], { cwd: checkout, timeout: 5000, maxBuffer: 4_000_000 });
+      const diff = await exec("git", ["diff", ...(head ? ["HEAD"] : ["--cached"]), "--no-ext-diff", "--binary", "--", ".", ":(exclude)**/.loom/**", ":(exclude).loom/**"], { cwd: checkout, timeout: 5000, maxBuffer: 4_000_000 });
       dirtyContent.push(["tracked", digest(diff.stdout)]);
       if (!head) {
-        const unstaged = await exec("git", ["diff", "--no-ext-diff", "--binary"], { cwd: checkout, timeout: 5000, maxBuffer: 4_000_000 });
+        const unstaged = await exec("git", ["diff", "--no-ext-diff", "--binary", "--", ".", ":(exclude)**/.loom/**", ":(exclude).loom/**"], { cwd: checkout, timeout: 5000, maxBuffer: 4_000_000 });
         dirtyContent.push(["unstaged", digest(unstaged.stdout)]);
       }
       const untracked = await exec("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: checkout, timeout: 5000, maxBuffer: 1_000_000 });
       for (const name of untracked.stdout.split("\0").filter(Boolean)) {
-        if (name.startsWith(".loom/")) continue;
+        if (name.split("/").includes(".loom")) continue;
         const file = path.join(checkout, name), stat = fs.lstatSync(file);
         if (stat.isSymbolicLink()) dirtyContent.push([name, digest(fs.readlinkSync(file))]);
         else if (stat.isFile() && stat.size <= 4_000_000) dirtyContent.push([name, digest(fs.readFileSync(file).toString("base64"))]);

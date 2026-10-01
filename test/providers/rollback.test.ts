@@ -529,8 +529,13 @@ it("files-only releases pending recovery even if the saved checkout is gone (#3)
   const { rt, dir } = await gitRuntime(fakeCodex()); await turn(rt, "first");
   const cp = checkpointBefore(rt, "first"), journal = path.join(dir, ".loom", "rewind-pending.json");
   fs.writeFileSync(journal, JSON.stringify({ id: cp, origin: null, steps: [], workspace: { dir: path.join(dir, "gone") } }));
-  await rt.rewind(cp, { conversation: false });
+  fs.writeFileSync(path.join(dir, "app.txt"), "Main must survive\n");
+  const out = await rt.rewind(cp, { conversation: false });
+  expect(out).toEqual({ recoveryReleased: true, message: expect.stringMatching(/no files were restored/), changed: [], conversation: [] });
   expect(fs.existsSync(journal)).toBe(false);
+  expect(fs.readFileSync(path.join(dir, "app.txt"), "utf8")).toBe("Main must survive\n");
+  expect(rt.log.list().some(e => e.payload.state === "rewind_recovery_released")).toBe(true);
+  await turn(rt, "ordinary recovery");
 });
 
 it("captures the full native retained prefix when Loom only knows recent turns (#2)", async () => {

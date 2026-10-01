@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import pc from "picocolors";
 import qrcode from "qrcode-terminal";
+import { rewindSummary } from "./rewind-output.js";
 import type { LoomEvent, ProjectStatus } from "../types.js";
 
 // package.json says node >=22.5, but npm doesn't enforce engines at run time.
@@ -793,9 +794,7 @@ program
     }
     try {
       const out = await client.rewind(project.id, target.id, opts.filesOnly ? { conversation: false } : {});
-      console.log(
-        `${pc.green("✓")} rewound ${pc.dim(`· ${out.changed.length} file${out.changed.length === 1 ? "" : "s"} · undo the files with \`loom rewind ${out.undo.id}\``)}`,
-      );
+      console.log(`${pc.green("✓")} ${rewindSummary(out)}`);
       for (const c of out.conversation ?? []) {
         if (c.error) console.log(`${pc.yellow("!")} ${c.agentId}'s conversation stayed as it was: ${c.error}`);
         else console.log(pc.dim(`  ${c.agentId}'s conversation went back ${c.turns} turn${c.turns === 1 ? "" : "s"}`));

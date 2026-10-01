@@ -192,6 +192,8 @@ interface Session {
   proc: HarnessProcess | null;
   turn: Turn | null;
   tools: Map<string, Tool>;
+  backgroundTasks: Set<string>;
+  taskRoster: boolean;
   pending: Map<RequestId, PendingRequest>;
   inputs: Map<RequestId, { turnId?: TurnId; resolve: (answers: UserInputAnswers) => void }>;
   /** The permission mode the session started in; plan turns switch away and back. */
@@ -248,7 +250,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     const session = {
       info: { provider: this.provider, instanceId: this.instanceId, threadId: input.threadId, status: "connecting",
         runtimeMode: input.runtimeMode, cwd: input.cwd, resumeCursor: sessionId, createdAt: now, updatedAt: now, ...(model ? { model } : {}) },
-      sessionId, prompts, proc: null, turn: null, tools: new Map(), pending: new Map(), inputs: new Map(), planMode: false, compactions: 0, stopping: false,
+      sessionId, prompts, proc: null, turn: null, tools: new Map(), backgroundTasks: new Set(), taskRoster: false, pending: new Map(), inputs: new Map(), planMode: false, compactions: 0, stopping: false,
     } as Omit<Session, "query" | "done"> as Session;
 
     const options: Options = {
@@ -623,7 +625,26 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     const at = turnId ? { turnId } : {};
     switch (msg.type) {
       case "system":
-        if (msg.subtype === "init") {
+        // The SDK's level roster is authoritative and independent of edge
+        // ordering. Treat ambient tasks as writers too: they can still write.
+        if (msg.subtype === "background_tasks_changed") {
+          s.taskRoster = true;
+          const next = new Set(msg.tasks.map(task => task.task_id));
+          for (const id of next) if (!s.backgroundTasks.has(id)) this.emit(threadId, "item.started",
+            { itemType: "command_execution", status: "inProgress", detail: "Background task" }, { ...at, itemId: `background:${id}` });
+          for (const id of s.backgroundTasks) if (!next.has(id)) this.emit(threadId, "item.completed",
+            { itemType: "command_execution", status: "completed" }, { ...at, itemId: `background:${id}` });
+          s.backgroundTasks = next;
+        } else if (!s.taskRoster && ((msg.subtype === "task_started" && msg.is_backgrounded !== false) ||
+          (msg.subtype === "task_updated" && msg.patch.is_backgrounded === true))) {
+          if (!s.backgroundTasks.has(msg.task_id)) {
+            s.backgroundTasks.add(msg.task_id);
+            this.emit(threadId, "item.started", { itemType: "command_execution", status: "inProgress", detail: "description" in msg ? msg.description : msg.patch.description ?? "Background task" }, { ...at, itemId: `background:${msg.task_id}` });
+          }
+        } else if (!s.taskRoster && msg.subtype === "task_notification") {
+          s.backgroundTasks.delete(msg.task_id);
+          this.emit(threadId, "item.completed", { itemType: "command_execution", status: msg.status === "failed" ? "failed" : "completed", detail: msg.summary }, { ...at, itemId: `background:${msg.task_id}` });
+        } else if (msg.subtype === "init") {
           if (typeof msg.model === "string" && msg.model) s.info = { ...s.info, model: msg.model };
           if (msg.session_id && msg.session_id !== s.sessionId) {
             s.sessionId = msg.session_id;

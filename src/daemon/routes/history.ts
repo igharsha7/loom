@@ -72,7 +72,7 @@ export function registerHistoryRoutes(app: Express, withRuntime: WithRuntime): v
   app.post(
     "/api/projects/:id/checkpoints/:cpId/rewind-file",
     withRuntime(async (rt, req, res) => {
-      const file = String((req.body as { path?: unknown } | undefined)?.path ?? "").trim();
+      const file = String((req.body as { path?: unknown } | undefined)?.path ?? "");
       if (!file) return void res.status(400).json({ error: "which file? send { path }" });
       try {
         res.json(await rt.rewindFile(String(req.params.cpId), file));

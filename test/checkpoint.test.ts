@@ -8,10 +8,10 @@
  * mock cannot have an opinion about.
  */
 
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { capture, diffSince, find, forgetAll, list, prune, restore, restoreFile, STORE_LIMITS } from "../src/core/checkpoint.js";
 import { tmpDir } from "./helpers.js";
@@ -524,7 +524,6 @@ describe("port audit checkpoint regressions", () => {
 
 vi.mock("node:child_process", { spy: true });
 import * as childProcess from "node:child_process";
-import { vi } from "vitest";
 
 it.each(["diff", "ls-tree"])("fails restore before touching files when git %s fails (#5)", async command => {
   const dir = repo(), cp = (await capture(dir, "before"))!;
@@ -584,6 +583,79 @@ it("hashes and diffs repo-relative porcelain paths from a project subdirectory (
   expect(JSON.parse(before).loomTurnTree["nested/code.txt"].hash).not.toBe("missing");
   write(dir, "nested/code.txt", "three\n");
   const diff = await diffSinceSnapshot(sub, before);
-  expect(diff?.files).toEqual([{ status: " M", path: "nested/code.txt" }]);
+  expect(diff?.files).toEqual([{ status: " M", path: "code.txt" }]);
   expect(diff?.patch).toContain("+three");
+});
+
+it("isolates sibling project checkpoint lists, restore and retention (finding #6)", async () => {
+  const dir = repo();
+  write(dir, "a/file.txt", "A"); write(dir, "b/file.txt", "B");
+  git(dir, "add", "a", "b"); git(dir, "commit", "-qm", "siblings");
+  const a = path.join(dir, "a"), b = path.join(dir, "b");
+  const ca = (await capture(a, "A"))!, cb = (await capture(b, "B"))!;
+  const { prepareRestore } = await import("../src/core/checkpoint.js");
+  write(dir, "a/file.txt", "A2");
+  const prepared = await prepareRestore(a, ca.id);
+  expect((await list(a)).map(c => c.id)).not.toContain(cb.id);
+  expect((await list(dir)).map(c => c.id)).not.toContain(ca.id);
+  await expect(restore(a, cb.id)).rejects.toThrow(/no checkpoint/);
+  await prune(b, 0);
+  expect(await find(a, ca.id)).not.toBeNull();
+  expect(await find(a, prepared.undo.id)).not.toBeNull();
+  await prune(a, 1);
+  expect(await find(a, prepared.undo.id)).not.toBeNull();
+  git(dir, "gc", "--prune=now");
+  git(dir, "cat-file", "-e", ca.commit);
+  await restore(a, ca.id, prepared);
+  expect(read(a, "file.txt")).toBe("A");
+});
+
+it.each([false, true])("refuses embedded repos and submodules explicitly, tracked=%s (finding #12)", async tracked => {
+  const dir = repo(), nested = path.join(dir, "embedded");
+  fs.mkdirSync(nested);
+  git(nested, "init", "-q"); git(nested, "config", "user.email", "t@t"); git(nested, "config", "user.name", "t");
+  write(nested, "file.txt", "one"); git(nested, "add", "."); git(nested, "commit", "-qm", "inner");
+  if (tracked) { git(dir, "add", "embedded"); git(dir, "commit", "-qm", "gitlink"); }
+  await expect(capture(dir, "incomplete")).rejects.toThrow(/submodules or embedded/);
+  expect(read(nested, "file.txt")).toBe("one");
+});
+
+it("restores many paths with batched Git preflight and staging (finding #15)", async () => {
+  const dir = repo();
+  for (let i = 0; i < 20_000; i++) write(dir, `many/${i}.txt`, "before\n");
+  const cp = (await capture(dir, "many"))!;
+  for (let i = 0; i < 20_000; i++) write(dir, `many/${i}.txt`, "after\n");
+  const start = vi.mocked(execFile).mock.calls.length;
+  const lstat = vi.spyOn(fs.promises, "lstat");
+  try {
+    const result = await restore(dir, cp.id);
+    const launches = vi.mocked(execFile).mock.calls.slice(start);
+    expect(result.changed).toHaveLength(20_000);
+    expect(launches.length).toBeLessThan(45);
+    expect(launches.filter(call => (call[1] as string[]).includes("check-ignore"))).toHaveLength(2);
+    expect(launches.filter(call => (call[1] as string[]).includes("checkout-index"))).toHaveLength(1);
+    expect(lstat.mock.calls.filter(call => String(call[0]) === path.join(dir, "many"))).toHaveLength(2);
+    for (let i = 0; i < 20_000; i++) expect(read(dir, `many/${i}.txt`)).toBe("before\n");
+  } finally { lstat.mockRestore(); }
+  // The budget includes 40k fixture writes under the full suite's disk load.
+  // Batching and every restored file are verified independently of elapsed time.
+}, 120_000);
+
+it("retains files and counts when a text patch exceeds 64 MiB (finding #16)", async () => {
+  const dir = repo(), cp = (await capture(dir, "before large text"))!;
+  write(dir, "large.txt", "x".repeat(65 * 1024 * 1024) + "\n");
+  const diff = await diffSince(dir, cp.id);
+  expect(diff).toMatchObject({ files: [{ path: "large.txt" }], added: 1, removed: 0, truncated: true });
+  expect(diff!.patch.length).toBeLessThan(13_000);
+}, 30_000);
+
+it("returns literal project-relative fallback paths, including newline names (finding #14)", async () => {
+  const dir = repo(), sub = path.join(dir, "nested"); fs.mkdirSync(sub);
+  const before = await turnSnapshot(sub);
+  write(sub, " report\nname.txt", "new\n"); write(dir, "outside.txt", "outside\n");
+  const diff = await diffSinceSnapshot(sub, before);
+  expect(diff?.files).toEqual([{ status: "??", path: " report\nname.txt" }]);
+  const { stageAndCommitFiles } = await import("../src/core/git.js");
+  await stageAndCommitFiles(sub, diff!.files.map(f => f.path), "nested turn");
+  expect(git(dir, "show", "HEAD:nested/ report\nname.txt")).toBe("new\n");
 });

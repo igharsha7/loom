@@ -948,3 +948,162 @@ it("follows only the rolled-back workspace and native cursor (#5)", async () => 
   expect(brain.store.bindingById("worktree")).toMatchObject({ nativeSessionId: "worktree-native", sessionEpoch: 1 });
   expect(brain.store.bindingById("other-config")).toMatchObject({ nativeSessionId: "other-native", sessionEpoch: 1 });
 });
+
+it("uses pending undo provenance in a linked checkout before a rewound event exists (finding #1)", async () => {
+  const { rt, dir } = await project({ git: true, continuity: false });
+  const linked = path.join(path.dirname(dir), `linked-${Date.now()}`);
+  execFileSync("git", ["worktree", "add", "-q", "-b", "agent-test", linked], { cwd: dir });
+  const cp = (await checkpoints.capture(linked, "linked before"))!;
+  fs.writeFileSync(path.join(linked, "app.txt"), "linked later");
+  const prepared = await checkpoints.prepareRestore(linked, cp.id);
+  await checkpoints.restore(linked, cp.id, prepared);
+  fs.writeFileSync(path.join(dir, "app.txt"), "main must survive");
+  fs.writeFileSync(path.join(dir, ".loom", "rewind-pending.json"), JSON.stringify({ id: cp.id, origin: null, steps: [], workspace: { dir: linked }, prepared }));
+  await rt.rewind(prepared.undo.id);
+  expect(fs.readFileSync(path.join(linked, "app.txt"), "utf8")).toBe("linked later");
+  expect(fs.readFileSync(path.join(dir, "app.txt"), "utf8")).toBe("main must survive");
+  expect(fs.existsSync(path.join(dir, ".loom", "rewind-pending.json"))).toBe(false);
+});
+
+it("retains interrupted rewind intent if retry preflight fails (finding #2)", async () => {
+  const { rt, dir } = await project({ git: true });
+  const cp = (await checkpoints.capture(dir, "before"))!;
+  fs.writeFileSync(path.join(dir, "app.txt"), "changed");
+  const restore = checkpoints.restore;
+  const crash = vi.spyOn(checkpoints, "restore").mockImplementationOnce(async (...args) => { await restore(...args); throw new Error("crash after writes"); });
+  try { await expect(rt.rewind(cp.id)).rejects.toThrow(/crash/); } finally { crash.mockRestore(); }
+  const journal = path.join(dir, ".loom", "rewind-pending.json"), intent = fs.readFileSync(journal, "utf8");
+  const preflight = vi.spyOn(checkpoints, "restore").mockRejectedValueOnce(new Error("symlink parent"));
+  try { await expect(rt.rewind(cp.id)).rejects.toThrow(/symlink/); } finally { preflight.mockRestore(); }
+  expect(fs.readFileSync(journal, "utf8")).toBe(intent);
+  await expect(rt.sendMessage("unsafe", "codex")).rejects.toThrow(/rewinding/);
+  await rt.rewind(cp.id, { conversation: false }); expect(fs.existsSync(journal)).toBe(false);
+});
+
+it.each(["rewind-pending.json", "compaction-pending.json"])("blocks chat switch on persisted %s (finding #7)", async journal => {
+  const { rt, dir } = await project({ git: true });
+  fs.writeFileSync(path.join(dir, ".loom", journal), "{}");
+  await expect(rt.switchChat("main", "claude")).rejects.toThrow(/rewind|compaction/);
+  expect((await rt.status()).holder).not.toBe("claude");
+  fs.rmSync(path.join(dir, ".loom", journal));
+  await rt.switchChat("main", "claude"); expect((await rt.status()).holder).toBe("claude");
+});
+
+it("waits for turn commit finalization before the next route handoff (finding #8)", async () => {
+  const { rt } = await project({ git: true, continuity: false });
+  const briefings = (rt as unknown as { briefings: { prepareHandoff: (...args: unknown[]) => Promise<unknown> } }).briefings;
+  const briefing = vi.spyOn(briefings, "prepareHandoff").mockResolvedValue({ memory: "", briefing: "", mode: "template", elapsedMs: 0, bridges: [] });
+  const turns = (rt as unknown as { turns: RuntimeTurns }).turns;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const commit = vi.spyOn(turns, "commitTurn").mockImplementationOnce(async () => { await gate; });
+  // The fake does not edit files; provide a real diff so finalization reaches commit.
+  const diff = vi.spyOn(checkpoints, "diffSince").mockResolvedValueOnce({ files: [{ status: " M", path: "app.txt" }], added: 1, removed: 1, patch: "", truncated: false });
+  try {
+    await rt.startRoute({ task: "two steps", spec: ["codex", "claude"] });
+    await waitUntil(() => commit.mock.calls.length > 0);
+    expect(rt.routeState()?.status).toBe("running");
+    release(); await waitUntil(() => rt.routeState()?.status === "completed");
+    expect(rt.log.list({ kinds: ["error"] }).some(e => /finalizing/.test(String(e.payload.message)))).toBe(false);
+  } finally { release(); commit.mockRestore(); diff.mockRestore(); briefing.mockRestore(); }
+});
+
+it("Stop cancels legacy dispatch while startup is awaited (finding #9)", async () => {
+  const { rt, codex } = await project({ continuity: false });
+  const host = rt as unknown as { ensureStarted: (id: string) => Promise<unknown> };
+  const original = host.ensureStarted.bind(rt);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const startup = vi.spyOn(host, "ensureStarted").mockImplementationOnce(async id => { await gate; return original(id); });
+  try {
+    const sending = rt.sendMessage("must never run", "codex"), outcome = sending.catch(error => error);
+    await waitUntil(() => startup.mock.calls.length > 0);
+    expect(await rt.interrupt()).toEqual({ interrupted: "codex" });
+    release(); expect((await outcome).message).toMatch(/interrupted/);
+    expect(rpcOf(codex, "turn/start")).toHaveLength(0);
+    expect(rt.anyBusy()).toBe(false);
+  } finally { release(); startup.mockRestore(); }
+});
+
+it("clears a prior turn checkpoint before a failed new capture (finding #10)", async () => {
+  const { rt, dir } = await project({ git: true, continuity: false });
+  const turns = (rt as unknown as { turns: RuntimeTurns }).turns;
+  const prior = (await checkpoints.capture(dir, "prior"))!;
+  turns.turnCheckpoint.set("codex", prior.id);
+  const capture = vi.spyOn(checkpoints, "capture").mockRejectedValueOnce(new Error("capture failed"));
+  try { await turns.checkpointBefore("codex", "next", "main"); } finally { capture.mockRestore(); }
+  expect(turns.turnCheckpoint.has("codex")).toBe(false);
+  const { turnSnapshot } = await import("../../src/core/worktree.js");
+  turns.preTurnTree.set("codex", await turnSnapshot(dir));
+  fs.writeFileSync(path.join(dir, "app.txt"), "new turn\n");
+  turns.captureTurnDiff("codex"); await turns.lastTurnDiff.get("codex");
+  await waitUntil(() => rt.log.list({ kinds: ["turn_diff"] }).length > 0);
+  expect(rt.log.list({ kinds: ["turn_diff"] }).at(-1)!.payload.checkpoint).toBeUndefined();
+});
+
+it.each(["snapshot", "checkpoint"])("Stop cancels legacy dispatch during %s capture (finding #9)", async stage => {
+  const { rt, codex } = await project({ continuity: false, git: true });
+  const worktree = await import("../../src/core/worktree.js");
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const originalSnapshot = worktree.turnSnapshot, originalCapture = checkpoints.capture;
+  const spy = stage === "snapshot"
+    ? vi.spyOn(worktree, "turnSnapshot").mockImplementationOnce(async dir => { await gate; return originalSnapshot(dir); })
+    : vi.spyOn(checkpoints, "capture").mockImplementationOnce(async (...args) => { await gate; return originalCapture(...args); });
+  try {
+    const sending = rt.sendMessage("cancel preparation", "codex"), outcome = sending.catch(error => error);
+    await waitUntil(() => spy.mock.calls.length > 0);
+    expect(await rt.interrupt()).toEqual({ interrupted: "codex" });
+    release(); expect((await outcome).message).toMatch(/interrupted/);
+    expect(rpcOf(codex, "turn/start")).toHaveLength(0); expect(rt.anyBusy()).toBe(false);
+    await rt.sendMessage("ordinary retry", "codex"); await waitUntil(() => !rt.anyBusy());
+    expect(rpcOf(codex, "turn/start")).toHaveLength(1);
+  } finally { release(); spy.mockRestore(); }
+});
+
+it("releases a vanished checkout through files-only without writing Main (finding #1)", async () => {
+  const { rt, dir } = await project({ git: true, continuity: false });
+  const cp = (await checkpoints.capture(dir, "before"))!;
+  const journal = path.join(dir, ".loom", "rewind-pending.json");
+  fs.writeFileSync(journal, JSON.stringify({ id: cp.id, origin: null, steps: [], workspace: { dir: path.join(dir, "gone") } }));
+  expect(await rt.rewind(cp.id, { conversation: false })).toMatchObject({ recoveryReleased: true, changed: [], message: expect.stringMatching(/no files were restored/) });
+  expect(fs.existsSync(journal)).toBe(false);
+  expect(fs.readFileSync(path.join(dir, "app.txt"), "utf8")).toBe("v0\n");
+  await rt.sendMessage("ordinary recovery", "codex"); await waitUntil(() => !rt.anyBusy());
+});
+
+it("clears runtime ownership after a chat switch stops a retained legacy writer (finding #4)", async () => {
+  const { rt } = await project({ continuity: false, git: true, codex: [started,
+    codexNotify("item/started", { item: { id: "cmd", type: "commandExecution", command: "write", status: "inProgress" } }), codexDone()] });
+  const agent = rt.agent("codex") as ProviderAgent;
+  (agent as unknown as { options: Record<string, unknown> }).options.commandSettleMs = 100;
+  await rt.ensureStarted("codex");
+  // Attach lazily, then pause submission long enough to install the stop failure.
+  await rt.sendMessage("unsettled", "codex");
+  await waitUntil(() => Boolean((agent as unknown as { providers: unknown }).providers));
+  const service = (agent as unknown as { providers: { service: import("../../src/providers/service.js").ProviderService } }).providers.service;
+  const stop = vi.spyOn(service, "stopSession").mockRejectedValueOnce(new Error("transient stop failure"));
+  const briefings = (rt as unknown as { briefings: { prepareHandoff: (...args: unknown[]) => Promise<unknown> } }).briefings;
+  const briefing = vi.spyOn(briefings, "prepareHandoff").mockResolvedValue({ memory: "", briefing: "", mode: "template", elapsedMs: 0, bridges: [] });
+  try {
+    await waitUntil(() => stop.mock.calls.length > 0 && rt.log.list({ kinds: ["error"] }).length > 0);
+    expect(agent.busy()).toBe(true);
+    await rt.switchChat("main", "claude");
+    expect((rt as unknown as { turns: RuntimeTurns }).turns.busySince.has("codex")).toBe(false);
+    await rt.sendMessage("ordinary switch recovery", "claude"); await waitUntil(() => !rt.anyBusy());
+  } finally { stop.mockRestore(); briefing.mockRestore(); }
+});
+
+it("can finish files-only recovery from the journal even if its target ref was pruned (finding #6)", async () => {
+  const { rt, dir } = await project({ continuity: false, git: true });
+  const cp = (await checkpoints.capture(dir, "target"))!;
+  fs.writeFileSync(path.join(dir, "app.txt"), "later\n");
+  const prepared = await checkpoints.prepareRestore(dir, cp.id);
+  const journal = path.join(dir, ".loom", "rewind-pending.json");
+  fs.writeFileSync(journal, JSON.stringify({ id: cp.id, origin: null, steps: [], workspace: { dir }, prepared }));
+  execFileSync("git", ["update-ref", "-d", `refs/loom/checkpoints/${cp.id}`], { cwd: dir });
+  execFileSync("git", ["gc", "--prune=now"], { cwd: dir });
+  await rt.rewind(cp.id, { conversation: false });
+  expect(fs.readFileSync(path.join(dir, "app.txt"), "utf8")).toBe("v0\n");
+  expect(fs.existsSync(journal)).toBe(false);
+});

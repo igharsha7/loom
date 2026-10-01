@@ -359,6 +359,7 @@ export class ProviderAgent extends AdapterBase {
     let release!: () => void;
     this.settled = new Promise(resolve => { release = resolve; });
     let submitted = false;
+    let retainWriter = false;
     try {
       const { service } = await this.attach();
       const runtimeMode = this.runtimeMode();
@@ -404,8 +405,8 @@ export class ProviderAgent extends AdapterBase {
       // Turn-level settlement (the session stays warm): the harness reported
       // the turn done, and no command it started is still running. A command
       // that won't finish leaves Brain's outcome unproven.
-      // Brain waits up to a minute for proof; an ordinary turn moves on after a
-      // few seconds, since a harness can end a turn with a command it abandoned.
+      // Brain waits up to a minute for proof; an ordinary turn waits a few
+      // seconds, then stops the session before giving up its writer lock.
       const settleMs = typeof this.options.commandSettleMs === "number" ? this.options.commandSettleMs : input.continuity ? 60_000 : 5_000;
       const commandsIdle = await this.commandsSettled(chat, settleMs);
       if (!commandsIdle) {
@@ -433,11 +434,16 @@ export class ProviderAgent extends AdapterBase {
         if (input.continuity) throw error instanceof NativeDispatchRejected ? error : new NativeDispatchRejected("interrupted before the turn started");
         return;
       }
+      if (error instanceof NativeQuiescenceUnknown && !input.continuity) {
+        // Legacy dispatch has no persisted ownership receipt. Stop the writer
+        // before releasing its in-memory lock. A failed stop keeps Stop usable.
+        try { await this.providers?.service.stopSession(chat, this.id); }
+        catch { retainWriter = true; throw error; }
+      }
       throw error;
     } finally {
       this.ingestion.untagTurn(chat, this.id);
-      this.current = null;
-      this._busy = false;
+      if (!retainWriter) { this.current = null; this._busy = false; }
       this.endContinuity();
       release();
     }
@@ -529,10 +535,18 @@ export class ProviderAgent extends AdapterBase {
     }
     cur.interrupted = true;
     const service = this.providers?.service;
-    if (service && cur.turnId) await service.interruptTurn(cur.chat, this.id, cur.turnId).catch(error => { if (error instanceof NativeQuiescenceUnknown) throw error; });
+    if (service && cur.turnId) await service.interruptTurn(cur.chat, this.id, cur.turnId).catch(async error => {
+      if (error instanceof NativeQuiescenceUnknown) await service.stopSession(cur.chat, this.id);
+    });
     const settled = this.settled ?? Promise.resolve();
     const within = (ms: number) => Promise.race([settled.then(() => true), new Promise<false>(resolve => setTimeout(() => resolve(false), ms).unref())]);
-    if (await within(15_000)) return;
+    if (await within(15_000)) {
+      if (this.current === cur && this._busy && service) {
+        await service.stopSession(cur.chat, this.id);
+        this.current = null; this._busy = false;
+      }
+      return;
+    }
     // The harness did not stop the turn: end its session (and process group).
     if (service) await service.stopSession(cur.chat, this.id);
     if (!(await within(10_000))) throw new NativeQuiescenceUnknown(`${this.provider} did not stop after interruption; quiescence unknown`);

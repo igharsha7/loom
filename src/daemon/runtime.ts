@@ -258,7 +258,7 @@ export class ProjectRuntime {
       isCurrentAgent: (agent) => !this.closed && this.agents.get(agent.id) === agent,
       dispatchFailed: (agent, chat, error) => {
         if (this.closed || this.agents.get(agent.id) !== agent) return;
-        if (!this.continuity || !isAdapter(agent) || !agent.busy()) this.turns.busySince.delete(agent.id);
+        if (!isAdapter(agent) || !agent.busy()) this.turns.busySince.delete(agent.id);
         const event = this.log.append({ kind: "error", agentId: agent.id, chat,
           payload: { message: error instanceof Error ? error.message : String(error) } });
         this.afterAgentEvent(event);
@@ -1646,7 +1646,7 @@ export class ProjectRuntime {
    * chat. `resend` sends the chat's last message again, now to the new agent.
    */
   async switchChat(chat: string, agentId: string, opts: { resend?: boolean } = {}): Promise<{ from: string | null; resent?: TurnResult; requeued?: number }> {
-    if (this.restoring) throw new ContinuityError("conflict", "the project is rewinding; wait before switching");
+    if (this.restoring || this.rewindPending()) this.assertChatNotSwitching(chat);
     const target = this.agent(agentId);
     if (!isAdapter(target)) throw new Error(`"${agentId}" is a bridge — it can't answer in a thread`);
     if (chat !== MAIN_CHAT && !this.chats().some((c) => c.id === chat)) throw new Error(`no chat "${chat}"`);
@@ -2066,6 +2066,10 @@ export class ProjectRuntime {
     if (event.kind === "run_complete" && event.agentId) {
       this.captureTurnDiff(event.agentId);
       if (!this.continuity) void this.captureAgentDecisions(event.agentId).catch(() => { });
+    }
+    if (event.agentId && (event.kind === "error" || (event.kind === "status" && event.payload.state === "interrupted"))) {
+      this.turns.turnCheckpoint.delete(event.agentId);
+      this.turns.preTurnTree.delete(event.agentId);
     }
     this.routes.handleAgentEvent(event);
     // Accumulate the turn's prose so decisions can be mined when it completes.
@@ -2802,6 +2806,7 @@ export class ProjectRuntime {
   }
 
   private async handoffGuarded(to: string, opts: { source?: "user" | "route" }, duringSwitch: boolean): Promise<{ from: string | null; merge?: MergeOutcome }> {
+    if (this.rewindPending()) this.assertChatNotSwitching(MAIN_CHAT);
     if (!duringSwitch) this.assertChatNotSwitching(MAIN_CHAT);
     this.handoffs++;
     try { return await this.performHandoff(to, opts, duringSwitch); }
@@ -2816,6 +2821,7 @@ export class ProjectRuntime {
       if (generation !== (this.switchGeneration.get(MAIN_CHAT) ?? 0) ||
         (route && (!active || active.id !== route.id || active.status !== "running")))
         throw new ContinuityError("conflict", "handoff was superseded; the chat or route changed");
+      if (this.rewindPending()) throw new ContinuityError("recovery_required", "finish the interrupted rewind or compaction before handoff");
       if (!duringSwitch) this.assertChatNotSwitching(MAIN_CHAT);
     };
     if (this.continuity?.store.activeReceipts().some(r => r.execution === "unknown"))
@@ -2840,9 +2846,10 @@ export class ProjectRuntime {
     if (holder && holder !== to) {
       const current = this.agent(holder);
       if (isAdapter(current)) {
-        if (this.continuity && this.turns.busySince.has(holder) && !current.busy())
+        if (opts.source === "route") { await this.turns.waitForFinalization(holder, checkRoute); checkRoute(); }
+        if (this.turns.busySince.has(holder) && !current.busy())
           throw new ContinuityError("conflict", "outgoing turn is still preparing or finalizing; wait or stop before interrupt-switching");
-        if (current.busy()) await current.interrupt();
+        if (current.busy()) { await current.interrupt(); await this.turns.finishStopped(current); }
         const diff = await current.diff().catch(() => "");
         if (diff) handoffMeta = { ...handoffMeta, dirty: true, diff: diff.slice(0, 2000) };
       }

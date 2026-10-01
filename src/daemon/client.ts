@@ -15,7 +15,8 @@ import type {
   RouteStepSpec,
   UnifiedMemory,
 } from "../types.js";
-import type { Checkpoint, RestoreResult } from "../core/checkpoint.js";
+import type { Checkpoint } from "../core/checkpoint.js";
+import type { RewindResult } from "./runtime/turns.js";
 import type { OrchestraRun } from "../core/orchestra.js";
 import type { QueueItem } from "../core/prompt-queue.js";
 import type { LogLine, ServerConfig, ServerStatus } from "../core/servers.js";
@@ -420,9 +421,7 @@ export class DaemonClient {
   }
 
   /** Files and (unless `conversation: false`) the checkpoint's chat's conversations. */
-  rewind(id: string, checkpointId: string, options: { conversation?: boolean } = {}): Promise<RestoreResult & {
-    conversation?: Array<{ agentId: string; provider: string; turns: number; error?: string }>;
-  }> {
+  rewind(id: string, checkpointId: string, options: { conversation?: boolean } = {}): Promise<RewindResult> {
     return this.request(
       "POST",
       `/api/projects/${encodeURIComponent(id)}/checkpoints/${encodeURIComponent(checkpointId)}/rewind`,

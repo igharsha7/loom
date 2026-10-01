@@ -56,8 +56,9 @@
  * itself rewindable, or it is a trap.
  */
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 
 import { GitError } from "./git.js";
@@ -115,11 +116,12 @@ interface Store {
   /** Where temporary indexes go. */
   scratch: string;
   prefix?: string;
+  refs: string;
 }
 
-function run(args: string[], cwd: string, env?: Record<string, string>, timeoutMs?: number, allowNoMatch = false): Promise<string> {
+function run(args: string[], cwd: string, env?: Record<string, string>, timeoutMs = 30_000, allowNoMatch = false, input?: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(
+    const child = execFile(
       "git",
       args,
       { cwd, maxBuffer: 64 * 1024 * 1024, ...(env ? { env: { ...process.env, ...env } } : {}), ...(timeoutMs ? { timeout: timeoutMs } : {}) },
@@ -132,6 +134,25 @@ function run(args: string[], cwd: string, env?: Record<string, string>, timeoutM
         resolve(String(stdout));
       },
     );
+    if (input !== undefined) { child.stdin?.on("error", () => {}); child.stdin?.end(input); }
+  });
+}
+
+/** Drain large patches while retaining only the display budget. */
+function displayPatch(args: string[], store: Store): Promise<{ patch: string; truncated: boolean }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", args, { cwd: store.dir, env: { ...process.env, ...store.env }, stdio: ["ignore", "pipe", "pipe"] });
+    let patch = "", truncated = false, stderr = "";
+    const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      if (patch.length + chunk.length > PATCH_EVENT_LIMIT) truncated = true;
+      patch += chunk.slice(0, Math.max(0, PATCH_EVENT_LIMIT - patch.length));
+    });
+    child.stderr.on("data", chunk => { stderr = (stderr + chunk).slice(0, 2000); });
+    child.on("error", error => { clearTimeout(timer); reject(error); });
+    child.on("close", code => { clearTimeout(timer); if (code !== 0) reject(new GitError("patch unavailable", stderr));
+      else resolve({ patch: patch + (truncated ? "\n… (truncated)" : ""), truncated }); });
   });
 }
 
@@ -147,12 +168,14 @@ const trimDir = (dir: string) => dir.replace(/\/+$/, "");
 const loomStorePath = (dir: string) => path.join(trimDir(dir), ".loom", "checkpoints.git");
 
 async function gitStore(dir: string): Promise<Store> {
-  return { kind: "git", dir, prefix: (await run(["rev-parse", "--show-prefix"], dir)).trimEnd(), env: {}, scratch: (await run(["rev-parse", "--absolute-git-dir"], dir)).trim() };
+  const prefix = (await run(["rev-parse", "--show-prefix"], dir)).trimEnd();
+  return { kind: "git", dir, prefix, refs: prefix ? `${REF_PREFIX}/projects/${createHash("sha256").update(prefix).digest("hex")}` : REF_PREFIX,
+    env: {}, scratch: (await run(["rev-parse", "--absolute-git-dir"], dir)).trim() };
 }
 
 function loomStore(dir: string): Store {
   const gitDir = loomStorePath(dir);
-  return { kind: "loom", dir, env: { GIT_DIR: gitDir, GIT_WORK_TREE: trimDir(dir) }, scratch: gitDir };
+  return { kind: "loom", dir, refs: REF_PREFIX, env: { GIT_DIR: gitDir, GIT_WORK_TREE: trimDir(dir) }, scratch: gitDir };
 }
 
 /** Loom's store for `dir`, created on first use with its excludes. */
@@ -220,8 +243,7 @@ export function capturedAt(id: string): number | null {
 }
 
 async function latestCommit(store: Store): Promise<string | null> {
-  const out = await quiet(["for-each-ref", "--sort=-refname", "--count=1", "--format=%(objectname)", REF_PREFIX], store.dir, store.env);
-  return out || null;
+  return (await listStore(store)).sort((a, b) => b.id.localeCompare(a.id))[0]?.commit ?? null;
 }
 
 /**
@@ -264,12 +286,13 @@ async function writeTree(store: Store, id: string, seed: string | null, guard: b
     const listed = (await run(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], store.dir, env)).split("\0").filter(Boolean);
     const ignored = new Set((await run(["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"], store.dir, env)).split("\0").filter(Boolean));
     const files = listed.filter(p => !protectedPath(p) && !ignored.has(p));
-    for (let i = 0; i < files.length; i += 200)
-      await run(["--literal-pathspecs", "add", "-A", "--", ...files.slice(i, i + 200)], store.dir, env);
+    if (files.length) await run(["--literal-pathspecs", "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"], store.dir, env, 30_000, false, files.join("\0") + "\0");
+    const entries = await run(["ls-files", "--stage", "-z", "--", "."], store.dir, env);
+    if (entries.split("\0").some(entry => entry.startsWith("160000 ")))
+      throw new GitError("checkpoints cannot capture submodules or embedded repositories; move them outside this project before rewinding", "");
     // A tracked .loom in HEAD is just as unsafe as unignored bookkeeping.
     const excluded = listed.filter(p => protectedPath(p) || ignored.has(p));
-    for (let i = 0; i < excluded.length; i += 200)
-      await run(["--literal-pathspecs", "rm", "-f", "--cached", "--ignore-unmatch", "--", ...excluded.slice(i, i + 200)], store.dir, env);
+    if (excluded.length) await run(["--literal-pathspecs", "rm", "-f", "--cached", "--ignore-unmatch", "--pathspec-from-file=-", "--pathspec-file-nul"], store.dir, env, 30_000, false, excluded.join("\0") + "\0");
     return (await run(["write-tree"], store.dir, env)).trim();
   } finally {
     dropIndex(index);
@@ -285,7 +308,7 @@ async function writeTree(store: Store, id: string, seed: string | null, guard: b
  * the checkpoint it undoes lives. Returns null when no checkpoint could be
  * taken: git missing, or too much new content for Loom's store.
  */
-export async function capture(dir: string, label: string, options: { store?: CheckpointStore; prune?: boolean } = {}): Promise<Checkpoint | null> {
+export async function capture(dir: string, label: string, options: { store?: CheckpointStore; prune?: boolean; parent?: string } = {}): Promise<Checkpoint | null> {
   let store: Store;
   let head: string | null = null;
   try {
@@ -311,6 +334,7 @@ export async function capture(dir: string, label: string, options: { store?: Che
           "commit-tree",
           tree,
           ...(head ? ["-p", head] : []),
+          ...(options.parent && options.parent !== head ? ["-p", options.parent] : []),
           "-m",
           `loom checkpoint: ${label.replace(/\s+/g, " ").trim().slice(0, 120) || "unlabelled"}`,
         ],
@@ -318,7 +342,7 @@ export async function capture(dir: string, label: string, options: { store?: Che
         store.env,
       )
     ).trim();
-    await run(["update-ref", `${REF_PREFIX}/${id}`, commit], dir, store.env);
+    await run(["update-ref", `${store.refs}/${id}`, commit], dir, store.env);
 
     const dirty = seed ? (await quiet(["diff", "--name-only", `${seed}..${commit}`], dir, store.env)).split("\n").filter(Boolean).length
       : (await quiet(["ls-tree", "-r", "--name-only", commit], dir, store.env)).split("\n").filter(Boolean).length;
@@ -334,7 +358,8 @@ export async function capture(dir: string, label: string, options: { store?: Che
     };
     if (options.prune !== false) await pruneStore(store, KEEP_CHECKPOINTS);
     return cp;
-  } catch {
+  } catch (error) {
+    if (error instanceof GitError && /submodules or embedded/.test(error.message)) throw error;
     // A checkpoint is a courtesy taken on a hot path. It must never be the
     // reason a turn doesn't run.
     return null;
@@ -343,7 +368,7 @@ export async function capture(dir: string, label: string, options: { store?: Che
 
 async function listStore(store: Store): Promise<Checkpoint[]> {
   const out = await quiet(
-    ["for-each-ref", "--format=%(refname:short)%09%(objectname)%09%(subject)%09%(committerdate:unix)", REF_PREFIX],
+    ["for-each-ref", "--format=%(refname)%09%(objectname)%09%(subject)%09%(committerdate:unix)", store.refs],
     store.dir,
     store.env,
   );
@@ -351,7 +376,7 @@ async function listStore(store: Store): Promise<Checkpoint[]> {
   const rows: Checkpoint[] = [];
   for (const line of out.split("\n")) {
     const [ref, commit, subject, when] = line.split("\t");
-    if (!ref || !commit) continue;
+    if (!ref || !commit || ref.slice(0, ref.lastIndexOf("/")) !== store.refs) continue;
     rows.push({
       id: ref.slice(ref.lastIndexOf("/") + 1),
       label: (subject ?? "").replace(/^loom checkpoint: /, ""),
@@ -380,14 +405,16 @@ export async function find(dir: string, id: string): Promise<Checkpoint | null> 
 const storeOf = async (dir: string, cp: Checkpoint): Promise<Store> => (cp.store === "loom" ? loomStore(dir) : await gitStore(dir));
 
 const protectedPath = (rel: string) => rel.split("/").some(p => p === ".loom" || p === ".git");
-async function safePath(dir: string, rel: string): Promise<void> {
+async function safePath(dir: string, rel: string, checkedParents = new Set<string>()): Promise<void> {
   if (!rel || path.isAbsolute(rel) || rel.split("/").some(p => p === ".." || !p) || protectedPath(rel))
     throw new GitError(`"${rel}" isn't a path inside this project`, "");
   let parent = dir;
   for (const part of rel.split("/").slice(0, -1)) {
     parent = path.join(parent, part);
+    if (checkedParents.has(parent)) continue;
     try { if ((await fs.promises.lstat(parent)).isSymbolicLink()) throw new GitError(`"${rel}" has a symlink parent`, ""); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    checkedParents.add(parent);
   }
 }
 
@@ -405,7 +432,10 @@ export async function prepareRestore(dir: string, id: string): Promise<{ target:
   // Before anything is lost: a checkpoint of what is about to be replaced.
   // Without this, rewind is a one-way door, and the one time it matters is
   // the time someone rewinds past work they meant to keep.
-  const undo = await capture(dir, `before rewinding to ${target.label.slice(0, 80)}`, { store: target.store, prune: false });
+  const store = await storeOf(dir, target);
+  if ((await run(["ls-tree", "-r", target.commit, "--", "."], dir, store.env)).split("\n").some(entry => entry.startsWith("160000 ")))
+    throw new GitError("checkpoints cannot restore submodules or embedded repositories", "");
+  const undo = await capture(dir, `before rewinding to ${target.label.slice(0, 80)}`, { store: target.store, prune: false, parent: target.commit });
   if (!undo) throw new GitError("couldn't save the current files before rewinding — nothing was changed", "");
   await restorePaths(dir, target, undo);
   return { target, undo };
@@ -413,11 +443,16 @@ export async function prepareRestore(dir: string, id: string): Promise<{ target:
 
 async function restorePaths(dir: string, target: Checkpoint, undo: Checkpoint): Promise<string[]> {
   const store = await storeOf(dir, target);
+  for (const cp of [target, undo]) if ((await run(["ls-tree", "-r", cp.commit, "--", "."], dir, store.env)).split("\n").some(entry => entry.startsWith("160000 ")))
+    throw new GitError("checkpoints cannot restore submodules or embedded repositories", "");
   const changed = (await run(["diff", "--relative", "--no-renames", "--name-only", "-z", `${undo.commit}..${target.commit}`, "--", "."], dir, store.env)).split("\0").filter(Boolean);
   const paths: string[] = [];
+  const ignored = new Set(changed.length ? (await run(["check-ignore", "--no-index", "-z", "--stdin"], dir, store.env, 30_000, true, changed.join("\0") + "\0")).split("\0").filter(Boolean) : []);
+  // Cache only within this pass; mutation preflight must check parents anew.
+  const checkedParents = new Set<string>();
   for (const rel of changed) {
-    if (protectedPath(rel) || await run(["check-ignore", "--no-index", "--", rel], dir, store.env, undefined, true)) continue;
-    await safePath(dir, rel);
+    if (protectedPath(rel) || ignored.has(rel)) continue;
+    await safePath(dir, rel, checkedParents);
     paths.push(rel);
   }
   return paths;
@@ -439,8 +474,16 @@ export async function restore(dir: string, id: string, prepared?: { target: Chec
   }
   const index = tmpIndex(store, `restore-${target.id}`);
   try {
-    for (let i = 0, files = paths.filter(p => present.has(p)); i < files.length; i += 200)
-      await run(["--literal-pathspecs", "checkout", target.commit, "--", ...files.slice(i, i + 200)], dir, { ...store.env, GIT_INDEX_FILE: index });
+    const files = paths.filter(p => present.has(p));
+    if (files.length) {
+      const env = { ...store.env, GIT_INDEX_FILE: index };
+      await run(["read-tree", target.commit], dir, env);
+      // checkout-index looks up literal names, avoiding Git pathspec matching
+      // against every entry for each of 20k paths. Run at the repository root.
+      const root = store.prefix ? path.resolve(dir, ...store.prefix.split("/").filter(Boolean).map(() => "..")) : dir;
+      await run(["checkout-index", "--force", "-z", "--stdin"], root, env, 30_000, false,
+        files.map(file => `${store.prefix ?? ""}${file}`).join("\0") + "\0");
+    }
 
   } finally { dropIndex(index); }
   return { restored: target, undo, changed: paths };
@@ -457,6 +500,8 @@ export async function restoreFile(dir: string, id: string, file: string): Promis
   const rel = file.replace(/^\.\//, "");
   await safePath(dir, rel);
   const targetStore = await storeOf(dir, target);
+  if ((await run(["ls-tree", "-r", target.commit, "--", "."], dir, targetStore.env)).split("\n").some(entry => entry.startsWith("160000 ")))
+    throw new GitError("checkpoints cannot restore submodules or embedded repositories", "");
   // Ignored content has no undo blob; absence from a tree cannot mean created.
   if ((await run(["check-ignore", "--no-index", "--", rel], dir, targetStore.env, undefined, true)))
     throw new GitError(`"${file}" is excluded from checkpoints`, "");
@@ -502,9 +547,9 @@ export async function diffSince(dir: string, id: string): Promise<TurnDiff | nul
       added += Number(a) || 0;
       removed += Number(r) || 0;
     }
-    const patch = await run(["diff", "--relative", "--no-renames", target.commit, now, "--", "."], dir, store.env);
-    const truncated = patch.length > PATCH_EVENT_LIMIT;
-    return { files, added, removed, patch: truncated ? patch.slice(0, PATCH_EVENT_LIMIT) + "\n… (truncated)" : patch, truncated };
+    const preview = await displayPatch(["diff", "--relative", "--no-renames", target.commit, now, "--", "."], store)
+      .catch(() => ({ patch: "Patch preview unavailable", truncated: true }));
+    return { files, added, removed, ...preview };
   } catch {
     return null;
   }
@@ -512,8 +557,10 @@ export async function diffSince(dir: string, id: string): Promise<TurnDiff | nul
 
 async function pruneStore(store: Store, keep: number): Promise<number> {
   const all = (await listStore(store)).sort((a, b) => (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
-  const drop = all.slice(Math.max(0, keep));
-  for (const c of drop) await quiet(["update-ref", "-d", `${REF_PREFIX}/${c.id}`], store.dir, store.env);
+  // Undo points are recovery assets, including a journal in another linked
+  // checkout. Automatic retention must never collect them during a retry.
+  const drop = all.slice(Math.max(0, keep)).filter(c => keep === 0 || !c.label.startsWith("before rewinding to "));
+  for (const c of drop) await quiet(["update-ref", "-d", `${store.refs}/${c.id}`], store.dir, store.env);
   // A project's own repository collects its garbage on its own schedule; Loom's
   // store has nobody else to do it.
   if (drop.length && store.kind === "loom") await quiet(["gc", "--auto", "--quiet"], store.dir, store.env);
