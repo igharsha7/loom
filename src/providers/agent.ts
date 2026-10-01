@@ -109,6 +109,8 @@ interface CurrentTurn {
   chat: ThreadId;
   turnId?: TurnId;
   interrupted: boolean;
+  /** Dispatch settled with an uncertain writer; only fencing can release this hold. */
+  quiescenceUnknown?: boolean;
   /** Terminal events seen for this chat during the send, by turn id. */
   ended: Map<TurnId, ProviderRuntimeEvent>;
   exited?: ProviderRuntimeEvent;
@@ -318,13 +320,16 @@ export class ProviderAgent extends AdapterBase {
     cur.wake?.();
   }
 
-  /** Commands still running per chat: a turn is settled only once none are. */
+  /** Commands and native children per chat: settlement waits until none run. */
   private readonly running = new Map<ThreadId, Set<string>>();
   private commandsIdle = new Map<ThreadId, () => void>();
 
   private trackCommands(event: ProviderRuntimeEvent): void {
     if (event.type === "session.exited") { this.running.delete(event.threadId); this.commandsIdle.get(event.threadId)?.(); return; }
-    if ((event.type !== "item.started" && event.type !== "item.completed") || event.payload.itemType !== "command_execution" || !event.itemId) return;
+    if (event.type !== "item.started" && event.type !== "item.completed") return;
+    const child = event.payload.itemType === "collab_agent_tool_call" &&
+      (event.payload.data as { nativeChild?: boolean } | undefined)?.nativeChild;
+    if ((event.payload.itemType !== "command_execution" && !child) || !event.itemId) return;
     const set = this.running.get(event.threadId) ?? new Set<string>();
     if (event.type === "item.started") set.add(event.itemId);
     else set.delete(event.itemId);
@@ -347,7 +352,8 @@ export class ProviderAgent extends AdapterBase {
   }
 
   async send(input: SendInput): Promise<void> {
-    if (this._busy) throw new Error(`${this.provider} agent "${this.id}" is busy`);
+    if (this._busy) throw new Error(`${this.provider} agent "${this.id}" is busy${this.current?.quiescenceUnknown
+      ? " — native writer quiescence is unknown; use Stop or loom interrupt before sending another turn" : ""}`);
     const bin = this.bin;
     if (!bin) throw new NativeDispatchRejected(this.provider === "codex" ? "codex CLI not found — install it or open Codex.app once"
       : "claude CLI not found — install Claude Code or set its path");
@@ -410,7 +416,7 @@ export class ProviderAgent extends AdapterBase {
       const settleMs = typeof this.options.commandSettleMs === "number" ? this.options.commandSettleMs : input.continuity ? 60_000 : 5_000;
       const commandsIdle = await this.commandsSettled(chat, settleMs);
       if (!commandsIdle) {
-        const reason = `${this.provider} reported the turn done while a command is still running; quiescence unknown`;
+        const reason = `${this.provider} reported the turn done while a command or child agent is still running; quiescence unknown`;
         this.ingestion.ingest({ ...end, type: "turn.aborted", payload: { reason } });
         throw new NativeQuiescenceUnknown(reason);
       }
@@ -434,6 +440,7 @@ export class ProviderAgent extends AdapterBase {
         if (input.continuity) throw error instanceof NativeDispatchRejected ? error : new NativeDispatchRejected("interrupted before the turn started");
         return;
       }
+      if (error instanceof NativeQuiescenceUnknown && input.continuity) retainWriter = true;
       if (error instanceof NativeQuiescenceUnknown && !input.continuity) {
         // Legacy dispatch has no persisted ownership receipt. Stop the writer
         // before releasing its in-memory lock. A failed stop keeps Stop usable.
@@ -443,7 +450,10 @@ export class ProviderAgent extends AdapterBase {
       throw error;
     } finally {
       this.ingestion.untagTurn(chat, this.id);
-      if (!retainWriter) { this.current = null; this._busy = false; }
+      // Late item results cannot resolve Brain's already-recorded uncertainty.
+      // Keep the local hold and a usable Stop until the session is fenced.
+      if (retainWriter) cur.quiescenceUnknown = true;
+      else { this.current = null; this._busy = false; }
       this.endContinuity();
       release();
     }
@@ -535,6 +545,11 @@ export class ProviderAgent extends AdapterBase {
     }
     cur.interrupted = true;
     const service = this.providers?.service;
+    if (service && cur.quiescenceUnknown) {
+      await service.stopSession(cur.chat, this.id);
+      if (this.current === cur) { this.current = null; this._busy = false; }
+      return;
+    }
     if (service && cur.turnId) await service.interruptTurn(cur.chat, this.id, cur.turnId).catch(async error => {
       if (error instanceof NativeQuiescenceUnknown) await service.stopSession(cur.chat, this.id);
     });

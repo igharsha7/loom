@@ -356,7 +356,7 @@ it("keeps a Claude Bash command unresolved when result has no tool result (audit
   await agent.stop();
 });
 
-it("flushes timed-out partial text under its own run before a later completion (audit #10)", async () => {
+it("isolates timed-out partial text and requires Stop before a later completion (audit #10)", async () => {
   const bin = fakeCodex({ scripts: [[
     codexNotify("turn/started", { turn: { id: "$TURN" } }),
     codexNotify("item/agentMessage/delta", { itemId: "partial", delta: "old partial" }),
@@ -368,9 +368,26 @@ it("flushes timed-out partial text under its own run before a later completion (
   const continuity = (runId: string) => ({ runId, bindingId: "b", sessionEpoch: 1, nativeSessionId: null, context: "" });
   await expect(agent.send({ text: "one", continuity: continuity("old") })).rejects.toBeInstanceOf(NativeQuiescenceUnknown);
   expect(of(events, "message").find(p => p.text === "old partial")).toMatchObject({ loomRunId: "old", partial: true });
-  await new Promise(resolve => setTimeout(resolve, 100));
-  await agent.send({ text: "two", continuity: { ...continuity("new"), nativeSessionId: turnsOf(bin)[0]!.thread } });
-  expect(of(events, "message").filter(p => p.text === "old partial")).toHaveLength(1);
+  await waitUntil(() => of(events, "tool_call").some(p => p.tool === "shell"));
+  expect(of(events, "tool_call").find(p => p.tool === "shell")).toMatchObject({ loomRunId: "old" });
+  const thread = turnsOf(bin)[0]!.thread;
+  const next = { text: "two", continuity: { ...continuity("new"), nativeSessionId: thread } };
+  expect(agent.busy()).toBe(true);
+  await expect(agent.send(next)).rejects.toThrow(/quiescence is unknown; use Stop or loom interrupt/);
+  expect(rpcOf(bin, "turn/start")).toHaveLength(1);
+  expect(of(events, "run_complete")).toHaveLength(0);
+  await agent.interrupt();
+  expect(agent.busy()).toBe(false);
+  // The restarted fake now serves a normal turn; its history stays beside bin.
+  fs.copyFileSync(fakeCodex(), bin);
+  await agent.send(next);
+  expect(callsOf(bin)).toHaveLength(2);
+  expect(rpcOf(bin, "thread/resume")[0]).toMatchObject({ threadId: thread });
+  expect(of(events, "message").filter(p => p.text === "old partial")).toEqual([
+    expect.objectContaining({ loomRunId: "old", partial: true }),
+  ]);
+  expect(of(events, "message").find(p => p.text === "Did the work.")).toMatchObject({ loomRunId: "new" });
+  expect(of(events, "run_complete")).toEqual([expect.objectContaining({ loomRunId: "new" })]);
   await agent.stop();
 });
 

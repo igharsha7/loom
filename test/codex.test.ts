@@ -11,12 +11,12 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { CodexAdapter, stopAllProviderSessions } from "../src/providers/agent.js";
 import { setApprovalBroker, type ApprovalRequest } from "../src/core/approvals.js";
 import { NativeDispatchRejected, NativeSessionMissing } from "../src/core/continuity/contracts.js";
 import type { AdapterEvent, SendInput } from "../src/types.js";
-import { makeProjectDir } from "./helpers.js";
+import { makeProjectDir, waitUntil } from "./helpers.js";
 import { CODEX_OK, codexDone, codexItem, codexMessage, codexNotify, codexTokens, fakeCodex, rpcOf, stdinOf,
   type FakeCodexOptions, type Step } from "./native-fakes.js";
 
@@ -338,5 +338,89 @@ describe("codex · interrupt", () => {
   it("is a no-op when nothing is running", async () => {
     const agent = new CodexAdapter("codex", makeProjectDir({ name: "cx" }), {});
     await expect(agent.interrupt()).resolves.toBeUndefined();
+  });
+});
+
+
+describe("codex native child settlement (finding #1)", () => {
+  const spawned = codexItem({ type: "collabAgentToolCall", tool: "spawnAgent", status: "completed",
+    receiverThreadIds: ["child-thread"], agentsStates: { "child-thread": { status: "running" } } });
+
+  it("holds send and run_complete until child turns and their commands settle", async () => {
+    const bin = fakeCodex({ script: [started, spawned,
+      codexNotify("item/started", { threadId: "child-thread", item: { id: "cmd", type: "commandExecution", command: "edit", status: "inProgress" } }),
+      codexDone(), { sleep: 120 },
+      codexNotify("turn/completed", { threadId: "child-thread", turn: { id: "child-turn", status: "completed" } }),
+      { sleep: 120 },
+      codexNotify("item/completed", { threadId: "child-thread", item: { id: "cmd", type: "commandExecution", command: "edit", status: "completed" } }),
+    ] });
+    const agent = new CodexAdapter("codex", makeProjectDir(), { bin });
+    const events: AdapterEvent[] = []; agent.onEvent(e => events.push(e));
+    let resolved = false;
+    const sending = agent.send({ text: "spawn" }).then(() => { resolved = true; });
+    await waitUntil(() => kinds(events).includes("tool_call"));
+    expect(agent.busy()).toBe(true);
+    expect(resolved).toBe(false);
+    expect(kinds(events)).not.toContain("run_complete");
+    await sending;
+    expect(agent.busy()).toBe(false);
+    expect(kinds(events).filter(k => k === "run_complete")).toHaveLength(1);
+  });
+
+  it("does not let a stale collaboration snapshot end a live child turn", async () => {
+    const bin = fakeCodex({ script: [started, spawned,
+      codexNotify("turn/started", { threadId: "child-thread", turn: { id: "child-turn", status: "inProgress" } }),
+      codexItem({ type: "collabAgentToolCall", tool: "wait", receiverThreadIds: ["child-thread"],
+        agentsStates: { "child-thread": { status: "completed" } } }),
+      codexDone(), { sleep: 180 },
+      codexNotify("turn/completed", { threadId: "child-thread", turn: { id: "child-turn", status: "completed" } }),
+    ] });
+    const agent = new CodexAdapter("codex", makeProjectDir(), { bin });
+    const events: AdapterEvent[] = []; agent.onEvent(e => events.push(e));
+    const sending = agent.send({ text: "spawn" });
+    await waitUntil(() => of(events, "tool_call").length >= 2);
+    expect(agent.busy()).toBe(true);
+    expect(kinds(events)).not.toContain("run_complete");
+    await sending;
+    expect(agent.busy()).toBe(false);
+  });
+
+  it("Stop contains a child after its parent completes, without waiting on a child RPC", async () => {
+    const dir = makeProjectDir(), pidFile = path.join(dir, ".loom", "child.pid");
+    const bin = fakeCodex({ script: [started, spawned,
+      { spawn: `require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);` },
+      codexDone(), { sleep: 60_000 }] });
+    const agent = new CodexAdapter("codex", dir, { bin });
+    const events: AdapterEvent[] = []; agent.onEvent(e => events.push(e));
+    const sending = agent.send({ text: "spawn" }).catch(error => error);
+    await waitUntil(() => fs.existsSync(pidFile));
+    const childPid = Number(fs.readFileSync(pidFile, "utf8"));
+    await agent.interrupt();
+    await sending;
+    expect(agent.busy()).toBe(false);
+    expect(() => process.kill(childPid, 0)).toThrow();
+    expect(rpcOf(bin, "turn/interrupt")).toHaveLength(0);
+  });
+
+  it("holds an uncertain child writer until Stop and then permits another turn", async () => {
+    const bin = fakeCodex({ script: [started, spawned, codexDone(), { sleep: 60_000 }] });
+    const agent = new CodexAdapter("codex", makeProjectDir(), { bin, commandSettleMs: 30 });
+    await expect(agent.send({ text: "spawn", continuity: continuity() })).rejects.toThrow(/child agent.*quiescence unknown/);
+    expect(agent.busy()).toBe(true);
+    await expect(agent.send({ text: "too soon" })).rejects.toThrow(/quiescence is unknown; use Stop or loom interrupt/);
+    expect(rpcOf(bin, "turn/start")).toHaveLength(1);
+    const service = (agent as unknown as { providers: { service: import("../src/providers/service.js").ProviderService } }).providers.service;
+    const stop = vi.spyOn(service, "stopSession").mockRejectedValueOnce(new Error("could not fence writer"));
+    try { await expect(agent.interrupt()).rejects.toThrow(/could not fence writer/); }
+    finally { stop.mockRestore(); }
+    expect(agent.busy()).toBe(true);
+    await agent.interrupt();
+    expect(agent.busy()).toBe(false);
+    fs.copyFileSync(fakeCodex(), bin);
+    await agent.send({ text: "after Stop", continuity: { ...continuity(), runId: "next", nativeSessionId: agent.sessionCursor("main") } });
+    expect(rpcOf(bin, "thread/resume")).toHaveLength(1);
+    expect(rpcOf(bin, "turn/start")).toHaveLength(2);
+    expect(agent.busy()).toBe(false);
+    await agent.stop();
   });
 });

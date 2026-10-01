@@ -182,7 +182,7 @@ Claude settings); override per session through the protocol instead.
 A second agent audited the port; Claude checked each round's findings against the
 code, Sol fixed them, Claude reviewed and ran the suite. Rounds 1–4 covered Phase 5
 only; rounds 5–8 covered all five phases, including what earlier fixes introduced.
-Findings per round: 5, 4, 6, 4, then 25, 24, 14, 10, 16. All fixed, each with a
+Findings per round: 5, 4, 6, 4, then 25, 24, 14, 10, 16, 5. All fixed, each with a
 regression test.
 
 - [x] Phase 5: dropped turns are named explicitly (`dropped: { from, turns, keep }`
@@ -209,7 +209,7 @@ regression test.
   question everywhere (routes, status, reloaded cards); multi-select questions;
   Codex file-read approvals; sparse Claude and Codex limit reports; per-window
   limit state.
-- [x] Tests: 1764 passing (plus 132 DOM). Known unrelated: `daemon.test.ts`
+- [x] Tests: 1779 passing (plus 132 DOM). Known unrelated: `daemon.test.ts`
   "real models" depends on the live Codex catalog; `app-queue-dom` is
   occasionally flaky. `codex.test.ts` "interrupts the running turn" failed once
   under full-suite load and couldn't be reproduced (6 runs alone, 2 full runs).
@@ -226,7 +226,16 @@ regression test.
   `checkpoint_unavailable`; a tracked `.loom/log.db` no longer invalidates
   Brain's packets; large restores batch git work (20k paths in seconds) and
   oversize patches keep the file list.
-- [ ] UI for the recovery states (pending rewind, pending compaction) — Phase 7.
+- [x] Round 10 (5 findings, all fixed): Codex child agents (spawnAgent) count
+  as running until they finish, so settlement, diffs, commits, switches and
+  rewinds wait for them; `.loom`/`.git` protection is case-insensitive (macOS);
+  same-agent route steps wait for finalization; pre-round-9 checkpoints of
+  subdirectory projects migrate into the per-project namespace (commits carry a
+  `Loom-Project` trailer); completed rewinds' undo points are pruned normally.
+  A turn whose writer may still be running keeps the agent busy until Stop (or
+  `loom interrupt`) shuts the session down; the busy error says so.
+- [ ] UI for the recovery states (pending rewind, pending compaction, a turn
+  held after an unsettled writer) — Phase 7.
   Today the way out is the CLI or the API.
 - [ ] Next audits go area by area (checkpoints, sessions, Brain) rather than
   across the whole port.

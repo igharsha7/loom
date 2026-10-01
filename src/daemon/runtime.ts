@@ -2843,10 +2843,10 @@ export class ProjectRuntime {
     let handoffMeta: Record<string, unknown> = { projected: true };
     const holder = this.validHolder();
     let merge: MergeOutcome | null = null;
+    if (holder && opts.source === "route") { await this.turns.waitForFinalization(holder, checkRoute); checkRoute(); }
     if (holder && holder !== to) {
       const current = this.agent(holder);
       if (isAdapter(current)) {
-        if (opts.source === "route") { await this.turns.waitForFinalization(holder, checkRoute); checkRoute(); }
         if (this.turns.busySince.has(holder) && !current.busy())
           throw new ContinuityError("conflict", "outgoing turn is still preparing or finalizing; wait or stop before interrupt-switching");
         if (current.busy()) { await current.interrupt(); await this.turns.finishStopped(current); }

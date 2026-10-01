@@ -169,8 +169,60 @@ const loomStorePath = (dir: string) => path.join(trimDir(dir), ".loom", "checkpo
 
 async function gitStore(dir: string): Promise<Store> {
   const prefix = (await run(["rev-parse", "--show-prefix"], dir)).trimEnd();
-  return { kind: "git", dir, prefix, refs: prefix ? `${REF_PREFIX}/projects/${createHash("sha256").update(prefix).digest("hex")}` : REF_PREFIX,
+  const store: Store = { kind: "git", dir, prefix, refs: prefix ? `${REF_PREFIX}/projects/${createHash("sha256").update(prefix).digest("hex")}` : REF_PREFIX,
     env: {}, scratch: (await run(["rev-parse", "--absolute-git-dir"], dir)).trim() };
+  if (prefix) await migrateLegacy(store);
+  return store;
+}
+
+/** Old refs have no project field. Migrate ids recorded in this project's own
+ * history; changed paths alone cannot distinguish a root capture from a subproject.
+ * An explicit legacy id remains usable when its history is no longer available. */
+async function migrateLegacy(store: Store): Promise<void> {
+  const legacy = await listStore({ ...store, refs: REF_PREFIX });
+  if (!legacy.length) return;
+  const ids = new Set<string>();
+  const remember = (payload: Record<string, unknown>) => {
+    if (typeof payload.cwd === "string" && path.resolve(payload.cwd) !== path.resolve(store.dir)) return;
+    for (const key of ["id", "undo"]) if (typeof payload[key] === "string") ids.add(payload[key] as string);
+  };
+  const dbFile = path.join(store.dir, ".loom", "log.db");
+  if (fs.existsSync(dbFile)) {
+    try {
+      const { DatabaseSync } = await import("node:sqlite");
+      const db = new DatabaseSync(dbFile, { readOnly: true });
+      try { for (const row of db.prepare("SELECT payload FROM events WHERE kind = 'checkpoint'").all()) remember(JSON.parse(String(row.payload))); }
+      finally { db.close(); }
+    } catch { /* JSONL and an explicit legacy id remain available. */ }
+  }
+  const jsonl = path.join(store.dir, ".loom", "log.jsonl");
+  if (fs.existsSync(jsonl)) for (const line of fs.readFileSync(jsonl, "utf8").split("\n")) {
+    try { const event = JSON.parse(line); if (event.kind === "checkpoint") remember(event.payload); } catch { /* incomplete tail */ }
+  }
+  try {
+    const pending = JSON.parse(fs.readFileSync(path.join(store.dir, ".loom", "rewind-pending.json"), "utf8"));
+    if (!pending.workspace?.dir || path.resolve(pending.workspace.dir) === path.resolve(store.dir)) {
+      for (const cp of [pending.prepared?.target, pending.prepared?.undo]) if (typeof cp?.id === "string") ids.add(cp.id);
+    }
+  } catch { /* no readable recovery journal */ }
+  for (const cp of legacy) {
+    if (!ids.has(cp.id)) continue;
+    // Captures from this version already have a namespace; a root capture's
+    // changes happening to be in a subdirectory do not transfer ownership.
+    if ((await quiet(["show", "-s", "--format=%B", cp.commit], store.dir)).includes("\nLoom-Project: ")) continue;
+    await moveLegacy(store, cp);
+  }
+}
+
+async function moveLegacy(store: Store, cp: Checkpoint): Promise<void> {
+  // One ref transaction: a crash cannot hide or lose the old checkpoint.
+  try {
+    await run(["update-ref", "--stdin"], store.dir, store.env, 30_000, false,
+      `start\ncreate ${store.refs}/${cp.id} ${cp.commit}\ndelete ${REF_PREFIX}/${cp.id} ${cp.commit}\nprepare\ncommit\n`);
+  } catch (error) {
+    // Another operation may have migrated the same id while we read history.
+    if ((await quiet(["rev-parse", `${store.refs}/${cp.id}`], store.dir, store.env)) !== cp.commit) throw error;
+  }
 }
 
 function loomStore(dir: string): Store {
@@ -308,7 +360,7 @@ async function writeTree(store: Store, id: string, seed: string | null, guard: b
  * the checkpoint it undoes lives. Returns null when no checkpoint could be
  * taken: git missing, or too much new content for Loom's store.
  */
-export async function capture(dir: string, label: string, options: { store?: CheckpointStore; prune?: boolean; parent?: string } = {}): Promise<Checkpoint | null> {
+export async function capture(dir: string, label: string, options: { store?: CheckpointStore; prune?: boolean } = {}): Promise<Checkpoint | null> {
   let store: Store;
   let head: string | null = null;
   try {
@@ -334,9 +386,9 @@ export async function capture(dir: string, label: string, options: { store?: Che
           "commit-tree",
           tree,
           ...(head ? ["-p", head] : []),
-          ...(options.parent && options.parent !== head ? ["-p", options.parent] : []),
           "-m",
           `loom checkpoint: ${label.replace(/\s+/g, " ").trim().slice(0, 120) || "unlabelled"}`,
+          "-m", `Loom-Project: ${store.prefix || "."}`,
         ],
         dir,
         store.env,
@@ -399,12 +451,23 @@ export async function list(dir: string): Promise<Checkpoint[]> {
 
 export async function find(dir: string, id: string): Promise<Checkpoint | null> {
   if (!/^c[a-z0-9]+$/.test(id)) return null;
-  return (await list(dir)).find((c) => c.id === id) ?? null;
+  const found = (await list(dir)).find((c) => c.id === id);
+  if (found) return found;
+  if ((await quiet(["rev-parse", "--is-inside-work-tree"], dir)) === "true") {
+    const store = await gitStore(dir);
+    if (store.prefix) {
+      const legacy = (await listStore({ ...store, refs: REF_PREFIX })).find(c => c.id === id);
+      if (legacy && !(await quiet(["show", "-s", "--format=%B", legacy.commit], dir)).includes("\nLoom-Project: ")) {
+        await moveLegacy(store, legacy); return legacy;
+      }
+    }
+  }
+  return null;
 }
 
 const storeOf = async (dir: string, cp: Checkpoint): Promise<Store> => (cp.store === "loom" ? loomStore(dir) : await gitStore(dir));
 
-const protectedPath = (rel: string) => rel.split("/").some(p => p === ".loom" || p === ".git");
+const protectedPath = (rel: string) => rel.split("/").some(p => p.toLowerCase() === ".loom" || p.toLowerCase() === ".git");
 async function safePath(dir: string, rel: string, checkedParents = new Set<string>()): Promise<void> {
   if (!rel || path.isAbsolute(rel) || rel.split("/").some(p => p === ".." || !p) || protectedPath(rel))
     throw new GitError(`"${rel}" isn't a path inside this project`, "");
@@ -425,7 +488,7 @@ async function safePath(dir: string, rel: string, checkedParents = new Set<strin
  * cannot be removed by a broad clean/read-tree. A temporary index keeps checkout
  * away from the user's staging area. HEAD does not move.
  */
-export async function prepareRestore(dir: string, id: string): Promise<{ target: Checkpoint; undo: Checkpoint }> {
+export async function prepareRestore(dir: string, id: string, journal?: string): Promise<{ target: Checkpoint; undo: Checkpoint }> {
   const target = await find(dir, id);
   if (!target) throw new GitError(`no checkpoint "${id}" in this project`, "");
 
@@ -435,9 +498,16 @@ export async function prepareRestore(dir: string, id: string): Promise<{ target:
   const store = await storeOf(dir, target);
   if ((await run(["ls-tree", "-r", target.commit, "--", "."], dir, store.env)).split("\n").some(entry => entry.startsWith("160000 ")))
     throw new GitError("checkpoints cannot restore submodules or embedded repositories", "");
-  const undo = await capture(dir, `before rewinding to ${target.label.slice(0, 80)}`, { store: target.store, prune: false, parent: target.commit });
+  const undo = await capture(dir, `before rewinding to ${target.label.slice(0, 80)}`, { store: target.store, prune: false });
   if (!undo) throw new GitError("couldn't save the current files before rewinding — nothing was changed", "");
   await restorePaths(dir, target, undo);
+  // Separate recovery refs retain both trees without parenting undo commits on
+  // targets. They live only until the restore and its conversation journal settle.
+  const intent = journal ? (await run(["hash-object", "-w", "--stdin"], dir, store.env, 30_000, false,
+    JSON.stringify({ journal: path.resolve(journal), at: Date.now() }))).trim() : undefined;
+  await run(["update-ref", "--stdin"], dir, store.env, 30_000, false,
+    `start\nupdate ${store.refs}/recovery/${undo.id}/target ${target.commit}\nupdate ${store.refs}/recovery/${undo.id}/undo ${undo.commit}\n` +
+    (intent ? `update ${store.refs}/recovery/${undo.id}/journal ${intent}\n` : "") + "prepare\ncommit\n");
   return { target, undo };
 }
 
@@ -486,6 +556,9 @@ export async function restore(dir: string, id: string, prepared?: { target: Chec
     }
 
   } finally { dropIndex(index); }
+  // The daemon's mutation callback means its conversation recovery still owns
+  // these pins; it releases them after removing the journal.
+  if (!beforeMutation) await releasePins(store, undo.id);
   return { restored: target, undo, changed: paths };
 }
 
@@ -555,12 +628,55 @@ export async function diffSince(dir: string, id: string): Promise<TurnDiff | nul
   }
 }
 
+async function releasePins(store: Store, id: string): Promise<void> {
+  await run(["update-ref", "--stdin"], store.dir, store.env, 30_000, false,
+    `start\ndelete ${store.refs}/recovery/${id}/target\ndelete ${store.refs}/recovery/${id}/undo\ndelete ${store.refs}/recovery/${id}/journal\nprepare\ncommit\n`);
+}
+
+/** Release a completed or explicitly abandoned recovery, including old journals. */
+export async function releaseRestore(dir: string, prepared: { target: Checkpoint; undo: Checkpoint }): Promise<void> {
+  for (const store of await storesOf(dir)) {
+    if (store.kind === prepared.undo.store) await releasePins(store, prepared.undo.id);
+  }
+}
+
 async function pruneStore(store: Store, keep: number): Promise<number> {
   const all = (await listStore(store)).sort((a, b) => (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
-  // Undo points are recovery assets, including a journal in another linked
-  // checkout. Automatic retention must never collect them during a retry.
-  const drop = all.slice(Math.max(0, keep)).filter(c => keep === 0 || !c.label.startsWith("before rewinding to "));
+  // A crash between preparation and journal publication must not leave an
+  // immortal pin. Give publication a minute, then collect pins without intent.
+  const recoveries = (await run(["for-each-ref", "--format=%(refname)%09%(objectname)", `${store.refs}/recovery/`], store.dir, store.env)).trim().split("\n");
+  for (const row of keep === 0 ? [] : recoveries) {
+    const [ref, object] = row.split("\t");
+    if (!ref?.endsWith("/journal") || !object) continue;
+    const intent = JSON.parse(await run(["cat-file", "blob", object], store.dir, store.env)) as { journal: string; at: number };
+    if (!fs.existsSync(intent.journal) && Date.now() - intent.at > 60_000) {
+      const id = ref.split("/").at(-2)!;
+      await releasePins(store, id);
+    }
+  }
+  const pinned = new Set((await quiet(["for-each-ref", "--format=%(objectname)", `${store.refs}/recovery/`], store.dir, store.env)).split("\n"));
+  // Older versions have journals but no recovery refs. Honour those until they
+  // are retried, including journals in linked checkouts sharing this repository.
+  const dirs = new Set([store.dir]);
+  if (store.kind === "git") {
+    const worktrees = await quiet(["worktree", "list", "--porcelain"], store.dir);
+    for (const line of worktrees.split("\n")) if (line.startsWith("worktree ")) {
+      const root = line.slice(9); dirs.add(root);
+      if (store.prefix) dirs.add(path.join(root, store.prefix));
+    }
+  }
+  for (const dir of dirs) {
+    try {
+      const journal = JSON.parse(fs.readFileSync(path.join(dir, ".loom", "rewind-pending.json"), "utf8"));
+      for (const cp of [journal.prepared?.target, journal.prepared?.undo]) if (typeof cp?.commit === "string") pinned.add(cp.commit);
+    } catch { /* no readable journal */ }
+  }
+  const drop = all.slice(Math.max(0, keep)).filter(c => keep === 0 || !pinned.has(c.commit));
   for (const c of drop) await quiet(["update-ref", "-d", `${store.refs}/${c.id}`], store.dir, store.env);
+  if (keep === 0) {
+    const refs = (await quiet(["for-each-ref", "--format=%(refname)", `${store.refs}/recovery/`], store.dir, store.env)).split("\n").filter(Boolean);
+    for (const ref of refs) await run(["update-ref", "-d", ref], store.dir, store.env);
+  }
   // A project's own repository collects its garbage on its own schedule; Loom's
   // store has nobody else to do it.
   if (drop.length && store.kind === "loom") await quiet(["gc", "--auto", "--quiet"], store.dir, store.env);

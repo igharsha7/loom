@@ -989,7 +989,7 @@ it.each(["rewind-pending.json", "compaction-pending.json"])("blocks chat switch 
   await rt.switchChat("main", "claude"); expect((await rt.status()).holder).toBe("claude");
 });
 
-it("waits for turn commit finalization before the next route handoff (finding #8)", async () => {
+it.each(["claude", "codex"])("waits for turn commit finalization before route handoff to %s (finding #3)", async next => {
   const { rt } = await project({ git: true, continuity: false });
   const briefings = (rt as unknown as { briefings: { prepareHandoff: (...args: unknown[]) => Promise<unknown> } }).briefings;
   const briefing = vi.spyOn(briefings, "prepareHandoff").mockResolvedValue({ memory: "", briefing: "", mode: "template", elapsedMs: 0, bridges: [] });
@@ -1000,9 +1000,11 @@ it("waits for turn commit finalization before the next route handoff (finding #8
   // The fake does not edit files; provide a real diff so finalization reaches commit.
   const diff = vi.spyOn(checkpoints, "diffSince").mockResolvedValueOnce({ files: [{ status: " M", path: "app.txt" }], added: 1, removed: 1, patch: "", truncated: false });
   try {
-    await rt.startRoute({ task: "two steps", spec: ["codex", "claude"] });
+    await rt.startRoute({ task: "two steps", spec: ["codex", next] });
     await waitUntil(() => commit.mock.calls.length > 0);
     expect(rt.routeState()?.status).toBe("running");
+    await new Promise(resolve => setTimeout(resolve, 150));
+    expect((rt as unknown as { queue: PromptQueue }).queue.snapshot().items).toHaveLength(0);
     release(); await waitUntil(() => rt.routeState()?.status === "completed");
     expect(rt.log.list({ kinds: ["error"] }).some(e => /finalizing/.test(String(e.payload.message)))).toBe(false);
   } finally { release(); commit.mockRestore(); diff.mockRestore(); briefing.mockRestore(); }

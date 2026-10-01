@@ -148,6 +148,9 @@ interface Session {
   planMode: boolean;
   /** Turns that already finished; a turn can finish before turn/start answers. */
   finished: Set<TurnId>;
+  /** Native children hold settlement independently of their spawning tool call. */
+  children: Map<string, boolean>;
+  childTurns: Set<string>;
   /** Per turn: running usage at the first report, to compute the turn's own usage. */
   baseline: { total: Usage; first: Usage } | null;
   turnUsage: Usage | null;
@@ -205,7 +208,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
       info: { provider: this.provider, instanceId: this.instanceId, threadId: input.threadId, status: "connecting",
         runtimeMode: input.runtimeMode, cwd: input.cwd, processGroupId: proc.child.pid, createdAt: now, updatedAt: now,
         ...(input.modelSelection?.model ? { model: input.modelSelection.model } : {}) },
-      proc, rpc: undefined as unknown as CodexRpc, providerThreadId: "", pending: new Map(), inputs: new Map(), planMode: false, finished: new Set(),
+      proc, rpc: undefined as unknown as CodexRpc, providerThreadId: "", pending: new Map(), inputs: new Map(), planMode: false, finished: new Set(), children: new Map(), childTurns: new Set(),
       baseline: null, turnUsage: null, compacting: false, stopping: false,
     };
     session.rpc = new CodexRpc(proc.child, {
@@ -343,6 +346,9 @@ export class CodexProviderAdapter implements ProviderAdapter {
     // Settle open approvals and questions first (t3code: the interrupt must not
     // queue behind a card nobody will answer).
     this.settlePending(s, "cancel");
+    // A finished parent can still have native children writing. Contain the
+    // entire process group rather than depend on child interrupt acknowledgements.
+    if (s.children.size) { await this.stopSession(threadId); return; }
     const target = turnId ?? s.info.activeTurnId;
     if (!target || s.finished.has(target)) return;
     await s.rpc.request("turn/interrupt", { threadId: s.providerThreadId, turnId: target }, 5000);
@@ -517,8 +523,12 @@ export class CodexProviderAdapter implements ProviderAdapter {
   // ---- native → canonical --------------------------------------------------
 
   private notification(s: Session, method: string, params: Json): void {
-    // Sub-agent threads report their own items; this session's thread is the one.
-    if (s.providerThreadId && typeof params.threadId === "string" && params.threadId !== s.providerThreadId) return;
+    const nativeThread = typeof params.threadId === "string" ? params.threadId
+      : typeof (params.thread as Json | undefined)?.id === "string" ? String((params.thread as Json).id) : undefined;
+    if (s.providerThreadId && nativeThread && nativeThread !== s.providerThreadId) {
+      this.childNotification(s, nativeThread, method, params);
+      return;
+    }
     const threadId = s.info.threadId;
     const turnId = typeof params.turnId === "string" ? params.turnId : s.info.activeTurnId;
     const at = { ...(turnId ? { turnId } : {}) };
@@ -609,8 +619,52 @@ export class CodexProviderAdapter implements ProviderAdapter {
     }
   }
 
+  private childState(s: Session, id: string, running: boolean): void {
+    const previous = s.children.get(id);
+    s.children.set(id, running);
+    if (previous === running || (!running && previous === undefined)) return;
+    this.emit(s.info.threadId, running ? "item.started" : "item.completed",
+      { itemType: "collab_agent_tool_call", status: running ? "inProgress" : "completed",
+        title: "Codex child agent", data: { nativeChild: true } }, { itemId: `child:${id}` });
+  }
+
+  private childNotification(s: Session, id: string, method: string, params: Json): void {
+    if (method === "turn/started") { s.childTurns.add(id); this.childState(s, id, true); }
+    else if (method === "turn/completed" || method === "thread/closed") { s.childTurns.delete(id); this.childState(s, id, false); }
+    else if (method === "thread/status/changed") {
+      const status = (params.status as Json | undefined)?.type;
+      if (status === "active") { s.childTurns.add(id); this.childState(s, id, true); }
+      else if (status === "idle" || status === "notLoaded") { s.childTurns.delete(id); this.childState(s, id, false); }
+    } else if (method === "item/started" || method === "item/completed") {
+      const item = (params.item ?? {}) as Json;
+      // Commands have their own settlement even after the child's turn ends.
+      if (codexItemType(item.type) === "command_execution") {
+        if (!s.children.has(id)) this.childState(s, id, true);
+        this.item(s, method === "item/started" ? "item.started" : "item.completed",
+          { ...item, id: `child:${id}:${String(item.id ?? "command")}` }, {});
+      }
+      this.rememberChildren(s, item);
+    }
+  }
+
+  private rememberChildren(s: Session, item: Json): void {
+    if (codexItemType(item.type) !== "collab_agent_tool_call") return;
+    const states = (item.agentsStates ?? {}) as Record<string, Json>;
+    const ids = new Set([...(Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds.map(String) : []), ...Object.keys(states)]);
+    for (const id of ids) {
+      if (id === s.providerThreadId) continue;
+      const status = states[id]?.status;
+      const terminal = status === "completed" || status === "errored" || status === "shutdown" || status === "notFound";
+      // Snapshots cannot end a directly observed live child turn.
+      if (terminal && s.childTurns.has(id)) continue;
+      // A spawn snapshot may arrive after the child's own terminal notification.
+      if (terminal || item.tool !== "spawnAgent" || !s.children.has(id)) this.childState(s, id, !terminal);
+    }
+  }
+
   private item(s: Session, type: "item.started" | "item.completed", item: Json, at: { turnId?: TurnId }): void {
     const threadId = s.info.threadId;
+    this.rememberChildren(s, item);
     const itemType = codexItemType(item.type);
     const itemId = typeof item.id === "string" ? item.id : undefined;
     const extra = { ...at, ...(itemId ? { itemId } : {}) };

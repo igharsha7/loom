@@ -659,3 +659,104 @@ it("returns literal project-relative fallback paths, including newline names (fi
   await stageAndCommitFiles(sub, diff!.files.map(f => f.path), "nested turn");
   expect(git(dir, "show", "HEAD:nested/ report\nname.txt")).toBe("new\n");
 });
+
+
+it.each([".LOOM/log.db", ".LoOm/rewind-pending.json", ".lOoM/compaction-pending.json", ".GIT/config"])("refuses case aliases of protected state: %s (finding #2)", async file => {
+  const dir = repo(), cp = (await capture(dir, "before"))!;
+  const live = file.toLowerCase(), content = read(dir, live) ?? "must survive"; write(dir, live, content);
+  await expect(restoreFile(dir, cp.id, file)).rejects.toThrow(/isn't a path/);
+  expect(read(dir, live)).toBe(content);
+});
+
+it("migrates legacy subproject refs from history and preserves rewind links (finding #4)", async () => {
+  const root = repo(), sub = path.join(root, "nested");
+  write(root, "nested/file.txt", "before"); git(root, "add", "nested"); git(root, "commit", "-qm", "nested");
+  const cp = (await capture(sub, "legacy clean capture"))!;
+  // Reproduce the pre-namespace commit and ref; clean captures cannot be scoped by diff.
+  const commit = git(root, "commit-tree", `${cp.commit}^{tree}`, "-p", "HEAD", "-m", "loom checkpoint: legacy clean capture").trim();
+  const ref = git(root, "for-each-ref", "--format=%(refname)", "refs/loom/checkpoints").trim();
+  git(root, "update-ref", "-d", ref); git(root, "update-ref", `refs/loom/checkpoints/${cp.id}`, commit);
+  write(sub, ".loom/log.jsonl", JSON.stringify({ kind: "checkpoint", payload: { id: cp.id, reason: "before_turn" } }) + "\n");
+  const undoId = `c${(Date.now() + 10).toString(36)}`;
+  const undoCommit = git(root, "commit-tree", `${cp.commit}^{tree}`, "-p", "HEAD", "-m", "loom checkpoint: before rewinding to legacy").trim();
+  git(root, "update-ref", `refs/loom/checkpoints/${undoId}`, undoCommit);
+  write(sub, ".loom/rewind-pending.json", JSON.stringify({ workspace: { dir: sub }, prepared: {
+    target: { ...cp, commit }, undo: { ...cp, id: undoId, commit: undoCommit } } }));
+  expect((await list(sub)).map(c => c.id)).toContain(cp.id);
+  expect((await list(sub)).map(c => c.id)).toContain(undoId);
+  expect((await list(root)).map(c => c.id)).not.toContain(undoId);
+  fs.rmSync(path.join(sub, ".loom", "rewind-pending.json"));
+  expect((await list(root)).map(c => c.id)).not.toContain(cp.id);
+  write(sub, "file.txt", "after");
+  await restore(sub, cp.id);
+  expect(read(sub, "file.txt")).toBe("before");
+  expect(read(root, "app.ts")).toBe("export const port = 3000;\n");
+});
+
+it("opens an unlogged clean legacy checkpoint by its existing id (finding #4)", async () => {
+  const root = repo(), sub = path.join(root, "nested"); write(sub, "file.txt", "before");
+  git(root, "add", "nested"); git(root, "commit", "-qm", "nested");
+  const cp = (await capture(sub, "legacy"))!;
+  const commit = git(root, "commit-tree", `${cp.commit}^{tree}`, "-p", "HEAD", "-m", "loom checkpoint: legacy").trim();
+  const ref = git(root, "for-each-ref", "--format=%(refname)", "refs/loom/checkpoints").trim();
+  git(root, "update-ref", "-d", ref); git(root, "update-ref", `refs/loom/checkpoints/${cp.id}`, commit);
+  expect(await find(sub, cp.id)).toMatchObject({ id: cp.id, commit });
+  expect((await list(root)).map(c => c.id)).not.toContain(cp.id);
+});
+
+it("prunes completed rewind undo points and releases their recovery refs (finding #5)", async () => {
+  const dir = repo(), target = (await capture(dir, "target"))!;
+  write(dir, "app.ts", "changed");
+  const out = await restore(dir, target.id);
+  expect(git(dir, "rev-list", "--parents", "-n", "1", out.undo.commit).trim().split(" ")).toEqual([out.undo.commit, git(dir, "rev-parse", "HEAD").trim()]);
+  expect(git(dir, "for-each-ref", "--format=%(refname)", "refs/loom/checkpoints")).not.toContain("/recovery/");
+  await capture(dir, "newest");
+  await prune(dir, 1);
+  expect(await find(dir, out.undo.id)).toBeNull();
+  expect(await list(dir)).toHaveLength(1);
+});
+
+it("pins an active recovery without retaining a completed one forever (finding #5)", async () => {
+  const { prepareRestore, releaseRestore } = await import("../src/core/checkpoint.js");
+  const dir = repo(), target = (await capture(dir, "target"))!;
+  write(dir, "app.ts", "changed");
+  const journal = path.join(dir, ".loom", "rewind-pending.json");
+  const prepared = await prepareRestore(dir, target.id, journal);
+  write(dir, ".loom/rewind-pending.json", JSON.stringify({ prepared }));
+  await capture(dir, "newest");
+  const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+  try { await prune(dir, 1); } finally { clock.mockRestore(); }
+  expect(await find(dir, target.id)).not.toBeNull();
+  expect(await find(dir, prepared.undo.id)).not.toBeNull();
+  git(dir, "gc", "--prune=now");
+  await releaseRestore(dir, prepared); fs.rmSync(journal); await prune(dir, 1);
+  expect(await find(dir, target.id)).toBeNull();
+  expect(await find(dir, prepared.undo.id)).toBeNull();
+});
+
+
+it("does not infer legacy project ownership from changed paths (finding #4)", async () => {
+  const root = repo(), sub = path.join(root, "nested"); write(sub, "file.txt", "before");
+  git(root, "add", "nested"); git(root, "commit", "-qm", "nested");
+  write(sub, "file.txt", "after");
+  const cp = (await capture(root, "root project changed a nested file"))!;
+  const commit = git(root, "commit-tree", `${cp.commit}^{tree}`, "-p", "HEAD", "-m", "loom checkpoint: legacy root").trim();
+  git(root, "update-ref", `refs/loom/checkpoints/${cp.id}`, commit);
+  expect((await list(sub)).map(c => c.id)).not.toContain(cp.id);
+  expect(await find(root, cp.id)).toMatchObject({ commit });
+});
+
+
+it("collects recovery pins orphaned before journal publication (finding #5)", async () => {
+  const { prepareRestore } = await import("../src/core/checkpoint.js");
+  const dir = repo(), target = (await capture(dir, "target"))!;
+  const journal = path.join(dir, ".loom", "rewind-pending.json");
+  const prepared = await prepareRestore(dir, target.id, journal);
+  await capture(dir, "newest");
+  await prune(dir, 1); // preparation is still within its publication grace period
+  expect(await find(dir, prepared.undo.id)).not.toBeNull();
+  const now = Date.now(), clock = vi.spyOn(Date, "now").mockReturnValue(now + 61_000);
+  try { await prune(dir, 1); } finally { clock.mockRestore(); }
+  expect(await find(dir, prepared.undo.id)).toBeNull();
+  expect(git(dir, "for-each-ref", "--format=%(refname)", "refs/loom/checkpoints")).not.toContain("/recovery/");
+});

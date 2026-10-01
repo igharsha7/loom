@@ -306,14 +306,17 @@ export class RuntimeTurns {
       // it must never redirect the lost checkout's restore into Main.
       const message = "rewind recovery released; the original checkout no longer exists, so no files were restored";
       this.host.log.append({ kind: "status", payload: { state: "rewind_recovery_released", id, cwd: pending.workspace.dir, message } });
+      if (pending.prepared) await checkpoints.releaseRestore(this.host.info.dir, pending.prepared);
       fs.rmSync(journal);
       return { recoveryReleased: true, message, changed: [], conversation: [] };
     }
     let releasedWorkspace: { dir: string; agentId?: string } | undefined;
     let releasedPending = false;
+    let releasedRecovery: { dir: string; prepared: NonNullable<typeof pending>["prepared"] } | undefined;
     let releasedPrepared: NonNullable<typeof pending>["prepared"];
     if (pending && (options.conversation === false || pending.prepared?.undo.id === id)) {
       releasedPending = true;
+      releasedRecovery = { dir: pending.workspace?.dir ?? this.host.info.dir, prepared: pending.prepared };
       if (id === pending.id) releasedPrepared = pending.prepared;
       if (id === pending.id || id === pending.prepared?.undo.id)
         releasedWorkspace = pending.workspace ?? this.checkpointWorkspace(pending.id);
@@ -359,7 +362,7 @@ export class RuntimeTurns {
       }
     }
     const workspace = pending?.workspace ?? releasedWorkspace ?? this.checkpointWorkspace(id);
-    const prepared = pending?.prepared ?? releasedPrepared ?? await checkpoints.prepareRestore(workspace.dir, id);
+    const prepared = pending?.prepared ?? releasedPrepared ?? await checkpoints.prepareRestore(workspace.dir, id, journal);
     const saveIntent = (remaining: RollbackStep[]) => {
       fs.mkdirSync(path.dirname(journal), { recursive: true });
       const tmp = `${journal}.${randomUUID()}.tmp`;
@@ -370,14 +373,20 @@ export class RuntimeTurns {
       const parent = fs.openSync(path.dirname(journal), "r");
       try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
     };
-    if (!pending) saveIntent(steps.map(s => s.step));
+    if (!pending) {
+      try { saveIntent(steps.map(s => s.step)); }
+      catch (error) { await checkpoints.releaseRestore(workspace.dir, prepared); throw error; }
+    }
     let out: checkpoints.RestoreResult;
     let filesMayHaveChanged = Boolean(pending || releasedPending);
     try { out = await checkpoints.restore(workspace.dir, id, prepared, () => { filesMayHaveChanged = true; }); }
     catch (error) {
       // Preflight refusals must not wedge an unchanged workspace. Once writes
       // start, retain the intent and undo point for retry or files-only escape.
-      if (!filesMayHaveChanged) fs.rmSync(journal, { force: true });
+      if (!filesMayHaveChanged) {
+        await checkpoints.releaseRestore(workspace.dir, prepared);
+        fs.rmSync(journal, { force: true });
+      }
       throw error;
     }
     // The files are back; a conversation that fails now is reported, and the
@@ -433,7 +442,13 @@ export class RuntimeTurns {
       if (retired.length) this.host.log.append({ kind: "status", ...(chat !== MAIN_CHAT ? { chat } : {}),
         payload: { state: "brain_items_retired", items: retired, rewind: rewound.id, chat } });
     }
-    if (!conversation.some(c => c.error)) fs.rmSync(journal);
+    if (!conversation.some(c => c.error)) {
+      // Release refs first: a crash before journal removal still leaves the
+      // journal protecting both trees for recovery.
+      await checkpoints.releaseRestore(workspace.dir, prepared);
+      if (releasedRecovery?.prepared) await checkpoints.releaseRestore(releasedRecovery.dir, releasedRecovery.prepared);
+      fs.rmSync(journal);
+    }
     return { ...out, conversation };
   }
 
