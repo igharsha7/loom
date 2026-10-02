@@ -20,6 +20,18 @@ import { isAdapter } from "../../types.js";
 import { CLOCK_TICK_MS, questionHold } from '../runtime-support.js';
 import type { TurnOptions, TurnResult } from "./turns.js";
 
+/** Records transitions even when the queue is paused or between clock ticks. */
+export class ForegroundActivity extends Map<string, number> {
+  activityAt = 0;
+  override set(key: string, value: number): this { this.activityAt = Date.now(); return super.set(key, value); }
+  override delete(key: string): boolean {
+    const removed = super.delete(key);
+    if (removed) this.activityAt = Date.now();
+    return removed;
+  }
+  override clear(): void { if (this.size) this.activityAt = Date.now(); super.clear(); }
+}
+
 /** Dependencies owned by the project coordinator, read live for each operation. */
 export interface RuntimeQueueHost {
   queue: PromptQueue;
@@ -28,7 +40,7 @@ export interface RuntimeQueueHost {
   validHolder: () => string | null;
   orchestra: OrchestraEngine;
   config: ProjectConfig;
-  busySince: Map<string, number>;
+  busySince: Map<string, number> & { activityAt?: number };
   closed: boolean;
   appendIfOpen: (event: Parameters<EventJournal["append"]>[0]) => void;
   startRoute: (opts: { task: string; spec?: string | RouteStepSpec[]; router?: RouterKind; maxHops?: number; }) => Promise<RouteState>;
@@ -129,7 +141,8 @@ export class RuntimeQueue {
         this.quietSince = 0;
         return describeCondition(when);
       }
-      if (!this.quietSince) this.quietSince = Date.now();
+      if (!this.quietSince) this.quietSince = this.host.busySince.activityAt || Date.now();
+      this.quietSince = Math.max(this.quietSince, this.host.busySince.activityAt ?? 0);
       return Date.now() - this.quietSince >= when.ms ? null : describeCondition(when);
     }
     const run = this.host.orchestra.get(when.runId);
@@ -188,6 +201,7 @@ export class RuntimeQueue {
   }
 
   kickQueue(): void {
+    if (this.host.busySince.size || this.host.orchestra.active()) this.quietSince = 0;
     if (this.host.closed || this.draining || this.holds > 0 || this.host.queue.paused || !this.host.queue.length) return;
     queueMicrotask(() => void this.drainPromptQueue());
   }

@@ -30,6 +30,8 @@ export class CodexRpc {
   ) {
     this.lines = readline.createInterface({ input: child.stdout! });
     this.lines.on("line", line => this.receive(line));
+    // Keep the listener after close: a buffered write can fail later.
+    child.stdin?.on("error", error => this.close(error));
   }
 
   request(method: string, params: Json, timeoutMs = 60_000): Promise<Json> {
@@ -58,8 +60,10 @@ export class CodexRpc {
   }
 
   private write(message: Json): void {
-    if (this.closedError || !this.child.stdin?.writable) return;
-    this.child.stdin.write(`${JSON.stringify(message)}\n`);
+    if (this.closedError) return;
+    if (!this.child.stdin?.writable) { this.close(new Error("codex app-server stdin is not writable")); return; }
+    try { this.child.stdin.write(`${JSON.stringify(message)}\n`); }
+    catch (error) { this.close(error instanceof Error ? error : new Error(String(error))); }
   }
 
   private receive(line: string): void {

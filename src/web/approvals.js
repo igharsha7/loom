@@ -58,6 +58,7 @@ import { state } from './state.js';
       var who = (c.querySelector(".apag") || {}).textContent || "";
       var res = c.querySelector(".apres");
       c.classList.add("done");
+      Array.prototype.forEach.call(c.querySelectorAll("[data-apact]"), function(b){ b.disabled = true; });
       if (res) res.innerHTML = (behavior === "allow" || behavior === "allow_session" ? '<span class="ok">\u2713 allowed' + (behavior === "allow_session" ? " for the session" : "") + "</span>"
           : behavior === "deny" ? '<span class="no">\u2715 denied</span>' : "<span>\u2713 answered elsewhere</span>") +
         "<span>" + esc(tool) + (who ? " \u00b7 " + esc(who) : "") + (message ? " \u2014 " + esc(message) : "") + "</span>";

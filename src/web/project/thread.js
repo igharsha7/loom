@@ -314,6 +314,10 @@ export function createThread(view) {
     function reconcileApprovals(){
       if (!view.historyLoaded || !state.approvals || state.approvals.pid !== view.pid) return;
       var feed = document.getElementById("feed"); if (!feed) return;
+      Array.prototype.forEach.call(feed.querySelectorAll(".apcard:not(.done)[data-approval]"), function(c){
+        var id = c.getAttribute("data-approval");
+        if (!state.approvals.list.some(function(a){ return a.id === id; })) settleApprovalCards(id, "", "");
+      });
       state.approvals.list.forEach(function(a){
         if ((a.chat || "main") !== view.chatId) return;
         if (!hasApprovalCard(feed, a.id)) placeLine(feed, approvalCard(a));

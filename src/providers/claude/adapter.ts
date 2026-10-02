@@ -291,6 +291,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     try { q = query({ prompt: prompts, options }); }
     catch (error) { throw fail("transport", `claude could not start: ${(error as Error).message}`, error); }
     session.query = q;
+    this.sessions.set(input.threadId, session);
     session.done = this.consume(session);
 
     const timeoutMs = this.options.startTimeoutMs ?? 60_000;
@@ -298,7 +299,9 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
       // A resume of a session the CLI doesn't have fails here, before any
       // prompt is read: "No conversation found with session ID".
       await Promise.race([q.initializationResult(),
+        session.done.then(() => { throw new Error("claude exited during initialization"); }),
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`claude did not initialize within ${Math.round(timeoutMs / 1000)}s`)), timeoutMs).unref())]);
+      if (session.stopping || session.info.status === "error" || this.sessions.get(input.threadId) !== session) throw new Error("claude exited during initialization");
     } catch (error) {
       session.stopping = true;
       prompts.close();
@@ -311,6 +314,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
           throw containment;
         }
       }
+      if (this.sessions.get(input.threadId) === session) this.sessions.delete(input.threadId);
       const stderr = session.proc?.stderr().trim() ?? "";
       if (resume && MISSING_SESSION.test(`${(error as Error).message}\n${stderr}`)) throw fail("session_missing", `claude session ${resume} could not be resumed`, error);
       const failure = fail("transport", `claude could not start: ${(error as Error).message}`.slice(0, 500), error);

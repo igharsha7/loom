@@ -14,9 +14,12 @@ export function createApprovalEvents(view) {
     // ---- approvals: agents in "always ask" waiting on you --------------------
     // The daemon holds each request open until someone answers; the thread
     // shows it as a card (lineFor), the badge counts every one in the project.
+    var revision = 0, snapshot = 0;
     function loadApprovals(){
+      var observed = revision, issued = ++snapshot;
       api("/api/projects/" + view.pid + "/approvals").then(function(j){
-        if (state.pid !== view.pid) return;
+        if (state.pid !== view.pid || issued !== snapshot) return;
+        if (observed !== revision) { loadApprovals(); return; }
         state.approvals = { pid: view.pid, list: j.approvals || [] };
         drawApBadge();
         view.reconcileApprovals();
@@ -25,6 +28,7 @@ export function createApprovalEvents(view) {
 
     function onApprovalEvent(ev){
       if (!ev || ev.kind !== "approval") return;
+      revision++;
       var p = ev.payload || {};
       if (!state.approvals || state.approvals.pid !== view.pid) state.approvals = { pid: view.pid, list: [] };
       if (p.phase === "requested") {

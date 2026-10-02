@@ -124,6 +124,9 @@ export class ProviderAgent extends AdapterBase {
   private current: CurrentTurn | null = null;
   private settled: Promise<void> | null = null;
   private stopping: Promise<void> | null = null;
+  private attaching: Promise<{ providers: ProjectProviders; service: ProviderService }> | null = null;
+  private attachAbort: AbortController | null = null;
+  private attachmentWork: Promise<unknown> | null = null;
   private beforeCompact: ((session: ProviderSession) => void) | undefined;
   private compactingChat: string | undefined;
   private compaction: { chat: string; interrupted?: boolean; resolve: () => void; reject: (error: Error) => void } | null = null;
@@ -230,32 +233,61 @@ export class ProviderAgent extends AdapterBase {
    * rebuilt agent with the same id (a model or permission change) takes over:
    * the previous instance is stopped first, and its sessions resume here.
    */
-  private async attach(): Promise<{ providers: ProjectProviders; service: ProviderService }> {
-    if (this.providers) return { providers: this.providers, service: this.providers.service };
-    const providers = acquireProviders(this.projectDir, () => String(this.options.loomProject ?? ""));
-    const previous = providers.owners.get(this.id);
-    if (previous && previous !== this) {
-      try { await previous.stop(); }
-      catch (error) { releaseProviders(this.projectDir, providers); throw error; }
-    }
-    // A concurrent attach may have finished while the previous owner stopped.
-    const attached = this.providers as ProjectProviders | null;
-    if (attached) { releaseProviders(this.projectDir, providers); return { providers: attached, service: attached.service }; }
-    let instance: ProviderInstance;
-    try { instance = await providerRegistry.create(this.provider, this.id, this.options, {
-      cwd: this.projectDir, mcpServers: () => this.mcp?.servers ?? [], canAsk: hasApprovalBroker,
-    }); } catch (error) { releaseProviders(this.projectDir, providers); throw error; }
-    const adapter = instance.adapter;
-    try { providers.service.register(adapter, instance); }
-    catch (error) { await instance.dispose(); releaseProviders(this.projectDir, providers); throw error; }
-    this.instance = instance;
-    providers.owners.set(this.id, this);
-    providers.busy.set(this.id, () => this.current?.chat ?? this.compactingChat);
-    this.unsubscribe = providers.service.onEvent(event => { if (event.instanceId === this.id) this.observe(event); });
-    this.providers = providers;
-    this.adapter = adapter;
-    this.migrateLegacySession(providers.service);
-    return { providers, service: providers.service };
+  private attach(): Promise<{ providers: ProjectProviders; service: ProviderService }> {
+    if (this.stopping) return Promise.reject(new NativeDispatchRejected("agent is stopping"));
+    if (this.providers) return Promise.resolve({ providers: this.providers, service: this.providers.service });
+    if (this.attaching) return this.attaching;
+    const abort = new AbortController();
+    this.attachAbort = abort;
+    const check = () => { if (abort.signal.aborted) throw new NativeDispatchRejected("attachment interrupted"); };
+    const previousWork = this.attachmentWork;
+    const work = (async () => {
+      if (previousWork) await previousWork.catch(() => {});
+      check();
+      if (this.instance) throw new NativeQuiescenceUnknown("previous attachment disposal failed; retry Stop");
+      const providers = acquireProviders(this.projectDir, () => String(this.options.loomProject ?? ""));
+      let adopted = false;
+      try {
+        const previous = providers.owners.get(this.id);
+        if (previous && previous !== this) await previous.stop();
+        check();
+        const instance = await providerRegistry.create(this.provider, this.id, this.options, {
+          cwd: this.projectDir, mcpServers: () => this.mcp?.servers ?? [], canAsk: hasApprovalBroker,
+        });
+        try { check(); providers.service.register(instance.adapter, instance); }
+        catch (error) {
+          // Retain a failed disposal so another Stop can retry fencing it.
+          try { await instance.dispose(); }
+          catch (containment) {
+            this.instance = instance;
+            if (abort.signal.aborted) this.emit({ kind: "error", payload: {
+              message: `attachment disposal failed; retry Stop: ${containment instanceof Error ? containment.message : String(containment)}`,
+            } });
+            throw containment;
+          }
+          throw error;
+        }
+        this.instance = instance;
+        providers.owners.set(this.id, this);
+        providers.busy.set(this.id, () => this.current?.chat ?? this.compactingChat);
+        this.unsubscribe = providers.service.onEvent(event => { if (event.instanceId === this.id) this.observe(event); });
+        this.providers = providers;
+        this.adapter = instance.adapter;
+        adopted = true;
+        this.migrateLegacySession(providers.service);
+        return { providers, service: providers.service };
+      } finally { if (!adopted) releaseProviders(this.projectDir, providers); }
+    })();
+    this.attachmentWork = work;
+    void work.finally(() => { if (this.attachmentWork === work) this.attachmentWork = null; }).catch(() => {});
+    const cancelled = new Promise<never>((_, reject) => {
+      abort.signal.addEventListener("abort", () => reject(new NativeDispatchRejected("attachment interrupted")), { once: true });
+    });
+    const attaching = Promise.race([work, cancelled]).finally(() => {
+      if (this.attaching === attaching) { this.attaching = null; this.attachAbort = null; }
+    });
+    this.attaching = attaching;
+    return attaching;
   }
 
   /**
@@ -507,8 +539,10 @@ export class ProviderAgent extends AdapterBase {
   }
 
   async interrupt(): Promise<void> {
+    this.attachAbort?.abort();
     const cur = this.current;
     if (!this.providers) {
+      if (this.instance) { await this.instance.dispose(); this.instance = null; }
       await providerRegistry.disposeInstance(this.projectDir, this.id);
       if (cur?.quiescenceUnknown) { this.current = null; this._busy = false; }
     }

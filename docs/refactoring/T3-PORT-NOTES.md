@@ -379,9 +379,10 @@ remaining seams, not evidence that all provider-specific code has been removed.
 
 ## Round 14 audit corrections (2026-10-02)
 
-Concurrent agent Stop now shares one cleanup promise, retaining the shared
-service until its last owner releases it. An unavailable roster entry still
-loads, but legacy dispatch rejects it before logging or starting a background
+Round 14 made concurrent agent Stop share one cleanup promise for attached
+owners, retaining the shared service until its last owner releases it. It did
+not fence an attachment waiting without a current turn. An unavailable roster
+entry still loads, but legacy dispatch rejects it before logging or starting a background
 turn: a queued prompt is restored and paused, editable or removable as usual.
 Stop during session initialization emits interrupted; Brain still receives
 NativeDispatchRejected and its engine behavior is unchanged.
@@ -394,11 +395,35 @@ provider config change, or queue-file shape change is needed.
 
 Browser queue snapshots accept only the latest issued HTTP request, alongside
 the socket epoch/revision checks. Pending approvals are read after socket hello
-and reconciled into the loaded thread by approval id, including after reconnect.
+and missing cards inserted into the loaded thread by approval id. Round 14
+did not reject snapshots crossed by decisions or retire stale reconnect cards.
 Pending approval HTTP snapshots now include the same chat as the log event
 (an in-memory/wire addition), so side-thread requests recover into their own thread.
 Both live cards and the badge preserve sessionOption, correcting Phase 3's
 live-session permission parity gap. Historical browser usage infers legacy
 Codex/Claude ownership from the reported provider label, never the current
-roster's first matching driver. Quiet conditions observe foreground activity
-before the continuity blocker returns, so busy time cannot count as quiet.
+roster's first matching driver. Round 14 reset quiet conditions when a blocker
+observed foreground activity; paused queues and turns between observations
+could still count busy time as quiet.
+
+## Round 15 audit corrections (2026-10-02)
+
+Stop and interrupt cancel attachment waits, including rollback planning with no
+current turn. Attachment is shared per agent and checks cancellation after
+waiting on the previous owner and the factory. A late result is disposed instead
+of registered; failed disposal retains its handle for a later Stop retry. New
+attachment attempts wait for prior factory cleanup. Stop need not wait for an
+unresolved factory to return.
+
+Approval reads accept only the latest issued snapshot, retrying a read crossed
+by a live approval event. Reconciliation folds and disables cards absent from
+the current pending list, including decisions missed while disconnected.
+Claude registers its connecting session before consuming the stream and rejects
+startup if consumption ends before readiness; a later ensureSession can restart.
+Foreground activity timestamps are recorded on busy-map transitions independently
+of queue pause and clock ticks. Codex RPC listens for asynchronous stdin errors,
+closes the transport and rejects pending and future requests; unwritable stdin
+and synchronous write failures use the same path.
+
+All five fixes have focused fake regressions. Persisted data shapes and provider
+configs are unchanged. Brain's Codex and Claude Code engine behavior is unchanged.

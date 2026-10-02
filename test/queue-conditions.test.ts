@@ -9,7 +9,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { RuntimeQueue } from "../src/daemon/runtime/queue.js";
+import { ForegroundActivity, RuntimeQueue } from "../src/daemon/runtime/queue.js";
 import { describeCondition, parseCondition } from "../src/core/prompt-queue.js";
 import { deleteRecipe, getRecipe, listRecipes, roleToTarget, saveRecipe, targetToRole } from "../src/core/recipes.js";
 import { ProjectRuntime } from "../src/daemon/runtime.js";
@@ -156,5 +156,30 @@ it("restarts the quiet clock after a continuity turn (#8)", () => {
     expect(queue.queueBlocker(item)).toMatch(/quiet/);
     now = 1299; expect(queue.queueBlocker(item)).toMatch(/quiet/);
     now = 1300; expect(queue.queueBlocker(item)).toBeNull();
+  } finally { clock.mockRestore(); }
+});
+
+
+it("restarts quiet time after paused foreground work and turns between ticks (round 15 #4)", () => {
+  let now = 1000;
+  const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+  const busySince = new ForegroundActivity();
+  const host = { config: { brain: { continuity: true } }, busySince, closed: false,
+    queue: { paused: true, length: 1 }, orchestra: { active: () => null }, routeState: () => null, validHolder: () => null };
+  const queue = new RuntimeQueue(host as any);
+  const item = { target: { kind: "agent", agentId: "a" }, when: { kind: "quiet", ms: 100 } } as any;
+  try {
+    expect(queue.queueBlocker(item)).toMatch(/quiet/);
+    now = 1050; busySince.set("a", now);
+    queue.kickQueue(); // paused queues must still notice activity without dispatching
+    // No blocker observation during work, even when the whole quiet period passes.
+    now = 1250; busySince.delete("a");
+    expect(queue.queueBlocker(item)).toMatch(/quiet/);
+    now = 1349; expect(queue.queueBlocker(item)).toMatch(/quiet/);
+    now = 1350; expect(queue.queueBlocker(item)).toBeNull();
+    now = 1360; busySince.set("a", now);
+    now = 1361; busySince.clear(); // a short turn entirely between observations
+    now = 1400; expect(queue.queueBlocker(item)).toMatch(/quiet/);
+    now = 1461; expect(queue.queueBlocker(item)).toBeNull();
   } finally { clock.mockRestore(); }
 });

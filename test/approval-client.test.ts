@@ -104,3 +104,41 @@ it("keeps answered history folded while a new request owns the badge and pending
   expect(state.approvals.list).toEqual([]);
   expect(document.querySelector('[data-approval="old"] .apres')?.textContent).toContain("allowed");
 });
+
+it("does not revive a decided approval from an older HTTP snapshot (round 15 #2)", async () => {
+  const { view } = mount();
+  state.approvals = { pid: "p", list: [request] }; view.reconcileApprovals();
+  let resolve!: (value: any) => void;
+  vi.mocked(api).mockReturnValueOnce(new Promise(r => { resolve = r; })).mockResolvedValue({ approvals: [] });
+  view.loadApprovals();
+  view.onApprovalEvent({ kind: "approval", payload: { phase: "decided", approvalId: "gap", behavior: "allow" } });
+  resolve({ approvals: [request] });
+  await vi.waitFor(() => expect(api).toHaveBeenCalledTimes(2));
+  expect(state.approvals.list).toEqual([]);
+  openApprovalsPop(document.getElementById("badge"));
+  expect(document.querySelector('.appop [data-approval="gap"]')).toBeNull();
+  expect(document.querySelector('.apcard[data-approval="gap"]')?.classList.contains("done")).toBe(true);
+});
+
+it("folds and disables an approval answered while disconnected on socket hello (round 15 #2)", async () => {
+  const { view, thread, sockets } = mount();
+  state.approvals = { pid: "p", list: [request] }; view.reconcileApprovals();
+  vi.mocked(api).mockResolvedValue({ approvals: [] });
+  thread.connect();
+  sockets[0].onmessage({ data: JSON.stringify({ type: "hello" }) });
+  await vi.waitFor(() => expect(document.querySelector('.apcard.done .apres')?.textContent).toContain("answered elsewhere"));
+  expect(state.approvals.list).toEqual([]);
+  document.querySelectorAll<HTMLButtonElement>('.apcard [data-apact]').forEach(b => expect(b.disabled).toBe(true));
+});
+
+it("uses only the latest issued approval snapshot (round 15 #2)", async () => {
+  const { view } = mount();
+  let old!: (value: any) => void;
+  vi.mocked(api).mockReturnValueOnce(new Promise(resolve => { old = resolve; })).mockResolvedValueOnce({ approvals: [] });
+  view.loadApprovals(); view.loadApprovals();
+  await Promise.resolve();
+  old({ approvals: [request] });
+  await Promise.resolve();
+  expect(state.approvals.list).toEqual([]);
+  expect(document.querySelector('.apcard:not(.done)')).toBeNull();
+});

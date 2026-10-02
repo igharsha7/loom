@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { ForegroundActivity } from "./queue.js";
 import { UnavailableAdapter } from "../../adapters/unavailable.js";
 import path from "node:path";
 import { BatonManager, NotHolderError } from "../../core/baton.js";
@@ -186,7 +187,7 @@ export class RuntimeTurns {
    * `busy` and dead enough to never finish, which blocks every dispatch with
    * "is busy" until someone notices.
    */
-  busySince = new Map<string, number>();
+  busySince = new ForegroundActivity();
   private readonly preparing = new Map<string, AbortController>();
   get isPreparing(): boolean { return this.preparing.size > 0; }
   /** Native requests between capture and settlement (or queueing). */

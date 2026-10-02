@@ -182,7 +182,7 @@ Claude settings); override per session through the protocol instead.
 A second agent audited the port; Claude checked each round's findings against the
 code, Sol fixed them, Claude reviewed and ran the suite. Rounds 1–4 covered Phase 5
 only; rounds 5–8 covered all five phases, including what earlier fixes introduced.
-Findings per round: 5, 4, 6, 4, then 25, 24, 14, 10, 16, 5, 8, 11, 9, 9. All fixed, each with a
+Findings per round: 5, 4, 6, 4, then 25, 24, 14, 10, 16, 5, 8, 11, 9, 9, 5. All fixed, each with a
 regression test.
 
 - [x] Phase 5: dropped turns are named explicitly (`dropped: { from, turns, keep }`
@@ -198,7 +198,8 @@ regression test.
 - [x] Sessions and settlement: Brain's writer lease, diffs, commits and routes
   wait for command settlement; Claude no longer invents completions for
   unfinished commands; Stop before or during submission is honoured; a failed
-  containment keeps its handles and retries; shutdown fences pending starts;
+  containment keeps its handles and retries; shutdown fences service session starts
+  (attachment waits were not covered until round 15);
   late events keep their own chat and run.
 - [x] Rewind recovery: an interrupted rewind is journalled and holds dispatch
   until it is retried, undone, or finished `--files-only`; a manual compaction is
@@ -209,7 +210,7 @@ regression test.
   question everywhere (routes, status, reloaded cards); multi-select questions;
   Codex file-read approvals; sparse Claude and Codex limit reports; per-window
   limit state.
-- [x] Tests: 1885 passing (plus 134 DOM). Known unrelated: `daemon.test.ts`
+- [x] Tests: 1897 passing (plus 134 DOM). Known unrelated: `daemon.test.ts`
   "real models" depends on the live Codex catalog; `app-queue-dom` is
   occasionally flaky. `codex.test.ts` "interrupts the running turn" failed once
   under full-suite load and couldn't be reproduced (6 runs alone, 2 full runs).
@@ -275,14 +276,21 @@ regression test.
   is unavailable still opens; more provider policy moved into driver records
   (what remains is listed in the notes for Phase 6).
 - [x] Round 14 (9 findings and 2 flaky tests): concurrent agent Stop shares
-  cleanup; unavailable drivers reject before queue dispatch; rollback retains
-  requested default models; first-mount queue reads cannot retire the current
+  cleanup for attached owners; unavailable drivers reject before queue dispatch;
+  rollback retains requested default models; first-mount queue reads cannot retire the current
   epoch; pre-submission Stop emits interrupted while Brain keeps its rejection;
-  pending approval snapshots restore thread cards on mount/reconnect; legacy
-  browser limits retain built-in ownership; continuity busy time resets quiet
-  conditions; live approval cards and badge retain session permission options.
+  pending approval snapshots insert missing thread cards on mount/reconnect;
+  legacy browser limits retain built-in ownership; observed continuity busy time
+  resets quiet conditions; live approval cards and badge retain session permission options.
   Interrupt tests wait for turn-start events; the approval DOM test waits for
   both copies and actually submits a stale card to exercise HTTP 404.
+- [x] Round 15 (5 P2 findings): Stop cancels attachment waits without a current
+  turn and disposes late factory results; approval snapshots reject reads crossed
+  by live events and fold cards absent after reconnect; Claude stream termination
+  during initialization rejects startup instead of registering a stopped session;
+  foreground busy transitions reset quiet time even while paused or between ticks;
+  Codex stdin errors close RPC and reject pending/future requests. Focused fake
+  regressions cover every finding. No persisted shapes or Brain engine changes.
 - [ ] UI for the recovery states (pending rewind, pending compaction, a turn
   held after an unsettled writer) — Phase 7.
   Today the way out is the CLI or the API.

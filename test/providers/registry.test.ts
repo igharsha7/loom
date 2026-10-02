@@ -426,3 +426,80 @@ it("restores and pauses queued prompts for an unavailable driver (#2)", async ()
   runtime.queue.setPaused(false); await runtime.drainPromptQueue();
   expect(runtime.log.list({ kinds: ["message"] }).some(e => e.payload.text === "keep one")).toBe(true);
 });
+
+it.each(["plan", "rollback"])("Stop cancels %s attachment awaiting a factory and disposes its late result (round 15 #1)", async operation => {
+  const dir = tmpDir("stop-attachment"), agent = new ProviderAgent("pending", remote.kind, dir);
+  close.push(() => agent.stop());
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const create = remote.create.bind(remote);
+  let instance!: ProviderInstance;
+  const factory = vi.spyOn(remote, "create").mockImplementation(async input => { await gate; instance = await create(input); return instance; });
+  const pending = operation === "plan" ? agent.planRollback("main", Date.now()) : agent.rollbackConversation({} as any);
+  const rejected = expect(pending).rejects.toThrow(/attachment interrupted/);
+  try {
+    await waitUntil(() => factory.mock.calls.length === 1);
+    const work = (agent as any).attachmentWork;
+    await agent.stop(); // completes even though the factory has not returned
+    await rejected;
+    expect((agent as any).providers).toBeNull();
+    release(); await work.catch(() => {});
+    expect((agent as any).providers).toBeNull();
+    expect(providerRegistry.instances()).not.toContain(instance);
+    factory.mockRestore();
+    await agent.send({ text: "ordinary retry" });
+    expect((agent as any).providers).not.toBeNull();
+  } finally { release(); factory.mockRestore(); }
+});
+
+it("Stop cancels attachment awaiting a previous owner (round 15 #1)", async () => {
+  const dir = tmpDir("stop-previous"), previous = new ProviderAgent("same", remote.kind, dir);
+  close.push(() => previous.stop());
+  await previous.send({ text: "first" });
+  const agent = new ProviderAgent("same", remote.kind, dir); close.push(() => agent.stop());
+  const shared = (previous as any).providers;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const stop = previous.stop.bind(previous);
+  const stopping = vi.spyOn(previous, "stop").mockImplementation(async () => { await gate; await stop(); });
+  const factory = vi.spyOn(remote, "create");
+  const rejected = expect(agent.planRollback("main", Date.now())).rejects.toThrow(/attachment interrupted/);
+  try {
+    await waitUntil(() => stopping.mock.calls.length === 1);
+    const work = (agent as any).attachmentWork;
+    await agent.stop(); await rejected;
+    release(); await work.catch(() => {});
+    expect(factory).not.toHaveBeenCalled();
+    expect((agent as any).providers).toBeNull();
+    expect(shared.refs).toBe(0);
+  } finally { release(); stopping.mockRestore(); factory.mockRestore(); }
+});
+
+it("retains a failed late factory disposal so Stop can retry it (round 15 #1)", async () => {
+  const agent = new ProviderAgent("late-disposal", remote.kind, tmpDir("late-disposal"));
+  close.push(() => agent.stop());
+  const events: any[] = []; agent.onEvent(e => events.push(e));
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const create = remote.create.bind(remote);
+  let dispose!: ReturnType<typeof vi.fn>;
+  const factory = vi.spyOn(remote, "create").mockImplementation(async input => {
+    await gate;
+    const instance = await create(input);
+    dispose = vi.fn().mockRejectedValueOnce(new NativeQuiescenceUnknown("unfenced")).mockImplementation(() => instance.dispose());
+    return { ...instance, dispose };
+  });
+  const rejected = expect(agent.planRollback("main", Date.now())).rejects.toThrow(/attachment interrupted/);
+  try {
+    await waitUntil(() => factory.mock.calls.length === 1);
+    const work = (agent as any).attachmentWork;
+    await agent.stop(); await rejected;
+    release(); await expect(work).rejects.toThrow("unfenced");
+    expect((agent as any).providers).toBeNull();
+    expect((agent as any).instance).not.toBeNull();
+    expect(events.some(e => /retry Stop/.test(e.payload.message))).toBe(true);
+    await agent.stop();
+    expect(dispose).toHaveBeenCalledTimes(2);
+    expect((agent as any).instance).toBeNull();
+  } finally { release(); factory.mockRestore(); }
+});
