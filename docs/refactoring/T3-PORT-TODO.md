@@ -324,6 +324,89 @@ Decided with the user 2026-10-02.
 - [ ] Instances: several accounts per driver (the registry's continuation and
   account identity), auth status, install/update detection, native session
   history import.
+
+### From t3code's October update (83 commits, de251fc29..4804036e0)
+
+Reviewed 2026-10-03. t3code is the reference for each item.
+
+**MCP.** Loom already hands the project's own MCP servers to both harnesses
+(`src/core/mcp.ts`; Codex `mcp_servers.<key>` config on `thread/start`, Claude
+SDK `mcpServers`). Missing:
+
+- [ ] MCP elicitations. Loom declines every `mcpServer/elicitation/request`
+  (`src/providers/codex/adapter.ts`). t3code surfaces form-mode elicitations as
+  an approval with Approve / allow for session / always allow, builds the
+  response content from the form schema, and declines URL mode
+  (`CodexSessionRuntime.ts` `toMcpElicitationResponse`). The Claude SDK side
+  needs the same through its elicitation callback. The popup is Phase 7.
+- [ ] Refresh Codex's MCP tool list before each turn when MCP servers are
+  configured (`config/mcpServer/reload`), so a server added mid-chat is seen
+  without restarting the session.
+- [ ] Surface `mcpServer/oauthLogin/completed` and MCP server status, so a server
+  that needs sign-in says so instead of failing silently.
+- [ ] A Loom MCP server for agents, like t3code's `t3-code` server: an HTTP MCP
+  endpoint in the daemon, a per-chat bearer credential with capabilities, and
+  injection per process (Codex `-c mcp_servers.loom.url=…` with
+  `bearer_token_env_var`, Claude SDK `mcpServers` with an `Authorization`
+  header), revoked when the session ends. Never written to the user's provider
+  config. t3code's toolkits are preview, devices and pull requests; Loom's
+  would start with what agents now do through prose or the CLI: link a PR to
+  the chat, ask the orchestra or team, read Brain's briefing.
+- [ ] Restart a chat's session on request to load new skills, plugins and MCP
+  servers (t3code 921cb3c8b, a cmd+k action). Under Brain this is a
+  reconstruction packet into the new session.
+
+**Subagents.** Loom shows a subagent as one `collab_agent_tool_call` item and
+drops subagent narration. t3code models each one as a task:
+
+- [ ] Canonical `task.started / task.progress / task.updated / task.completed`
+  events with a task id and linkage (title, role, model, effort, agent path,
+  parent task for nested agents), status `running / waiting / idle / completed
+  / failed / cancelled / interrupted`, and `timelineBypass` so rows stay out of
+  the parent chat's text.
+- [ ] Claude: identity from `task_started`, attribution by
+  `parent_tool_use_id`, the subagent's own model from its assistant snapshots
+  (t3code 7ab800a43: snapshots can arrive before `task_started` and nested
+  agents' tool calls arrive only as snapshots, so buffer both, capped).
+- [ ] Codex: the multi-agent v2 child-thread notifications mapped to the same
+  task events (t3code's synthetic `collabAgent/*` events); a finished child turn
+  is idle and resumable, not terminal.
+- [ ] Token usage records whether a turn had subagents, so context-window
+  reporting doesn't count their tokens against the parent's window.
+- [ ] Brain: a subagent's result reaches the chat as ordinary evidence, the same
+  rule as parallel orchestra workers above.
+
+**Git worktrees.** Loom has worktrees per orchestra worker and per agent
+(`git.worktreePerAgent`, `agent/<id>`), not per chat. t3code gives each thread
+an optional worktree and branch:
+
+- [ ] A chat can run in its own worktree: created on a temporary branch
+  (t3code's `t3code/<8 hex>`), renamed to a generated branch name after the
+  first turn, and the session's cwd follows it. Brain bindings must carry the cwd,
+  so a switch to another provider in the same chat lands in the same worktree.
+- [ ] Before each turn, recreate a worktree whose directory was deleted
+  (`git worktree prune`, then `add` from the branch), instead of failing the
+  turn.
+- [ ] A workspace lease per checkout, so a turn starting and a worktree being
+  removed never overlap, including orchestra workers sharing a repo.
+- [ ] A per-project setup script run when a worktree is created, and submodules
+  initialised (`git worktree add` leaves them empty).
+- [ ] Cleanup rules: remove worktrees after N days, when merged, when the chat
+  is deleted, or when unchanged; never one with uncommitted work.
+- [ ] Agents told where they are: the chat's instructions name the worktree and
+  branch, and that other chats work elsewhere (what orchestra workers already
+  get).
+
+**Fixes to port.**
+
+- [ ] Claude results for another turn (t3code 9da066dbe). Claude runs turns of
+  its own between prompts (background tasks reported after resume, peer
+  messages). Loom's Claude adapter completes the active turn on any `result`,
+  so `/compact` or a queued prompt can end early and leave the chat busy. Match
+  `user_message_uuids` / `user_message_uuid` against the turn id, and treat a
+  result with a non-human `origin` as not the user's.
+- [ ] Codex 0.159 protocol bindings (t3code 422248515): check Loom's Codex
+  method and field names against them.
 - Phase 7 (after this): UI in Loom's own look, inspired by t3code, including
   question, permission and approval popups.
 
