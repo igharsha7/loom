@@ -90,8 +90,8 @@ export class RuntimeQueue {
   /** Why the head can't go yet, or null when it can. */
   queueBlocker(item: QueueItem): string | null {
     // A condition comes first: a prompt held for 3am isn't waiting on an agent.
-    if (this.host.config.brain?.continuity && this.host.busySince.size) return "waiting for the foreground native turn";
     const held = item.when ? this.conditionUnmet(item.when) : null;
+    if (this.host.config.brain?.continuity && this.host.busySince.size) return "waiting for the foreground native turn";
     if (held) return held;
     const route = this.host.routeState();
     const routing = route && (route.status === "running" || route.status === "waiting_human");

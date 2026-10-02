@@ -93,7 +93,7 @@ import { openMenu } from './menus.js';
       get refreshTree() { return refreshTree; },
       get drawStatus() { return drawStatus; }
     });
-    var { drawStatus, refresh, loadHistory, connect, drawEmpty, threadScroller, wantScroll, stickOrFlag, toBottom, liveFor, nearBottom, loadEarlier } = createThread({
+    var { reconcileApprovals, drawStatus, refresh, loadHistory, connect, drawEmpty, threadScroller, wantScroll, stickOrFlag, toBottom, liveFor, nearBottom, loadEarlier } = createThread({
       get loadQueue() { return loadQueue; },
       get autosizeBox() { return autosizeBox; },
       get jumpToMessage() { return jumpToMessage; },
@@ -195,6 +195,7 @@ import { openMenu } from './menus.js';
       get ORCH_TASK_KINDS() { return ORCH_TASK_KINDS; },
     });
     var { loadApprovals, onApprovalEvent } = createApprovalEvents({
+      get reconcileApprovals() { return reconcileApprovals; },
       get pid() { return pid; },
       get chatId() { return chatId; },
       get desktop() { return desktop; }, set desktop(value) { desktop = value; }

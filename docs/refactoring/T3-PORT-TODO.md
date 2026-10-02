@@ -274,9 +274,15 @@ regression test.
   and inline code isn't parsed as an import; a project whose configured driver
   is unavailable still opens; more provider policy moved into driver records
   (what remains is listed in the notes for Phase 6).
-- [ ] Interrupt tests (`codex.test.ts`, `claude-code.test.ts`) race: Stop can
-  arrive before the turn starts, which correctly cancels it. Make them wait for
-  the turn to start. `app-composer-dom` approvals test times out under load.
+- [x] Round 14 (9 findings and 2 flaky tests): concurrent agent Stop shares
+  cleanup; unavailable drivers reject before queue dispatch; rollback retains
+  requested default models; first-mount queue reads cannot retire the current
+  epoch; pre-submission Stop emits interrupted while Brain keeps its rejection;
+  pending approval snapshots restore thread cards on mount/reconnect; legacy
+  browser limits retain built-in ownership; continuity busy time resets quiet
+  conditions; live approval cards and badge retain session permission options.
+  Interrupt tests wait for turn-start events; the approval DOM test waits for
+  both copies and actually submits a stale card to exercise HTTP 404.
 - [ ] UI for the recovery states (pending rewind, pending compaction, a turn
   held after an unsettled writer) — Phase 7.
   Today the way out is the CLI or the API.

@@ -38,8 +38,7 @@ function observeUsage(project, e){
     // Limits belong to an account. The registry supplies each roster entry's identity.
     var provider = p.provider, account = p.accountKey || provider;
     if (!provider) return false;
-    var historical = project.agents.filter(function(owner){ return owner.provider && owner.provider.limitsProvider === provider; })[0];
-    var driver = p.driverKind || (historical && (historical.provider.driverKind || historical.kind)) || (provider === "claude" ? "claude-code" : provider);
+    var driver = p.driverKind || (provider === "claude" ? "claude-code" : provider);
     project.agents.forEach(function(a){
       var owner = a.provider && a.provider.accountKey;
       var ownerDriver = a.provider && a.provider.driverKind || a.kind;

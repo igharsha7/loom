@@ -7,8 +7,9 @@ export class UnavailableAdapter extends AdapterBase {
   async start(): Promise<void> { }
   async stop(): Promise<void> { }
   async interrupt(): Promise<void> { }
-  async send(_input: SendInput): Promise<void> {
+  assertAvailable(): never {
     throw new Error(`provider driver "${this.kind}" is unavailable — restore it, disable this agent, or choose another agent; saved bindings are preserved`);
   }
+  async send(_input: SendInput): Promise<void> { this.assertAvailable(); }
   async selfCheck() { return [{ name: "installed", ok: false, detail: `provider driver "${this.kind}" is unavailable; saved bindings are preserved` }]; }
 }

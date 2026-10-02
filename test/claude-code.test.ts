@@ -14,9 +14,9 @@ import { ClaudeCodeAdapter, stopAllProviderSessions } from "../src/providers/age
 import { setApprovalBroker, type ApprovalRequest } from "../src/core/approvals.js";
 import { NativeSessionMissing } from "../src/core/continuity/contracts.js";
 import type { AdapterEvent, SendInput } from "../src/types.js";
-import { makeProjectDir } from "./helpers.js";
+import { makeProjectDir, waitUntil } from "./helpers.js";
 import { CLAUDE_OK, callsOf, claudeInit, claudeInitOf, claudePromptOf, claudeResult, claudeText, claudeThink, claudeTool,
-  fakeClaude, stdinOf, type FakeClaudeOptions, type Step } from "./native-fakes.js";
+  fakeClaude, stdinOf, turnsOf, type FakeClaudeOptions, type Step } from "./native-fakes.js";
 
 // Provider sessions stay warm between turns; end them with the file.
 afterAll(async () => { await stopAllProviderSessions(); });
@@ -338,7 +338,7 @@ describe("claude-code · interrupt", () => {
     const events: AdapterEvent[] = [];
     agent.onEvent((e) => events.push(e));
     const turn = agent.send({ text: "long one" });
-    await new Promise((r) => setTimeout(r, 500)); // let it actually start
+    await waitUntil(() => states(events).includes("turn_started") && turnsOf(bin).length === 1);
     await agent.interrupt();
     await turn;
     expect(states(events)).toContain("interrupted");

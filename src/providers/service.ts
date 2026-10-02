@@ -65,7 +65,7 @@ export interface RollbackStep {
   nativeSessionId?: string;
   cwd: string;
   runtimeMode: RuntimeMode;
-  model?: string;
+  model?: string | null;
 }
 
 const sessionKey = (threadId: string, instanceId: string) => `${threadId}\u0000${instanceId}`;
@@ -327,7 +327,8 @@ export class ProviderService {
     return { threadId, instanceId, provider: adapter.provider, beforeTurnId: everything ? null : first.id, turns: after.length,
       ...(typeof binding.resumeCursor === "string" ? { nativeSessionId: binding.resumeCursor } : {}),
       retainedTurnIds: ledger.turns.slice(0, ledger.turns.indexOf(first)).map(t => t.id),
-      cwd: binding.runtimePayload?.cwd ?? cwd, runtimeMode: binding.runtimeMode, ...(binding.runtimePayload?.model ? { model: binding.runtimePayload.model } : {}) };
+      cwd: binding.runtimePayload?.cwd ?? cwd, runtimeMode: binding.runtimeMode, ...(binding.runtimePayload?.requestedModel !== undefined ? { model: binding.runtimePayload.requestedModel }
+        : binding.runtimePayload?.model ? { model: binding.runtimePayload.model } : {}) };
   }
 
   async validateRollback(step: RollbackStep): Promise<void> {
@@ -337,7 +338,7 @@ export class ProviderService {
       throw new ProviderError("unsupported", "rollback", "restore this conversation's driver and account before retrying, or rewind files alone");
     if (step.beforeTurnId === null) return;
     try {
-      await this.ensureSession({ threadId: step.threadId, instanceId: step.instanceId, cwd: step.cwd, runtimeMode: step.runtimeMode, ...(step.model ? { model: step.model } : {}) });
+      await this.ensureSession({ threadId: step.threadId, instanceId: step.instanceId, cwd: step.cwd, runtimeMode: step.runtimeMode, ...(step.model !== undefined ? { model: step.model } : {}) });
     } catch (error) { if (isProviderError(error, "session_missing")) return; throw error; }
     const retained = await adapter.validateRollback?.(step.threadId, step.beforeTurnId);
     if (retained) step.retainedTurnIds = retained;
@@ -368,7 +369,7 @@ export class ProviderService {
     if (step.beforeTurnId === null) return forget();
     try {
       await this.ensureSession({ threadId: step.threadId, instanceId: step.instanceId, cwd: step.cwd, runtimeMode: step.runtimeMode,
-        ...(step.model ? { model: step.model } : {}), onMissingSession: "fail" });
+        ...(step.model !== undefined ? { model: step.model } : {}), onMissingSession: "fail" });
     } catch (error) {
       if (isProviderError(error, "session_missing")) return forget();
       throw error;

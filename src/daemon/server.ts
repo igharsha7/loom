@@ -157,6 +157,7 @@ export class LoomDaemon {
       tool: string;
       input: unknown;
       sessionOption?: boolean;
+      chat: string;
       createdAt: number;
       settle: (d: ApprovalDecision) => void;
     }
@@ -215,6 +216,7 @@ export class LoomDaemon {
         id,
         projectId: req.project,
         agent: req.agent,
+        chat: chat || "main",
         tool,
         input: req.input ?? {},
         ...(req.sessionOption ? { sessionOption: true } : {}),

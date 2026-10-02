@@ -7,8 +7,9 @@
  * runtime, with a real clock.
  */
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { RuntimeQueue } from "../src/daemon/runtime/queue.js";
 import { describeCondition, parseCondition } from "../src/core/prompt-queue.js";
 import { deleteRecipe, getRecipe, listRecipes, roleToTarget, saveRecipe, targetToRole } from "../src/core/recipes.js";
 import { ProjectRuntime } from "../src/daemon/runtime.js";
@@ -138,4 +139,22 @@ describe("recipes", () => {
     expect(() => saveRecipe({ name: "empty", steps: [] })).toThrow(/no steps/);
     expect(() => saveRecipe({ name: "blank", steps: [{ text: "   ", to: "auto" }] })).toThrow(/needs something to say/);
   });
+});
+
+it("restarts the quiet clock after a continuity turn (#8)", () => {
+  let now = 1000;
+  const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+  const busySince = new Map<string, number>();
+  const queue = new RuntimeQueue({ config: { brain: { continuity: true } }, busySince,
+    orchestra: { active: () => null }, routeState: () => null, validHolder: () => null } as any);
+  const item = { target: { kind: "agent", agentId: "a" }, when: { kind: "quiet", ms: 100 } } as any;
+  try {
+    expect(queue.queueBlocker(item)).toMatch(/quiet/);
+    now = 1050; busySince.set("a", now);
+    expect(queue.queueBlocker(item)).toMatch(/foreground/);
+    now = 1200; busySince.clear();
+    expect(queue.queueBlocker(item)).toMatch(/quiet/);
+    now = 1299; expect(queue.queueBlocker(item)).toMatch(/quiet/);
+    now = 1300; expect(queue.queueBlocker(item)).toBeNull();
+  } finally { clock.mockRestore(); }
 });

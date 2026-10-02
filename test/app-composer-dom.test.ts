@@ -18,7 +18,7 @@ import path from "node:path";
 import { JSDOM, VirtualConsole } from "jsdom";
 import WebSocket from "ws";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { requestApproval } from "../src/core/approvals.js";
+import { requestApproval, type ApprovalRequest } from "../src/core/approvals.js";
 import { readDaemonConfig } from "../src/core/registry.js";
 import { APP_HTML } from "../src/daemon/app-page.js";
 import { DaemonClient } from "../src/daemon/client.js";
@@ -82,8 +82,20 @@ beforeAll(async () => {
 }, 30_000);
 
 const live: Mounted[] = [];
+const approvalRequests: Array<{ controller: AbortController; decision: ReturnType<typeof requestApproval> }> = [];
+function askApproval(req: ApprovalRequest): ReturnType<typeof requestApproval> {
+  const controller = new AbortController();
+  const decision = requestApproval({ ...req, signal: controller.signal });
+  approvalRequests.push({ controller, decision });
+  return decision;
+}
 afterEach(async () => {
   while (live.length) live.pop()!.close();
+  // An assertion failure must not leave its native request waiting in the
+  // shared daemon and change the next test's badge count.
+  const requests = approvalRequests.splice(0);
+  for (const { controller } of requests) controller.abort();
+  await Promise.all(requests.map(({ decision }) => decision));
   // One run at a time per project: never leave one active for the next test.
   const { runs } = await rest<{ runs: Run[] }>("GET", "/orchestra");
   for (const r of runs) {
@@ -127,11 +139,13 @@ interface Mounted {
   errors: string[];
   /** Every request the page made, in order, with its JSON body. */
   sent: Sent[];
+  reconnect: () => void;
   close: () => void;
 }
 
 /** Boot the app in a DOM, desktop or phone, optionally onto a conversation. */
-function mount({ desktop = true, hash = "", chat = "", pid = projectId } = {}): Mounted {
+function mount({ desktop = true, hash = "", chat = "", pid = projectId, historySnapshot, dropApprovalPhase }:
+  { desktop?: boolean; hash?: string; chat?: string; pid?: string; historySnapshot?: () => void; dropApprovalPhase?: string } = {}): Mounted {
   const errors: string[] = [];
   const sent: Sent[] = [];
   const virtualConsole = new VirtualConsole();
@@ -139,6 +153,7 @@ function mount({ desktop = true, hash = "", chat = "", pid = projectId } = {}): 
   virtualConsole.on("error", (msg: string) => errors.push(String(msg)));
   const sockets: WebSocket[] = [];
   let closed = false;
+  let releaseHello: (() => void) | undefined;
   const never = new Promise<never>(() => {}); // settles never, so nothing runs post-teardown
 
   const dom = new JSDOM(APP_HTML, {
@@ -176,12 +191,24 @@ function mount({ desktop = true, hash = "", chat = "", pid = projectId } = {}): 
           body = null;
         }
         sent.push({ method: (init?.method ?? "GET").toUpperCase(), path: url.pathname, body });
-        return fetch(url, init).then((r) => (closed ? never : r));
+        return fetch(url, init).then((r) => {
+          if (closed) return never;
+          if (url.pathname.endsWith("/events") && historySnapshot) { const hook = historySnapshot; historySnapshot = undefined; hook(); releaseHello?.(); }
+          return r;
+        });
       }) as typeof window.fetch;
       window.WebSocket = class extends WebSocket {
         constructor(url: string | URL, protocols?: string | string[]) {
           super(url, protocols);
           sockets.push(this);
+        }
+        override emit(event: string | symbol, ...args: any[]): boolean {
+          if (event === "message" && dropApprovalPhase) {
+            const frame = JSON.parse(String(args[0]));
+            if (frame.type === "hello" && historySnapshot) { releaseHello = () => { super.emit(event, ...args); }; return false; }
+            if (frame.event?.kind === "approval" && frame.event.payload?.phase === dropApprovalPhase) return false;
+          }
+          return super.emit(event, ...args);
         }
       } as unknown as typeof window.WebSocket;
       window.localStorage.setItem("loomClientToken", clientToken);
@@ -196,6 +223,7 @@ function mount({ desktop = true, hash = "", chat = "", pid = projectId } = {}): 
     window: dom.window,
     errors,
     sent,
+    reconnect: () => sockets.at(-1)!.terminate(),
     close: () => {
       closed = true;
       for (const s of sockets) {
@@ -245,8 +273,8 @@ async function sendFromComposer(m: Mounted, words: string) {
   key(m, box(m), "Enter");
 }
 /** Mount desktop onto a project, once its composer is wired. */
-async function opened(pid = projectId) {
-  const m = mount({ hash: `#p/${pid}`, pid });
+async function opened(pid = projectId, options: Parameters<typeof mount>[0] = {}) {
+  const m = mount({ hash: `#p/${pid}`, pid, ...options });
   await waitUntil(() => !!$(m, '#box[data-bound="1"]'));
   return m;
 }
@@ -614,14 +642,48 @@ describe("web app · native context", () => {
 });
 
 describe("web app · approvals", () => {
+  it("recovers a missed approval into one actionable thread card on mount and reconnect (#6)", async () => {
+    let first!: ReturnType<typeof requestApproval>;
+    const m = await opened(projectId, { dropApprovalPhase: "requested", historySnapshot: () => {
+      first = askApproval({ project: projectId, agent: "execbot", tool: "Mount gap", input: {} });
+    } });
+    await waitUntil(() => text(m, "#feed .apcard:not(.done) .aptool").includes("Mount gap"));
+    expect($$(m, '#feed .apcard:not(.done)')).toHaveLength(1);
+    click($(m, '#feed .apcard:not(.done) [data-apact="allow"]'));
+    expect(await first).toEqual({ behavior: "allow" });
+    const second = askApproval({ project: projectId, agent: "execbot", tool: "Reconnect gap", input: {} });
+    m.reconnect();
+    await waitUntil(() => text(m, "#feed .apcard:not(.done) .aptool").includes("Reconnect gap"), { timeoutMs: 10_000 });
+    expect($$(m, '#feed .apcard:not(.done)')).toHaveLength(1);
+    click($(m, '#feed .apcard:not(.done) [data-apact="allow"]'));
+    expect(await second).toEqual({ behavior: "allow" });
+    expect(m.errors).toEqual([]);
+  });
+
+  it("offers Allow for session in both live approval copies (#9)", async () => {
+    const m = await opened();
+    await waitUntil(() => !!$(m, '#feed') && !$(m, '#feed .loader'));
+    const pending = askApproval({ project: projectId, agent: "execbot", tool: "Bash", input: {}, sessionOption: true });
+    await waitUntil(() => !!$(m, '#feed .apcard:not(.done) .apsess'));
+    click($(m, '#apbadge'));
+    await waitUntil(() => !!$(m, '#appop .apsess'));
+    const card = $(m, '#feed .apcard:not(.done)')!;
+    click(card.querySelector('.apsess'));
+    expect(await pending).toEqual({ behavior: "allow", scope: "session" });
+    await waitUntil(() => card.classList.contains('done'));
+    expect(m.errors).toEqual([]);
+  });
+
   it("renders a request as a card, answers it with Allow, and folds it", async () => {
     const m = await opened();
     await waitUntil(() => !!$(m, "#feed") && !$(m, "#feed .loader"));
     // The agent's side (an adapter asking the daemon): blocks until a human decides. Not awaited.
-    const decision = requestApproval({ project: projectId, agent: "plannerbot", tool: "Bash", input: { command: "rm -rf build", description: "clean" } });
+    const decision = askApproval({ project: projectId, agent: "plannerbot", tool: "Bash", input: { command: "rm -rf build", description: "clean" } });
 
-    await waitUntil(() => !!$(m, '#feed .apcard [data-apact="allow"]'));
-    const card = $(m, "#feed .apcard")!;
+    // Earlier tests leave answered cards in this project's history. Their
+    // hidden buttons remain in the DOM; only the pending card is actionable.
+    await waitUntil(() => !!$(m, '#feed .apcard:not(.done) [data-apact="allow"]'));
+    const card = $(m, "#feed .apcard:not(.done)")!;
     expect(card.querySelector(".aptool")?.textContent).toBe("Bash");
     expect(card.textContent).toContain("plannerbot");
     // the input, pretty-printed, not a one-line blob
@@ -632,18 +694,18 @@ describe("web app · approvals", () => {
     click(card.querySelector('[data-apact="allow"]'));
     expect(await decision).toEqual({ behavior: "allow" });
     await waitUntil(() => card.classList.contains("done"));
-    expect(text(m, "#feed .apcard .apres")).toContain("✓ allowed");
+    expect(card.querySelector(".apres")?.textContent).toContain("✓ allowed");
     await waitUntil(() => !shown($(m, "#apbadge")));
     expect((await rest<{ approvals: unknown[] }>("GET", "/approvals")).approvals).toEqual([]);
     expect(m.errors.join("\n")).toBe("");
   });
 
   it("denies with a reason from the badge's list, and a stale card folds on a 404", async () => {
-    const m = await opened();
+    const m = await opened(projectId, { dropApprovalPhase: "decided" });
     await waitUntil(() => !!$(m, "#feed") && !$(m, "#feed .loader"));
-    const file = (tool: string) => requestApproval({ project: projectId, agent: "execbot", tool, input: { path: "a.txt" } });
+    const file = (tool: string) => askApproval({ project: projectId, agent: "execbot", tool, input: { path: "a.txt" } });
     const first = file("Write");
-    await waitUntil(() => text(m, "#apbadge .apn") === "1");
+    await waitUntil(() => text(m, "#apbadge .apn") === "1" && !!$(m, "#feed .apcard:not(.done)"));
     click($(m, "#apbadge"));
     await waitUntil(() => !!$(m, "#appop .apcard"));
     const firstId = $(m, "#appop .apcard")!.getAttribute("data-approval")!;
@@ -661,8 +723,11 @@ describe("web app · approvals", () => {
     const id = $(m, "#feed .apcard:not(.done)")!.getAttribute("data-approval")!;
     await rest("POST", `/approvals/${id}`, { decision: "allow" });
     expect(await second).toEqual({ behavior: "allow" });
+    expect($(m, `#feed .apcard[data-approval="${id}"]`)!.classList.contains("done")).toBe(false);
+    click($(m, `#feed .apcard[data-approval="${id}"] [data-apact="allow"]`));
     await waitUntil(() => $(m, `#feed .apcard[data-approval="${id}"]`)?.classList.contains("done") ?? false);
-    expect(text(m, `#feed .apcard[data-approval="${id}"] .apres`)).toContain("allowed");
+    expect(m.sent.some(r => r.method === "POST" && r.path.endsWith(`/approvals/${id}`))).toBe(true);
+    expect(text(m, `#feed .apcard[data-approval="${id}"] .apres`)).toContain("answered elsewhere");
     expect(m.errors.join("\n")).toBe("");
   });
 });

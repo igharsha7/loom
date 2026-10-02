@@ -400,7 +400,7 @@ export function settleQuestionCards(event, root){
       return "";
     }
     if (e.kind === "approval") {
-      if (p.phase === "requested") return approvalCard({ approvalId: p.approvalId, agent: e.agentId, tool: p.tool, input: p.input, ts: e.ts });
+      if (p.phase === "requested") return approvalCard({ approvalId: p.approvalId, agent: e.agentId, tool: p.tool, input: p.input, sessionOption: p.sessionOption, ts: e.ts });
       if (p.phase === "decided") return '<div class="sys apl">' + (p.behavior === "allow" ? '<span class="ok">\u2713 allowed</span> ' : '<span class="no">\u2715 denied</span> ') +
         esc(p.tool || "tool") + " for " + esc(labelOf(e.agentId)) + (p.message ? " \u2014 " + esc(p.message) : "") + "</div>";
     }

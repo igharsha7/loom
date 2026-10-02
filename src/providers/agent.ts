@@ -123,6 +123,7 @@ export class ProviderAgent extends AdapterBase {
   private readonly ingestion: RuntimeIngestion;
   private current: CurrentTurn | null = null;
   private settled: Promise<void> | null = null;
+  private stopping: Promise<void> | null = null;
   private beforeCompact: ((session: ProviderSession) => void) | undefined;
   private compactingChat: string | undefined;
   private compaction: { chat: string; interrupted?: boolean; resolve: () => void; reject: (error: Error) => void } | null = null;
@@ -403,8 +404,9 @@ export class ProviderAgent extends AdapterBase {
       this.emit({ kind: "error", payload: { message } });
       throw new NativeQuiescenceUnknown(message);
     } catch (error) {
-      if (cur.interrupted && !submitted && !(error instanceof NativeSessionMissing)) {
-        // Stopped before any prompt reached the harness: interrupted, not failed.
+      if (cur.interrupted && (!submitted || error instanceof NativeDispatchRejected) && !(error instanceof NativeSessionMissing)) {
+        // A typed rejection proves non-submission even after sendTurn began
+        // initializing the session. Stopped before the harness: interrupted.
         this.emit({ kind: "status", payload: { state: "interrupted" } });
         if (input.continuity) throw error instanceof NativeDispatchRejected ? error : new NativeDispatchRejected("interrupted before the turn started");
         return;
@@ -541,7 +543,13 @@ export class ProviderAgent extends AdapterBase {
     if (!(await within(10_000))) throw new NativeQuiescenceUnknown(`${this.provider} did not stop after interruption; quiescence unknown`);
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    if (this.stopping) return this.stopping;
+    this.stopping = this.stopAttached().finally(() => { this.stopping = null; });
+    return this.stopping;
+  }
+
+  private async stopAttached(): Promise<void> {
     await this.interrupt();
     const providers = this.providers;
     if (!providers) return;

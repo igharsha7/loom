@@ -1,5 +1,5 @@
 import { agentGlyph,agentLabel,BRAND_TITLES,brandMark,hasBrand,labelOf } from '../agents.js';
-import { settleApprovalCards } from '../approvals.js';
+import { approvalCard,settleApprovalCards } from '../approvals.js';
 import { api,checkBuild } from '../connection.js';
 import { addLogRecord } from '../console.js';
 import { esc,hue,mdToHtml,money,pageGone } from '../format.js';
@@ -307,6 +307,20 @@ export function createThread(view) {
         if (before) feed.insertBefore(n, before); else feed.appendChild(n);
       });
     }
+    function hasApprovalCard(feed, id){
+      return Array.prototype.some.call(feed.querySelectorAll(".apcard[data-approval]"), function(c){ return c.getAttribute("data-approval") === id; });
+    }
+
+    function reconcileApprovals(){
+      if (!view.historyLoaded || !state.approvals || state.approvals.pid !== view.pid) return;
+      var feed = document.getElementById("feed"); if (!feed) return;
+      state.approvals.list.forEach(function(a){
+        if ((a.chat || "main") !== view.chatId) return;
+        if (!hasApprovalCard(feed, a.id)) placeLine(feed, approvalCard(a));
+      });
+      drawEmpty();
+    }
+
     function append(events){
       var feed = document.getElementById("feed"); if (!feed) return;
       // only the loading placeholder gets cleared — never real history
@@ -337,6 +351,7 @@ export function createThread(view) {
         if (e.kind === "approval" && e.payload && e.payload.phase === "decided") {
           if (settleApprovalCards(e.payload.approvalId, e.payload.behavior, e.payload.message)) return;
         }
+        if (e.kind === "approval" && pl.phase === "requested" && hasApprovalCard(feed, pl.approvalId)) return;
         noteLive(e);
         var html = lineFor(e);
         if (!html) return;
@@ -633,6 +648,7 @@ export function createThread(view) {
       });
       var q = pendingStream; pendingStream = [];
       q.forEach(onStreamFrame);
+      reconcileApprovals();
     }
     var PAGE = 80;
     function drawEarlier(more){
@@ -656,6 +672,7 @@ export function createThread(view) {
           evs.forEach(function(e){ settleQuestionCards(e, feed); });
           evs.forEach(function(e){
             if (!state.firstId || e.id < state.firstId) state.firstId = e.id;
+            if (e.kind === "approval" && e.payload && e.payload.phase === "requested" && hasApprovalCard(feed, e.payload.approvalId)) return;
             var html = lineFor(e);
             if (html) placeLine(feed, html, anchor);
           });
@@ -704,9 +721,6 @@ export function createThread(view) {
       state.ws = ws;
       ws.onopen = function(){
         state.wsLive = true; drawStatusbar();
-        // (re)read what's waiting: anything filed while the socket was down
-        // arrived as events nobody heard
-        view.loadApprovals();
         // Open shells only once the socket is truly listening, or the pty's
         // first output (its prompt) is broadcast into the void. Runs once —
         // a reconnect must not spawn another set of terminals.
@@ -717,9 +731,9 @@ export function createThread(view) {
         try {
           var frame = JSON.parse(ev.data);
           // The daemon says hello once this socket is subscribed. Anything the
-          // queue did before then went out as a frame this page never got, so
+          // queue or approvals did before then went out as a frame this page never got, so
           // read it again now (a reconnect lands here too).
-          if (frame.type === "hello") { checkBuild(); view.loadQueue(); return; }
+          if (frame.type === "hello") { checkBuild(); view.loadQueue(); view.loadApprovals(); return; }
           if (frame.type === "term") { view.onTermFrame(frame); return; }
           if (frame.type === "spec" || frame.type === "spec_done") { onSpecFrame(frame); return; }
           // A log record belongs to no chat — a daemon fault has no
@@ -771,5 +785,5 @@ export function createThread(view) {
         if (state.pid === view.pid) state.timers.push(setTimeout(connect, 3000));
       };
     }
-return { drawStatus, refresh, loadHistory, connect, drawEmpty, threadScroller, wantScroll, stickOrFlag, toBottom, liveFor, nearBottom, loadEarlier };
+return { reconcileApprovals, drawStatus, refresh, loadHistory, connect, drawEmpty, threadScroller, wantScroll, stickOrFlag, toBottom, liveFor, nearBottom, loadEarlier };
 }

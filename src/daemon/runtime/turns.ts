@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { UnavailableAdapter } from "../../adapters/unavailable.js";
 import path from "node:path";
 import { BatonManager, NotHolderError } from "../../core/baton.js";
 import * as checkpoints from "../../core/checkpoint.js";
@@ -595,6 +596,7 @@ export class RuntimeTurns {
     if (!isAdapter(agent)) {
       throw new Error(`agent "${target}" is a bridge (read-only) — it cannot take turns`);
     }
+    if (agent instanceof UnavailableAdapter) agent.assertAvailable();
     // Before anything is committed — the baton, the message in the thread, the
     // process — check the agent can afford the turn. Refusing after the message
     // is logged would leave a prompt in the conversation that nothing answers.

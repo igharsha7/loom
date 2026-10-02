@@ -384,3 +384,28 @@ it("discards the old provider cursor, model, cwd and ledger when an agent change
   expect(replacement.calls[0]!.args[0]).not.toHaveProperty("modelSelection");
   expect(directory.get("main", "codex")!.turnLedger).toMatchObject({ fromStart: true, turns: [] });
 });
+
+it("preserves a requested default model while validating and applying rollback (#3)", async () => {
+  const { service, codex, directory } = setup({ capabilities: { sessionModelSwitch: "restart", supportsConversationRollback: true } });
+  const start = codex.startSession.bind(codex);
+  vi.spyOn(codex, "startSession").mockImplementation(async input => {
+    const session = await start(input);
+    session.model = "actual-default";
+    return session;
+  });
+  await service.sendTurn({ threadId: "main", instanceId: "codex", ...base, model: null, input: "one" });
+  const cutoff = Date.now() + 1;
+  await waitUntil(() => Date.now() >= cutoff);
+  const second = await service.sendTurn({ threadId: "main", instanceId: "codex", ...base, model: null, input: "two" });
+  const binding = directory.get("main", "codex")!;
+  expect(binding.runtimePayload).toMatchObject({ model: "actual-default", requestedModel: null });
+  const step = service.planRollback("main", "codex", cutoff, "/repo")!;
+  expect(step).toMatchObject({ model: null, beforeTurnId: second.turnId });
+  await service.validateRollback(step);
+  expect(directory.get("main", "codex")!.turnLedger).toEqual(binding.turnLedger);
+  await service.stopSession("main", "codex");
+  await service.rollbackConversation(step);
+  expect(codex.calls.filter(c => c.op === "startSession")).toHaveLength(2);
+  expect(codex.calls.filter(c => c.op === "startSession")[1]!.args[0]).toMatchObject({ resumeCursor: binding.resumeCursor });
+  expect(codex.calls.find(c => c.op === "rollbackThread")!.args).toEqual(["main", second.turnId]);
+});

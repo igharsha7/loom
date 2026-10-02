@@ -326,7 +326,7 @@ describe("codex · interrupt", () => {
     const events: AdapterEvent[] = [];
     agent.onEvent((e) => events.push(e));
     const running = agent.send({ text: "long one" });
-    await new Promise((r) => setTimeout(r, 500));
+    await waitUntil(() => states(events).includes("turn_started"));
     await agent.interrupt();
     await running;
     expect(rpcOf(bin, "turn/interrupt")).toHaveLength(1);

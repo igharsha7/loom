@@ -404,15 +404,31 @@ it("waits for a late Claude tool result after the turn result (audit #4)", async
   await agent.stop();
 });
 
-it("Stop during initialization never submits the prompt (#1)", async () => {
-  const bin = fakeCodex({ initializeDelayMs: 150 }), { agent } = codexAgent(bin);
-  const sending = agent.send({ text: "must never run" });
-  const outcome = sending.catch(error => error);
-  await waitUntil(() => rpcOf(bin, "initialize").length > 0);
-  await agent.interrupt();
-  expect((await outcome).message).toMatch(/interrupted before/);
+it.each([["codex", false], ["codex", true], ["claude", false], ["claude", true]] as const)("Stop during %s initialization never submits the prompt (continuity=%s, #5)", async (kind, continuity) => {
+  const bin = kind === "codex" ? fakeCodex() : fakeClaude();
+  const { agent, events } = kind === "codex" ? codexAgent(bin) : claudeAgent(bin);
+  await (agent as any).attach();
+  const service = (agent as any).providers.service as import("../../src/providers/service.js").ProviderService;
+  const ensure = service.ensureSession.bind(service);
+  let entered!: () => void, release!: () => void;
+  const initializing = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const spy = vi.spyOn(service, "ensureSession").mockImplementation(async input => { entered(); await gate; return ensure(input); });
+  const sending = agent.send({ text: "must never run", ...(continuity ? {
+    continuity: { runId: "r", bindingId: "b", sessionEpoch: 1, nativeSessionId: null, context: "" },
+  } : {}) }).catch(error => error);
+  await initializing;
+  const stopped = agent.interrupt();
+  release(); await stopped;
+  const outcome = await sending;
+  if (continuity) expect(outcome).toBeInstanceOf((await import("../../src/providers/settlement.js")).NativeDispatchRejected);
+  else expect(outcome).toBeUndefined();
+  expect(of(events, "status")).toContainEqual(expect.objectContaining({ state: "interrupted" }));
+  expect(of(events, "error")).toEqual([]);
   expect(rpcOf(bin, "turn/start")).toHaveLength(0);
-  await agent.stop();
+  expect(stdinOf(bin).filter(m => m.type === "user")).toHaveLength(0);
+  expect(agent.busy()).toBe(false);
+  spy.mockRestore(); await agent.stop();
 });
 
 it("keeps manual compaction alive across idle reaper sweeps (#9)", async () => {

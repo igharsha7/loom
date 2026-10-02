@@ -18,7 +18,7 @@ import { createAgent } from "../../src/adapters/index.js";
 import { NativeUsage } from "../../src/daemon/runtime/native-usage.js";
 import { ProjectRuntime } from "../../src/daemon/runtime.js";
 import { FakeAdapter } from "./fake-adapter.js";
-import { makeProjectDir, tmpDir } from "../helpers.js";
+import { makeProjectDir, tmpDir, waitUntil } from "../helpers.js";
 import { listModelsForKind } from "../../src/daemon/system.js";
 import { setupReport } from "../../src/core/setup.js";
 import * as ades from "../../src/core/ades.js";
@@ -386,4 +386,43 @@ it("preserves explicit historical usage ownership for an unavailable driver (#5)
     driverKind: "retired-usage-driver", accountKey: "work", reachedScope: "window", windows: [], reached: "old" } });
   expect(usage.limitsFor("codex", "work")).toBeNull();
   expect(usage.limitsFor("retired-usage-driver", "work")?.reached).toBe("old");
+});
+
+it("concurrent Stop releases a shared service only once (#1)", async () => {
+  const dir = makeProjectDir();
+  const first = new ProviderAgent("first", remote.kind, dir), second = new ProviderAgent("second", remote.kind, dir);
+  close.push(() => second.stop(), () => first.stop());
+  await first.send({ text: "attach first" }); await second.send({ text: "attach second" });
+  const shared = (first as any).providers;
+  const unregister = shared.service.unregister.bind(shared.service);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const stopping = vi.spyOn(shared.service, "unregister").mockImplementation(async (id: any) => { await gate; await unregister(id); });
+  const reaperStop = vi.spyOn(shared.reaper, "stop");
+  const a = first.stop(), b = first.stop();
+  await waitUntil(() => stopping.mock.calls.length > 0);
+  release(); await Promise.all([a, b]);
+  expect(stopping).toHaveBeenCalledTimes(1);
+  expect(shared.refs).toBe(1); expect(reaperStop).not.toHaveBeenCalled();
+  const third = new ProviderAgent("third", remote.kind, dir); close.push(() => third.stop());
+  await third.send({ text: "attach third" }); expect((third as any).providers).toBe(shared);
+  await second.send({ text: "still attached" });
+});
+
+it("restores and pauses queued prompts for an unavailable driver (#2)", async () => {
+  process.env.LOOM_HOME = tmpDir("missing-queue-home");
+  const dir = makeProjectDir({ agents: [{ id: "missing", kind: "retired-driver" }, { id: "echo", kind: "echo" }] });
+  const runtime = await ProjectRuntime.open({ id: "missing-queue", name: "test", dir });
+  close.push(() => runtime.close());
+  await expect(runtime.sendMessage("direct", "missing")).rejects.toThrow(/unavailable/);
+  runtime.queue.setPaused(true);
+  const first = runtime.enqueue({ text: "keep one", target: { kind: "agent", agentId: "missing" } });
+  const second = runtime.enqueue({ text: "keep two", target: { kind: "agent", agentId: "missing" } });
+  runtime.queue.setPaused(false);
+  await runtime.drainPromptQueue();
+  expect(runtime.queue.snapshot()).toMatchObject({ paused: true, reason: expect.stringContaining("unavailable"), items: [first, second] });
+  expect(runtime.log.list({ kinds: ["message"] })).toEqual([]);
+  runtime.editQueued(first.id, { target: { kind: "agent", agentId: "echo" } });
+  runtime.queue.setPaused(false); await runtime.drainPromptQueue();
+  expect(runtime.log.list({ kinds: ["message"] }).some(e => e.payload.text === "keep one")).toBe(true);
 });

@@ -8,12 +8,12 @@ describe("registry account identities in the browser", () => {
       provider: { driverKind: "server-driver", accountKey, limitsProvider: "server" }, limits: null as any }));
     const project = { agents: roster };
     expect(observeUsage(project, { agentId: "0", kind: "status", ts: 1,
-      payload: { state: "usage_limits", provider: "server", accountKey: "a", windows: [{ id: "weekly", usedPercent: 90 }] } })).toBe(true);
+      payload: { state: "usage_limits", driverKind: "server-driver", provider: "server", accountKey: "a", windows: [{ id: "weekly", usedPercent: 90 }] } })).toBe(true);
     expect(roster[0]!.limits).toEqual(roster[1]!.limits);
     expect(roster[0]!.limits.windows).toHaveLength(1);
     expect(roster[2]!.limits).toBeNull();
     observeUsage(project, { agentId: "2", kind: "status", ts: 2,
-      payload: { state: "usage_limits", provider: "server", accountKey: "a", windows: [] } });
+      payload: { state: "usage_limits", driverKind: "server-driver", provider: "server", accountKey: "a", windows: [] } });
     expect(roster[2]!.limits).toBeNull();
   });
   it("uses roster account identity when legacy events omit it", () => {
@@ -57,4 +57,14 @@ it("uses the historical owner's window scope after the reporter changes driver (
     payload: { state: "usage_limits", provider: "claude", accountKey: "work", windows: [{ id, usedPercent: 100 }], reached } });
   report("five_hour", "five_hour"); report("seven_day", "seven_day"); report("seven_day");
   expect(historical.limits.reached).toBe("five_hour"); expect(switched.limits).toBeNull();
+});
+
+
+it("keeps historical Codex limits off a new driver sharing its limits label (#7)", () => {
+  const agents = ["new-driver", "codex"].map(kind => ({ id: kind, kind,
+    provider: { driverKind: kind, accountKey: "codex", limitsProvider: "codex" }, limits: null as any }));
+  observeUsage({ agents }, { agentId: "codex", kind: "status", ts: 1,
+    payload: { state: "usage_limits", provider: "codex", windows: [{ id: "primary", usedPercent: 80 }] } });
+  expect(agents[0]!.limits).toBeNull();
+  expect(agents[1]!.limits.windows[0].usedPercent).toBe(80);
 });

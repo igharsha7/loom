@@ -48,3 +48,15 @@ it("rejects an old daemon HTTP response after a new daemon socket frame (#3)", a
   resolve(snapshot(99)); await Promise.resolve();
   expect(view.queue.items.map((i: any) => i.id)).toEqual(["two"]); expect(view.queue.paused).toBe(true);
 });
+
+it("keeps the latest HTTP read across a restart before any socket frame (#4)", async () => {
+  const { queue, view, snapshot } = mount();
+  const replies: Array<(value: any) => void> = [];
+  vi.mocked(api).mockImplementation(() => new Promise(resolve => replies.push(resolve)));
+  queue.loadQueue(); queue.loadQueue();
+  replies[1]!({ ...snapshot(1), version: { epoch: "new", revision: 1 } }); await Promise.resolve();
+  replies[0]!({ ...snapshot(8), version: { epoch: "old", revision: 8 } }); await Promise.resolve();
+  queue.onQueueFrame({ ...snapshot(2, ["current"]), version: { epoch: "new", revision: 2 } });
+  expect(view.queue.version).toEqual({ epoch: "new", revision: 2 });
+  expect(view.queue.items.map((i: any) => i.text)).toEqual(["current"]);
+});

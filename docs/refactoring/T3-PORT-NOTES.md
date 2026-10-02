@@ -375,3 +375,30 @@ mount provisioning, legacy public names and historical label migration,
 operator-selected internal engine defaults, remaining non-registry ADE policy,
 management/login UI and remote-provider implementations. These are explicit
 remaining seams, not evidence that all provider-specific code has been removed.
+
+
+## Round 14 audit corrections (2026-10-02)
+
+Concurrent agent Stop now shares one cleanup promise, retaining the shared
+service until its last owner releases it. An unavailable roster entry still
+loads, but legacy dispatch rejects it before logging or starting a background
+turn: a queued prompt is restored and paused, editable or removable as usual.
+Stop during session initialization emits interrupted; Brain still receives
+NativeDispatchRejected and its engine behavior is unchanged.
+
+Rollback plans carry the requested model rather than the resolved model.
+Persisted rewind steps may now contain `model: null` for a default-model
+session. Existing string-valued or omitted models continue loading, and old
+session records still fall back to the resolved model. No version migration,
+provider config change, or queue-file shape change is needed.
+
+Browser queue snapshots accept only the latest issued HTTP request, alongside
+the socket epoch/revision checks. Pending approvals are read after socket hello
+and reconciled into the loaded thread by approval id, including after reconnect.
+Pending approval HTTP snapshots now include the same chat as the log event
+(an in-memory/wire addition), so side-thread requests recover into their own thread.
+Both live cards and the badge preserve sessionOption, correcting Phase 3's
+live-session permission parity gap. Historical browser usage infers legacy
+Codex/Claude ownership from the reported provider label, never the current
+roster's first matching driver. Quiet conditions observe foreground activity
+before the continuity blocker returns, so busy time cannot count as quiet.

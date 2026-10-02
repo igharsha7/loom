@@ -12,7 +12,11 @@ import { state } from '../state.js';
 export function createQueue(view) {
     var retiredEpochs = new Set();
     var frames = 0;
-    function httpSnapshot(j, started) {
+    // Before the first frame, only request order distinguishes snapshots
+    // spanning a restart. An older read must not retire the new epoch.
+    var requests = 0;
+    function httpSnapshot(j, started, request) {
+      if (request !== requests) return;
       if (frames !== started && j.version && view.queue.version && j.version.epoch !== view.queue.version.epoch) return;
       applyQueue(j);
     }
@@ -33,8 +37,8 @@ export function createQueue(view) {
 
 
     function loadQueue(){
-      var started = frames;
-      api("/api/projects/" + view.pid + "/queue").then(function(j){ httpSnapshot(j, started); }).catch(function(){});
+      var started = frames, request = ++requests;
+      api("/api/projects/" + view.pid + "/queue").then(function(j){ httpSnapshot(j, started, request); }).catch(function(){});
     }
 
     function applyQueue(j){
@@ -73,9 +77,9 @@ export function createQueue(view) {
 
     /** Every action here is the same round trip: act, then redraw from the server's answer. */
     function qAct(path, opts){
-      var started = frames;
+      var started = frames, request = ++requests;
       return api("/api/projects/" + view.pid + "/queue" + path, opts)
-        .then(function(j){ httpSnapshot(j, started); })
+        .then(function(j){ httpSnapshot(j, started, request); })
         .catch(function(err){ toast(err.message); loadQueue(); });
     }
 
@@ -121,10 +125,10 @@ export function createQueue(view) {
     function queueFromComposer(text, plan){
       var body = { text: text, target: queueTarget(), chat: view.chatId };
       if (plan) body.plan = true;
-      var started = frames;
+      var started = frames, request = ++requests;
       return api("/api/projects/" + view.pid + "/queue", { method: "POST", body: JSON.stringify(body) })
         .then(function(j){
-          httpSnapshot(j, started);
+          httpSnapshot(j, started, request);
           toast("queued — " + (view.queue.items.length) + " waiting");
         });
     }
