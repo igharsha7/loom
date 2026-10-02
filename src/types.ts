@@ -595,7 +595,7 @@ export interface AgentStatus {
   /** Native harnesses: the provider account's usage-limit windows, from the last report. */
   limits?: ProviderLimits | null;
   /** Registry facts for live usage folding; account identity is independent of driver kind. */
-  provider?: { driverKind: string; accountKey?: string; limitsProvider: string };
+  provider?: { driverKind: string; accountKey?: string; limitsProvider: string; reachedScope?: "account" | "window" };
 }
 
 export interface AgentContextUsage {

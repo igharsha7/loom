@@ -189,7 +189,7 @@ export class ProjectRuntime {
     );
     if (this.continuity) this.harnesses.start();
     // The last readings survive a restart: replay the recent reports.
-    for (const e of log.list({ kinds: ["status", "run_complete", "error"], limit: 500 })) this.nativeUsage.observe(e);
+    for (const e of log.list({ kinds: ["status", "run_complete", "error"], limit: 500 })) this.nativeUsage.observe(e, this.config.agents.find(a => a.id === e.agentId)?.kind);
     this.conversations = new ConversationStore(info.dir);
     const runtime = this;
     this.accounting = new RuntimeAccounting({
@@ -924,7 +924,7 @@ export class ProjectRuntime {
         payload,
       });
       this.continuity?.ingest(event);
-      this.nativeUsage.observe(event);
+      this.nativeUsage.observe(event, cfg.kind);
       if (liveRun) this.offerSwitch(event, cfg.kind, chat);
       if (liveRun) this.afterAgentEvent(event);
       if (liveRun && e.kind === "message" && p.proposedPlan === true) this.saveProposedPlan(agent.id, chat, String(p.text ?? ""));
@@ -1628,9 +1628,11 @@ export class ProjectRuntime {
     if (offered.has(p.reached)) return;
     offered.add(p.reached);
     this.switchOffered.set(agentId, offered);
-    const provider = providerRegistry.accountKey(kind, this.config.agents.find(a => a.id === agentId)?.options ?? {});
+    const options = this.config.agents.find(a => a.id === agentId)?.options ?? {};
+    const provider = providerRegistry.accountKey(kind, options);
+    const account = providerRegistry.accountIdentity(kind, options);
     const alternatives = this.config.agents
-      .filter((a) => a.id !== agentId && isNativeKind(a.kind) && providerRegistry.accountKey(a.kind, a.options ?? {}) !== provider && this.agents.has(a.id) && isAdapter(this.agents.get(a.id)!) && !this.nativeUsage.limitsFor(a.kind, providerRegistry.accountKey(a.kind, a.options ?? {}))?.reached)
+      .filter((a) => a.id !== agentId && isNativeKind(a.kind) && providerRegistry.accountIdentity(a.kind, a.options ?? {}) !== account && this.agents.has(a.id) && isAdapter(this.agents.get(a.id)!) && !this.nativeUsage.limitsFor(a.kind, providerRegistry.accountKey(a.kind, a.options ?? {}))?.reached)
       .map((a) => ({ agentId: a.id, kind: a.kind }));
     const window = (Array.isArray(p.windows) ? (p.windows as Array<{ id?: unknown; resetsAt?: unknown }>) : []).find((w) => w.id === p.reached);
     const where = chat ?? MAIN_CHAT;
@@ -3069,7 +3071,7 @@ export class ProjectRuntime {
           ...sampling(cfg),
           ...(cfg.avatar ? { avatar: cfg.avatar } : {}),
           ...(isNativeKind(cfg.kind) ? { provider: { driverKind: cfg.kind, accountKey: providerRegistry.accountKey(cfg.kind, cfg.options ?? {}),
-            limitsProvider: providerRegistry.require(cfg.kind).limits.provider },
+            limitsProvider: providerRegistry.require(cfg.kind).limits.provider, reachedScope: providerRegistry.require(cfg.kind).limits.reachedScope },
             context: this.nativeUsage.context(cfg.id), limits: this.nativeUsage.limitsFor(cfg.kind, providerRegistry.accountKey(cfg.kind, cfg.options ?? {})) } : {}),
         };
       }),

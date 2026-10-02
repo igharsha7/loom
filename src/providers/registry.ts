@@ -4,7 +4,7 @@ import { NativeDispatchRejected } from "./settlement.js";
 import { fenceLocal } from "./drivers/local.js";
 
 export class ProviderRegistry {
-  private readonly active = new Map<string, { kind: string; instance?: ProviderInstance }>();
+  private readonly active = new Map<string, { kind: string; instance?: ProviderInstance; rejected?: boolean }>();
   private readonly drivers = new Map<string, AnyProviderDriver>();
   constructor(drivers: readonly AnyProviderDriver[] = []) { for (const driver of drivers) this.register(driver); }
   register(driver: AnyProviderDriver): void {
@@ -28,6 +28,10 @@ export class ProviderRegistry {
     try { return driver.accountKey(this.decode(kind, options)); }
     catch { return undefined; } // unavailable or invalid configs remain inspectable in status
   }
+  accountIdentity(kind: string, options: Record<string, unknown> = {}): string | undefined {
+    const account = this.accountKey(kind, options);
+    return account === undefined ? undefined : JSON.stringify([kind, account]);
+  }
   async create(kind: string, instanceId: string, options: Record<string, unknown>, environment: ProviderEnvironment): Promise<ProviderInstance> {
     const driver = this.require(kind);
     let config: unknown;
@@ -39,25 +43,32 @@ export class ProviderRegistry {
     this.active.set(key, { kind });
     try {
       const instance = await driver.create({ instanceId, config, environment });
-      const expected = driver.continuationIdentity(instanceId, config);
-      if (instance.driverKind !== kind || instance.adapter.provider !== kind || instance.instanceId !== instanceId || instance.adapter.instanceId !== instanceId ||
-        instance.continuationIdentity.driverKind !== expected.driverKind || instance.continuationIdentity.continuationKey !== expected.continuationKey ||
-        instance.accountKey !== driver.accountKey(config)) {
-        await instance.dispose();
-        throw new Error("driver returned an instance with mismatched ownership");
-      }
       let disposed = false;
+      const registry = this;
       const materialized: ProviderInstance = { ...instance, async dispose() {
         if (disposed) return;
         await instance.dispose(); // failed fencing retains ownership and remains retryable
         disposed = true;
         registry.active.delete(key);
       } };
-      const registry = this;
+      this.active.set(key, { kind, instance: materialized, rejected: true });
+      const expected = driver.continuationIdentity(instanceId, config);
+      if (instance.driverKind !== kind || instance.adapter.provider !== kind || instance.instanceId !== instanceId || instance.adapter.instanceId !== instanceId ||
+        instance.continuationIdentity.driverKind !== expected.driverKind || instance.continuationIdentity.continuationKey !== expected.continuationKey ||
+        instance.accountKey !== driver.accountKey(config)) {
+        await materialized.dispose();
+        throw new Error("driver returned an instance with mismatched ownership");
+      }
       this.active.set(key, { kind, instance: materialized });
       return materialized;
-    } catch (error) { this.active.delete(key); throw error; }
+    } catch (error) { if (!this.active.get(key)?.instance) this.active.delete(key); throw error; }
   }
+  /** Retry fencing a factory result that could not be safely adopted. */
+  async disposeInstance(cwd: string, instanceId: string): Promise<void> {
+    const entry = this.active.get(JSON.stringify([cwd, instanceId]));
+    if (entry?.rejected) await entry.instance?.dispose();
+  }
+  rejectedInstances(): ProviderInstance[] { return [...this.active.values()].flatMap(v => v.rejected && v.instance ? [v.instance] : []); }
   instances(): ProviderInstance[] { return [...this.active.values()].flatMap(v => v.instance ? [v.instance] : []); }
   /** Old journals retain their original process identity; new journals carry opaque driver records. */
   async fenceRecovery(record: { writer?: WriterRecovery; processGroupId?: number; processIdentity?: string }): Promise<boolean> {

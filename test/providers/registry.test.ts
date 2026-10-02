@@ -19,6 +19,10 @@ import { NativeUsage } from "../../src/daemon/runtime/native-usage.js";
 import { ProjectRuntime } from "../../src/daemon/runtime.js";
 import { FakeAdapter } from "./fake-adapter.js";
 import { makeProjectDir, tmpDir } from "../helpers.js";
+import { listModelsForKind } from "../../src/daemon/system.js";
+import { setupReport } from "../../src/core/setup.js";
+import * as ades from "../../src/core/ades.js";
+import * as base from "../../src/adapters/base.js";
 
 const close: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const f of close.splice(0).reverse()) await f(); });
@@ -176,4 +180,115 @@ describe("provider registry", () => {
     expect((await runtime.status()).agents.find(a => a.id === "server")?.provider).toMatchObject({
       driverKind: remote.kind, accountKey: "test-server", limitsProvider: "test-server" });
   });
+});
+
+it("preserves explicit continuity ownership when Brain rebinds a cursor (B1)", async () => {
+  const dir = makeProjectDir(), agent = new ProviderAgent("rebind", remote.kind, dir, { account: "work" });
+  close.push(() => agent.stop());
+  await agent.send({ text: "one" });
+  const service = (agent as unknown as { providers: { service: ProviderService } }).providers.service;
+  await (agent as unknown as { bindContinuity(service: ProviderService, chat: string, cursor: string): Promise<void> }).bindContinuity(service, "main", "brain-cursor");
+  expect(service.directory.get("main", "rebind")?.continuationKey).toBe("rebind:work");
+  expect((await service.ensureSession({ threadId: "main", instanceId: "rebind", cwd: dir, runtimeMode: "auto-accept-edits", onMissingSession: "fail" })).via).toBe("resumed");
+});
+
+it("resumes an omitted persisted default model when runtime requests null (B2)", async () => {
+  const directory = new MemorySessionDirectory(), service = new ProviderService(directory);
+  const adapter = new FakeAdapter("default-model", { capabilities: { sessionModelSwitch: "restart" } });
+  service.register(adapter); close.push(() => service.stopAll());
+  const input = { threadId: "main", instanceId: adapter.instanceId, cwd: "/server", runtimeMode: "auto-accept-edits" as const, model: null };
+  const first = await service.ensureSession(input); await service.stopSession("main", adapter.instanceId);
+  expect(directory.get("main", adapter.instanceId)?.runtimePayload?.model).toBeUndefined();
+  const resumed = await service.ensureSession(input);
+  expect(resumed.via).toBe("resumed"); expect(resumed.session.resumeCursor).toBe(first.session.resumeCursor);
+  await service.stopSession("main", adapter.instanceId);
+  expect((await service.ensureSession({ ...input, model: "other" })).via).toBe("fresh");
+});
+
+it("qualifies identical account labels by driver for limits and suggestions (B3)", () => {
+  const usage = new NativeUsage();
+  usage.observe({ kind: "status", agentId: "claude", ts: 1, payload: { state: "usage_limits", provider: "claude", accountKey: "work", windows: [], reached: "five_hour" } });
+  usage.observe({ kind: "status", agentId: "codex", ts: 2, payload: { state: "usage_limits", provider: "codex", accountKey: "work", windows: [] } });
+  expect(usage.limitsFor("claude-code", "work")?.reached).toBe("five_hour");
+  expect(usage.limitsFor("codex", "work")?.reached).toBeNull();
+  expect(providerRegistry.accountIdentity("codex", { accountKey: "work" })).not.toBe(providerRegistry.accountIdentity("claude-code", { accountKey: "work" }));
+});
+
+it("retains mismatched factory writers when disposal fails and exposes a retry (B4)", async () => {
+  const dispose = vi.fn().mockRejectedValueOnce(new NativeQuiescenceUnknown("unfenced")).mockResolvedValue(undefined);
+  const registry = new ProviderRegistry([{ ...remote, async create(input) {
+    return { ...await remote.create(input), accountKey: "wrong", dispose };
+  } }]);
+  await expect(registry.create(remote.kind, "bad", {}, environment("/server"))).rejects.toBeInstanceOf(NativeQuiescenceUnknown);
+  expect(registry.instances()).toHaveLength(1);
+  await expect(registry.create(remote.kind, "bad", {}, environment("/server"))).rejects.toThrow(/already materialized/);
+  await registry.instances()[0]!.dispose(); expect(registry.instances()).toHaveLength(0);
+  await expect(registry.create(remote.kind, "bad", {}, environment("/server"))).rejects.toThrow(/mismatched ownership/);
+  expect(registry.instances()).toHaveLength(0);
+});
+
+
+it("discovers models using agent config and separates cached configurations (B5)", async () => {
+  const models = vi.fn(async (config: Record<string, unknown>) => ({ models: [String(config.bin), String(config.account), String(config.endpoint)], source: "api" as const }));
+  const driver = { ...remote, kind: "registry-model-test", models };
+  providerRegistry.register(driver);
+  const first = { bin: "first", account: "work", endpoint: "one" }, second = { ...first, endpoint: "two" };
+  expect((await listModelsForKind(driver.kind, first)).models).toEqual(["first", "work", "one"]);
+  expect((await listModelsForKind(driver.kind, second)).models).toEqual(["first", "work", "two"]);
+  await listModelsForKind(driver.kind, { endpoint: "one", account: "work", bin: "first" });
+  expect(models).toHaveBeenCalledTimes(2); expect(models).toHaveBeenCalledWith(first);
+});
+
+it("includes registered driver checks in setup without concrete core probes (B7)", async () => {
+  const selfCheck = vi.fn(async () => [{ name: "installed", ok: true, detail: "server available" }, { name: "signed in", ok: false, detail: "sign in to server" }]);
+  const driver = { ...remote, kind: "registry-setup-test", selfCheck };
+  providerRegistry.register(driver);
+  const detected = vi.spyOn(ades, "detectAdes").mockResolvedValue({});
+  const builtins = builtInDrivers.map(driver => vi.spyOn(driver, "selfCheck").mockResolvedValue([{ name: "installed", ok: false, detail: "fake" }]));
+  try {
+    expect((await setupReport()).agents.find(a => a.kind === driver.kind)).toMatchObject({ found: true, authed: false, authDetail: "sign in to server" });
+    expect(selfCheck).toHaveBeenCalledOnce();
+  } finally { detected.mockRestore(); builtins.forEach(mock => mock.mockRestore()); }
+});
+
+it("uses the emitting driver when two drivers share a limits label (B3)", () => {
+  const other = { ...remote, kind: "registry-shared-limits" };
+  providerRegistry.register(other);
+  const usage = new NativeUsage();
+  const event = { kind: "status" as const, agentId: "a", ts: 1, payload: { state: "usage_limits", provider: "test-server", accountKey: "work", windows: [], reached: "blocked" } };
+  usage.observe(event, remote.kind);
+  usage.observe({ ...event, payload: { ...event.payload, reached: null } }, other.kind);
+  expect(usage.limitsFor(remote.kind, "work")?.reached).toBe("blocked");
+  expect(usage.limitsFor(other.kind, "work")?.reached).toBeNull();
+});
+
+it("lets ordinary Stop retry fencing a rejected factory result (B4)", async () => {
+  const dispose = vi.fn().mockRejectedValueOnce(new NativeQuiescenceUnknown("unfenced")).mockResolvedValue(undefined);
+  let mismatch = true;
+  const driver = { ...remote, kind: "registry-rejected-factory", async create(input: Parameters<typeof remote.create>[0]) {
+    const adapter = new FakeAdapter(input.instanceId, { provider: this.kind });
+    return { ...await remote.create(input), driverKind: this.kind, adapter,
+      continuationIdentity: { driverKind: this.kind, continuationKey: "test" }, accountKey: mismatch ? "wrong" : remote.accountKey(input.config), dispose };
+  }, continuationIdentity: () => ({ driverKind: "registry-rejected-factory", continuationKey: "test" }) };
+  providerRegistry.register(driver);
+  const agent = new ProviderAgent("rejected", driver.kind, makeProjectDir()); close.push(() => agent.stop());
+  await expect(agent.send({ text: "one" })).rejects.toThrow();
+  expect(providerRegistry.instances().some(instance => instance.instanceId === "rejected")).toBe(true);
+  expect(agent.busy()).toBe(true);
+  await agent.interrupt(); expect(agent.busy()).toBe(false);
+  expect(providerRegistry.instances().some(instance => instance.instanceId === "rejected")).toBe(false);
+  mismatch = false; await agent.send({ text: "retry" }); expect(agent.busy()).toBe(false);
+});
+
+
+it("uses Claude's offline auth status check and preserves unknown auth (B7)", async () => {
+  const driver = providerRegistry.require("claude-code"), bin = path.join(tmpDir("auth-check"), "claude");
+  fs.writeFileSync(bin, "fake binary");
+  const output = vi.spyOn(base, "cliOutput").mockImplementation(async (_bin, args) => ({ code: 0, out: args.includes("--version") ? "Claude Code fake" : '{"loggedIn":false}' }));
+  try {
+    expect(await driver.selfCheck({ bin })).toContainEqual({ name: "signed in", ok: false, detail: "not signed in — run: claude /login" });
+    expect(output.mock.calls.map(call => call[1])).toEqual([["--version"], ["auth", "status", "--json"]]);
+    output.mockResolvedValue({ code: 1, out: "unsupported command" });
+    expect((await driver.selfCheck({ bin })).some(check => check.name === "signed in")).toBe(false);
+  } finally { output.mockRestore(); }
 });

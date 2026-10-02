@@ -1109,3 +1109,11 @@ it("can finish files-only recovery from the journal even if its target ref was p
   expect(fs.readFileSync(path.join(dir, "app.txt"), "utf8")).toBe("v0\n");
   expect(fs.existsSync(journal)).toBe(false);
 });
+
+it("offers a different driver even when both accounts are called work (B3)", async () => {
+  const { rt } = await project({ continuity: false });
+  for (const config of rt.config.agents) config.options = { ...config.options, accountKey: "work" };
+  const event = { kind: "status" as const, agentId: "codex", ts: Date.now(), payload: { state: "usage_limits", provider: "codex", accountKey: "work", windows: [], reached: "primary" } };
+  (rt as unknown as { offerSwitch(event: unknown, kind: string): void }).offerSwitch(event, "codex");
+  expect(rt.log.list().find(e => e.payload.state === "switch_suggested")?.payload.alternatives).toEqual([{ agentId: "claude", kind: "claude-code" }]);
+});

@@ -21,7 +21,7 @@ export class NativeUsage {
   private readonly limits = new Map<string, ProviderLimits>();
 
   /** Fold one adapter event in. Unrelated events are ignored. */
-  observe(event: Pick<LoomEvent, "kind" | "agentId" | "payload" | "ts">): void {
+  observe(event: Pick<LoomEvent, "kind" | "agentId" | "payload" | "ts">, driverKind?: string): void {
     const agent = event.agentId;
     if (!agent) return;
     const p = event.payload as Record<string, unknown>;
@@ -50,14 +50,16 @@ export class NativeUsage {
       case "usage_limits": {
         if (typeof p.provider !== "string" || !Array.isArray(p.windows)) return;
         // A report can carry one window (Claude sends one per event): merge by id.
-        const account = typeof p.accountKey === "string" ? p.accountKey : p.provider;
+        const driver = providerRegistry.get(driverKind ?? (typeof p.driverKind === "string" ? p.driverKind : ""))
+          ?? providerRegistry.list().find(d => d.limits.provider === p.provider);
+        const account = JSON.stringify([driver?.kind ?? p.provider, typeof p.accountKey === "string" ? p.accountKey : p.provider]);
         const previous = this.limits.get(account);
         const windows = new Map((previous?.windows ?? []).map(w => [w.id, w]));
         for (const w of p.windows as ProviderLimits["windows"]) if (w && typeof w.id === "string") windows.set(w.id, w);
         const blocked = this.blocked.get(account) ?? new Set<string>();
         // Account snapshots supersede all reached reasons; window reports
         // only clear the windows they update. The driver declares that scope.
-        if ((p.reachedScope ?? providerRegistry.list().find(d => d.limits.provider === p.provider)?.limits.reachedScope) === "account") blocked.clear();
+        if ((p.reachedScope ?? driver?.limits.reachedScope) === "account") blocked.clear();
         else for (const w of p.windows as ProviderLimits["windows"]) if (w.id !== p.reached) blocked.delete(w.id);
         if (typeof p.reached === "string") blocked.add(p.reached);
         this.blocked.set(account, blocked);
@@ -73,6 +75,6 @@ export class NativeUsage {
   context(agentId: string): AgentContextUsage | null { return this.contexts.get(agentId) ?? null; }
   limitsFor(kind: string, accountKey?: string): ProviderLimits | null {
     const provider = accountKey ?? providerOf(kind);
-    return provider ? this.limits.get(provider) ?? null : null;
+    return provider ? this.limits.get(JSON.stringify([kind, provider])) ?? null : null;
   }
 }

@@ -80,3 +80,24 @@ it("a closed Claude prompt queue rejects without native acceptance (port audit #
     expect(events.some(e => e.type === "turn.aborted")).toBe(true);
   } finally { await adapter.stopAll(); }
 });
+
+import { quiesceProcessGroup } from "../../src/adapters/base.js";
+
+it("retries transient EPERM until group disappearance proves quiescence (A1)", async () => {
+  let probes = 0;
+  const signal = vi.spyOn(process, "kill").mockImplementation((_pid, value) => {
+    if (value === 0) throw Object.assign(new Error(), { code: ++probes < 3 ? "EPERM" : "ESRCH" });
+    return true;
+  });
+  try { await quiesceProcessGroup(12345); expect(probes).toBe(3); }
+  finally { signal.mockRestore(); }
+});
+
+it("keeps persistent EPERM uncertain and bounded (A1)", async () => {
+  vi.useFakeTimers();
+  const signal = vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error(), { code: "EPERM" }); });
+  try {
+    const result = expect(quiesceProcessGroup(12345)).rejects.toBeInstanceOf(NativeQuiescenceUnknown);
+    await vi.advanceTimersByTimeAsync(6000); await result;
+  } finally { signal.mockRestore(); vi.useRealTimers(); }
+});

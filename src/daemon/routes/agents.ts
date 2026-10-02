@@ -94,7 +94,7 @@ export function registerAgentsRoutes(app: Express, withRuntime: WithRuntime): vo
     withRuntime(async (rt, req, res) => {
       const agent = rt.config.agents.find((a) => a.id === String(req.params.agentId));
       if (!agent) return void res.status(404).json({ error: "unknown agent" });
-      const { models, source } = await listModelsForKind(agent.kind);
+      const { models, source } = await listModelsForKind(agent.kind, agent.options ?? {});
       res.json({ kind: agent.kind, count: models.length, models, source });
     }),
   );

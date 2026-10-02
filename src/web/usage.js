@@ -43,12 +43,19 @@ function observeUsage(project, e){
     if (!provider) return false;
     project.agents.forEach(function(a){
       var owner = a.provider && a.provider.accountKey;
-      if (owner ? owner !== account : a.id !== agent.id) return;
+      var driver = agent.provider && agent.provider.driverKind || agent.kind;
+      var ownerDriver = a.provider && a.provider.driverKind || a.kind;
+      if (ownerDriver !== driver || (owner ? owner !== account : a.id !== agent.id)) return;
       var byId = {}, order = [];
       ((a.limits && a.limits.windows) || []).concat(p.windows).forEach(function(w){
         if (!w || !w.id) return; if (!(w.id in byId)) order.push(w.id); byId[w.id] = w;
       });
-      a.limits = { provider: provider, windows: order.map(function(id){ return byId[id]; }), reached: p.reached || null, at: e.ts };
+      var scope = p.reachedScope || (agent.provider && agent.provider.reachedScope) || (provider === "claude" ? "window" : "account");
+      var blocked = scope === "account" ? [] : (a._blockedLimits || (a.limits && a.limits.reached ? [a.limits.reached] : [])).slice();
+      if (scope !== "account") p.windows.forEach(function(w){ if (w.id !== p.reached) blocked = blocked.filter(function(id){ return id !== w.id; }); });
+      if (p.reached && blocked.indexOf(p.reached) < 0) blocked.push(p.reached);
+      a._blockedLimits = blocked;
+      a.limits = { provider: provider, windows: order.map(function(id){ return byId[id]; }), reached: blocked[0] || null, at: e.ts };
     });
     return true;
   }

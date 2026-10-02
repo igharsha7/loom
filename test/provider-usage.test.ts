@@ -23,3 +23,20 @@ describe("registry account identities in the browser", () => {
     expect(agents[0]!.limits).toMatchObject({ provider: "codex" });
   });
 });
+
+it("preserves unrelated blocked windows and clears only updated reasons (A4)", () => {
+  const agent = { id: "a", kind: "claude-code", limits: null as any };
+  const fold = (id: string, reached?: string) => observeUsage({ agents: [agent] }, { agentId: "a", kind: "status", ts: 1,
+    payload: { state: "usage_limits", provider: "claude", windows: [{ id, usedPercent: reached ? 100 : 10 }], reached } });
+  fold("five_hour", "five_hour"); fold("seven_day", "seven_day"); fold("seven_day");
+  expect(agent.limits.reached).toBe("five_hour"); fold("five_hour"); expect(agent.limits.reached).toBeNull();
+});
+
+it("keeps identically named accounts on different drivers separate (B3)", () => {
+  const agents = ["codex", "claude-code"].map(kind => ({ id: kind, kind, provider: { driverKind: kind, accountKey: "work" }, limits: null as any }));
+  observeUsage({ agents }, { agentId: "claude-code", kind: "status", ts: 1,
+    payload: { state: "usage_limits", provider: "claude", accountKey: "work", windows: [], reached: "five_hour" } });
+  observeUsage({ agents }, { agentId: "codex", kind: "status", ts: 2,
+    payload: { state: "usage_limits", provider: "codex", accountKey: "work", windows: [] } });
+  expect(agents[1]!.limits.reached).toBe("five_hour"); expect(agents[0]!.limits.reached).toBeNull();
+});

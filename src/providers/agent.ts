@@ -81,6 +81,7 @@ function releaseProviders(dir: string, p: ProjectProviders): void {
 /** Stop every warm session in this process (daemon shutdown, tests). */
 export async function stopAllProviderSessions(): Promise<void> {
   await Promise.allSettled([...projects.values()].map(p => p.service.stopAll()));
+  await Promise.allSettled(providerRegistry.rejectedInstances().map(instance => instance.dispose()));
 }
 
 // ---------------------------------------------------------------------------
@@ -412,7 +413,8 @@ export class ProviderAgent extends AdapterBase {
       if (error instanceof NativeQuiescenceUnknown && !input.continuity) {
         // Legacy dispatch has no persisted ownership receipt. Stop the writer
         // before releasing its in-memory lock. A failed stop keeps Stop usable.
-        try { await this.providers?.service.stopSession(chat, this.id); }
+        if (!this.providers) retainWriter = true; // rejected factory writer is retained in the registry
+        else try { await this.providers.service.stopSession(chat, this.id); }
         catch { retainWriter = true; throw error; }
       }
       throw error;
@@ -453,7 +455,7 @@ export class ProviderAgent extends AdapterBase {
     if ((binding?.resumeCursor ?? null) !== nativeSessionId) {
       // Another native session: its turns aren't on record here.
       service.directory.upsert({ threadId: chat, instanceId: this.id, provider: this.provider, status: "stopped",
-        resumeCursor: nativeSessionId, runtimePayload: { cwd: this.projectDir }, runtimeMode: this.runtimeMode(), turnLedger: null });
+        continuationKey: this.instance?.continuationIdentity.continuationKey, resumeCursor: nativeSessionId, runtimePayload: { cwd: this.projectDir }, runtimeMode: this.runtimeMode(), turnLedger: null });
     }
   }
 
@@ -504,6 +506,10 @@ export class ProviderAgent extends AdapterBase {
 
   async interrupt(): Promise<void> {
     const cur = this.current;
+    if (!this.providers) {
+      await providerRegistry.disposeInstance(this.projectDir, this.id);
+      if (cur?.quiescenceUnknown) { this.current = null; this._busy = false; }
+    }
     if (!cur) {
       if (this.compaction) {
         this.compaction.interrupted = true;

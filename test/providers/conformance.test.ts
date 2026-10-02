@@ -1,4 +1,6 @@
 /** Every built-in runs the same semantic scenarios; only native fixture dialects differ. */
+import fs from "node:fs";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { builtInDrivers } from "../../src/providers/builtInDrivers.js";
 import { providerRegistry } from "../../src/providers/registry.js";
@@ -9,7 +11,7 @@ import { RuntimeIngestion, type IngestedEvent } from "../../src/providers/ingest
 import { NativeQuiescenceUnknown } from "../../src/providers/settlement.js";
 import * as processes from "../../src/providers/process.js";
 import { makeProjectDir, waitUntil } from "../helpers.js";
-import { CLAUDE_OK, CODEX_OK, claudeResult, claudeText, codexDone, codexNotify, fakeClaude, fakeCodex, stdinOf, type Step } from "../native-fakes.js";
+import { CLAUDE_OK, CODEX_OK, claudeResult, claudeText, codexDone, codexNotify, fakeClaude, fakeCodex, stdinOf, turnsOf, type Step } from "../native-fakes.js";
 
 interface Fixture {
   make(script?: Step[]): string;
@@ -18,6 +20,7 @@ interface Fixture {
   closeSubmission?(instance: ProviderInstance): void;
   writer(kind: "command" | "child", finish: boolean): Step[];
   compact: Step[];
+  late(): string;
   history?(bin: string): Record<string, unknown>;
 }
 const started = codexNotify("turn/started", { turn: { id: "$TURN" } });
@@ -31,6 +34,11 @@ const fixtures: Record<string, Fixture> = {
         : codexNotify("item/completed", { item: { id: "cmd", type: "commandExecution", command: "write", status: "completed", exitCode: 0 } });
       return [started, open, codexDone(), ...(finish ? [{ sleep: 120 }, close] : [])];
     }, compact: CODEX_OK,
+    late: () => fakeCodex({ scripts: [
+      [started, codexNotify("item/started", { item: { id: "late-tool", type: "commandExecution", command: "old", status: "inProgress" } }), codexDone(), { sleep: 300 },
+        codexNotify("item/completed", { item: { id: "late-tool", type: "commandExecution", command: "old", status: "completed", exitCode: 0 } })],
+      [started, { sleep: 600 }, codexDone()],
+    ] }),
   },
   "claude-code": {
     make: script => fakeClaude({ ...(script ? { script } : {}) }), ok: CLAUDE_OK, refusal: () => fakeClaude(),
@@ -43,6 +51,11 @@ const fixtures: Record<string, Fixture> = {
       return [open, claudeResult(), ...(finish ? [{ sleep: 120 }, close] : [])];
     },
     compact: [{ out: { type: "system", subtype: "compact_boundary", compact_metadata: { trigger: "manual", pre_tokens: 1000 }, session_id: "$SESSION" } }, claudeResult()],
+    late: () => fakeClaude({ scripts: [
+      [{ out: { type: "assistant", message: { content: [{ type: "tool_use", id: "late-tool", name: "Bash", input: { command: "old" } }] }, parent_tool_use_id: null } },
+        claudeResult(), { sleep: 300 }, { out: { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "late-tool", content: "old result" }] }, parent_tool_use_id: null } }],
+      [{ sleep: 600 }, ...CLAUDE_OK],
+    ] }),
     history(bin) {
       const snapshots = new Map<string, Array<{ type: string; uuid: string; message: unknown }>>();
       const messages = async (session: string) => snapshots.get(session) ?? stdinOf(bin).filter(m => m.type === "user" && typeof m.uuid === "string")
@@ -62,11 +75,12 @@ for (const driver of builtInDrivers) describe(`${driver.metadata.displayName} ad
   const fixture = fixtures[driver.kind]!;
   async function instance(script?: Step[], binary?: string) {
     const bin = binary ?? fixture.make(script), dir = makeProjectDir();
-    const value = await providerRegistry.create(driver.kind, "agent", { bin, ...fixture.history?.(bin) }, { cwd: dir, canAsk: () => false, mcpServers: () => [] });
+    const history = fixture.history?.(bin);
+    const value = await providerRegistry.create(driver.kind, "agent", { bin, ...history }, { cwd: dir, canAsk: () => false, mcpServers: () => [] });
     dispose.push(() => value.dispose());
     const events: ProviderRuntimeEvent[] = []; value.adapter.onEvent(e => events.push(e));
     await value.adapter.startSession({ instanceId: "agent", threadId: "main", cwd: dir, runtimeMode: "auto-accept-edits" });
-    return { value, bin, dir, events };
+    return { value, bin, dir, events, history };
   }
   function agent(script?: Step[], options: Record<string, unknown> = {}) {
     const bin = fixture.make(script), value = new ProviderAgent("agent", driver.kind, makeProjectDir(), { bin, ...fixture.history?.(bin), ...options });
@@ -90,17 +104,19 @@ for (const driver of builtInDrivers) describe(`${driver.metadata.displayName} ad
     expect(events.some(e => e.type === "turn.accepted" || e.type === "turn.started" && !e.payload.local)).toBe(false);
   });
   it("preserves late-event correlation when the next turn is tagged", async () => {
-    const { value, events } = await instance();
+    const { value, events } = await instance(undefined, fixture.late());
     const out: IngestedEvent[] = [], ingestion = new RuntimeIngestion({ append: event => out.push(event) });
     ingestion.tagTurn("main", "agent", tags); value.adapter.onEvent(e => ingestion.ingest(e));
     const turn = await value.adapter.sendTurn({ instanceId: "agent", threadId: "main", input: "work" });
     await waitUntil(() => events.some(e => e.type === "turn.completed" && e.turnId === turn.turnId));
     ingestion.tagTurn("main", "agent", { ...tags, loomRunId: "next" });
-    const before = out.length;
-    // A fresh late item on the completed native turn must not acquire next's tags.
-    const item = events.find(e => e.type === "item.completed" && e.turnId === turn.turnId)!;
-    ingestion.ingest({ ...item, eventId: crypto.randomUUID(), itemId: "late-item" });
-    expect(out).toHaveLength(before);
+    const next = await value.adapter.sendTurn({ instanceId: "agent", threadId: "main", input: "next" });
+    await waitUntil(() => events.some(e => e.type === "item.completed" && e.itemId === "late-tool"));
+    const late = events.find(e => e.type === "item.completed" && e.itemId === "late-tool")!;
+    expect(late.turnId).toBe(turn.turnId);
+    expect(late.turnId).not.toBe(next.turnId);
+    expect(out.some(e => e.kind === "tool_call" && e.payload.loomRunId === "next")).toBe(false);
+    await waitUntil(() => events.some(e => e.type === "turn.completed" && e.turnId === next.turnId));
   });
   it.each(["command", "child"] as const)("waits for %s writers after the main turn ends", async kind => {
     const { value } = agent(fixture.writer(kind, true), { commandSettleMs: 1000 });
@@ -115,12 +131,25 @@ for (const driver of builtInDrivers) describe(`${driver.metadata.displayName} ad
     await value.interrupt(); expect(value.busy()).toBe(false);
   });
   it("cancels active work and fences all session writers with Stop", async () => {
-    const { value, events } = await instance([fixture.ok[0]!, { sleep: 10_000 }, ...fixture.ok.slice(1)]);
+    const marker = path.join(makeProjectDir(), "writer-heartbeat");
+    const writer = `const fs = require('node:fs'); fs.writeFileSync(${JSON.stringify(marker + '.pid')}, String(process.pid)); setInterval(() => fs.appendFileSync(${JSON.stringify(marker)}, 'x'), 10);`;
+    const { value, events, bin } = await instance([{ spawn: writer }, fixture.ok[0]!, { sleep: 10_000 }, ...fixture.ok.slice(1)]);
     const turn = await value.adapter.sendTurn({ instanceId: "agent", threadId: "main", input: "work" });
+    await waitUntil(() => fs.existsSync(marker));
+    const parent = turnsOf(bin)[0]!.pid, child = Number(fs.readFileSync(marker + ".pid", "utf8"));
+    dispose.push(async () => { try { process.kill(child, "SIGKILL"); } catch { /* already gone */ } });
     await value.adapter.interruptTurn("main", turn.turnId);
     await value.adapter.stopSession("main");
     expect(value.adapter.hasSession("main")).toBe(false);
     expect(events.some(e => e.type === "session.exited")).toBe(true);
+    for (const pid of [parent, child]) {
+      let failure: unknown;
+      try { process.kill(pid, 0); } catch (error) { failure = error; }
+      expect(failure).toMatchObject({ code: "ESRCH" });
+    }
+    const stopped = fs.readFileSync(marker, "utf8");
+    await new Promise(resolve => setTimeout(resolve, 150));
+    expect(fs.readFileSync(marker, "utf8")).toBe(stopped);
   });
   it("restarts and resumes the same native conversation", async () => {
     const { value, events, dir } = await instance();
@@ -140,7 +169,7 @@ for (const driver of builtInDrivers) describe(`${driver.metadata.displayName} ad
   });
   it("rolls back at a native turn boundary where supported", async () => {
     if (!driver.capabilities.supportsConversationRollback) return;
-    const { value, events } = await instance();
+    const { value, events, bin, history } = await instance();
     const turns: string[] = [];
     for (const input of ["one", "two"]) {
       const turn = await value.adapter.sendTurn({ instanceId: "agent", threadId: "main", input }); turns.push(turn.turnId);
@@ -149,13 +178,32 @@ for (const driver of builtInDrivers) describe(`${driver.metadata.displayName} ad
     await value.adapter.validateRollback!("main", turns[1]!);
     const rolled = await value.adapter.rollbackThread!("main", turns[1]!);
     expect(rolled.resumeCursor).toBeTruthy();
+    if (driver.kind === "codex") {
+      const history = JSON.parse(fs.readFileSync(path.join(path.dirname(bin), `${String(rolled.resumeCursor)}.history.json`), "utf8"));
+      expect(history).toEqual([turns[0]]);
+    } else {
+      const actual = history!.claudeHistory as { messages(id: string): Promise<Array<{ uuid: string }>> };
+      expect((await actual.messages(String(rolled.resumeCursor))).map(m => m.uuid)).toEqual([turns[0], `reply-${turns[0]}`]);
+      expect(value.adapter.hasSession("main")).toBe(false);
+    }
   });
   it("retains handles when fencing cannot prove quiescence, so Stop can retry", async () => {
-    const { value } = await instance();
+    const marker = path.join(makeProjectDir(), "retry-writer");
+    const writer = `require('node:fs').writeFileSync(${JSON.stringify(marker)}, String(process.pid)); setInterval(() => {}, 10);`;
+    const { value, events } = await instance([{ spawn: writer }, ...fixture.ok]);
+    const turn = await value.adapter.sendTurn({ instanceId: "agent", threadId: "main", input: "work" });
+    await waitUntil(() => fs.existsSync(marker) && events.some(e => e.type === "turn.completed" && e.turnId === turn.turnId));
+    const child = Number(fs.readFileSync(marker, "utf8"));
+    dispose.push(async () => { try { process.kill(child, "SIGKILL"); } catch { /* already gone */ } });
     const stop = vi.spyOn(processes, "stopHarness").mockRejectedValueOnce(new NativeQuiescenceUnknown("fencing unavailable"));
     await expect(value.adapter.stopSession("main")).rejects.toBeInstanceOf(NativeQuiescenceUnknown);
     expect(value.adapter.hasSession("main")).toBe(true);
+    expect(events.some(e => e.type === "session.exited")).toBe(false);
+    expect(process.kill(child, 0)).toBe(true);
     stop.mockRestore(); await value.adapter.stopSession("main");
     expect(value.adapter.hasSession("main")).toBe(false);
+    let failure: unknown;
+    try { process.kill(child, 0); } catch (error) { failure = error; }
+    expect(failure).toMatchObject({ code: "ESRCH" });
   });
 });

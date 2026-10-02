@@ -17,7 +17,7 @@ import path from "node:path";
 import os from "node:os";
 import { GuiChatDriver } from "../adapters/bridges/gui-chat.js";
 import { agyBin } from "../adapters/antigravity-cli.js";
-import { codexBin } from "../providers/codex/adapter.js";
+import { providerRegistry } from "../providers/registry.js";
 import { profileFor } from "../adapters/bridges/profiles.js";
 import { ADES, detectAdes } from "./ades.js";
 import { listProviders } from "./providers.js";
@@ -107,15 +107,8 @@ const AUTH: Record<string, string> = {
  * in · Please run /login" to anyone who asked. It isn't impossible. It just
  * needs asking the right question.
  *
- * Every probe here is free and offline-ish:
- *   codex     — `login status` reports without touching a model
- *   opencode  — `auth list` reads its own credentials file
- *   claude    — a `-p` probe; when signed out it refuses in ~30ms having called
- *               nothing. When signed IN it would cost a token or two, so it is
- *               capped hard and a slow answer counts as "signed in": only the
- *               instant refusal is diagnostic.
- *   grok      — no status command; its ~/.grok/auth.json session is read
- *               (shape only) instead.
+ * Registry drivers supply their own offline checks. The remaining adapters
+ * use local status commands or inspect credential-file shapes.
  */
 async function probeAuth(kind: string): Promise<{ authed: boolean | null; detail?: string }> {
   const run = (cmd: string, args: string[], ms: number): Promise<{ code: number | null; out: string }> =>
@@ -147,28 +140,10 @@ async function probeAuth(kind: string): Promise<{ authed: boolean | null; detail
     });
 
   try {
-    if (kind === "codex") {
-      const bin = codexBin();
-      if (!bin) return { authed: null };
-      const { out } = await run(bin, ["login", "status"], 6000);
-      if (/logged in/i.test(out)) return { authed: true };
-      if (/not logged in|no auth/i.test(out)) return { authed: false, detail: out.trim().slice(0, 60) };
-      return { authed: null };
-    }
     if (kind === "opencode") {
       const { out } = await run("opencode", ["auth", "list"], 8000);
       // its list marks each stored credential with a bullet
       return /●/.test(out) ? { authed: true } : { authed: null };
-    }
-    if (kind === "claude-code") {
-      // Signed out, this refuses instantly and for free. Signed in, it would
-      // start a real turn — so the timeout is the budget, and hitting it is a
-      // yes, not a maybe.
-      const { out } = await run("claude", ["-p", "hi", "--output-format", "json"], 6000);
-      if (/not logged in|please run \/login|invalid api key/i.test(out)) {
-        return { authed: false, detail: "the CLI says: Not logged in" };
-      }
-      return { authed: true };
     }
     if (kind === "grok-code") {
       // grok has no status command, but it keeps its session in ~/.grok/auth.json:
@@ -306,7 +281,17 @@ export async function setupReport(): Promise<SetupReport> {
   const available = await detectAdes();
 
   const agents: AgentStatus[] = await Promise.all(
-    ADES.filter((a) => a.tier === "adapter").map(async (a) => {
+    [...ADES.filter((a) => a.tier === "adapter" && !providerRegistry.get(a.kind)),
+      ...providerRegistry.list().map(driver => ({ kind: driver.kind, label: driver.metadata.displayName }))].map(async (a) => {
+      const driver = providerRegistry.get(a.kind);
+      if (driver) {
+        const checks = await driver.selfCheck(providerRegistry.decode(a.kind, {})).catch(error => [{ name: "installed", ok: false, detail: String(error) }]);
+        const installed = checks.find(check => check.name === "installed");
+        const signedIn = checks.find(check => check.name === "signed in");
+        return { kind: a.kind, label: a.label, found: installed?.ok ?? await driver.available(providerRegistry.decode(a.kind, {})).catch(() => false),
+          install: INSTALL[a.kind] ?? "", authed: signedIn?.ok ?? null,
+          ...(signedIn ? { authDetail: signedIn.detail } : {}), auth: AUTH[a.kind] ?? "" };
+      }
       const found = Boolean(available[a.kind]);
       const auth = found ? await probeAuth(a.kind) : { authed: null as boolean | null };
       return {

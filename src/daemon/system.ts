@@ -326,16 +326,17 @@ export function runModelList(cmd: string, args: string[]): Promise<string[]> {
  * have `debug models`, so it falls back — and "builtin" is the true label for
  * whichever of the two it was.
  *
- * Cached 60s per kind: the pickers reopen constantly and none of these change
+ * Cached 60s per kind and configuration: the pickers reopen constantly and none of these change
  * between two clicks.
  */
-export async function listModelsForKind(kind: string): Promise<ModelList> {
-  const hit = MODEL_LIST_CACHE.get(kind);
+export async function listModelsForKind(kind: string, options: Record<string, unknown> = {}): Promise<ModelList> {
+  const key = JSON.stringify([kind, Object.entries(options).sort(([a], [b]) => a.localeCompare(b))]);
+  const hit = MODEL_LIST_CACHE.get(key);
   if (hit && Date.now() - hit.ts < 60_000) return hit.list;
   let list: ModelList = { models: [], source: "none" };
   const driver = providerRegistry.get(kind);
   if (driver?.models) {
-    list = await driver.models(driver.defaultConfig());
+    list = await driver.models(providerRegistry.decode(kind, options));
   } else if (kind === "opencode") {
     list = { models: await runModelList("opencode", ["models"]), source: "cli" };
   } else if (kind === "grok-code") {
@@ -348,7 +349,7 @@ export async function listModelsForKind(kind: string): Promise<ModelList> {
     const { models } = await allModels();
     list = { models: models.map((m) => `${m.provider}/${m.id}`), source: "api" };
   }
-  MODEL_LIST_CACHE.set(kind, { list, ts: Date.now() });
+  MODEL_LIST_CACHE.set(key, { list, ts: Date.now() });
   return list;
 }
 

@@ -204,10 +204,10 @@ let seq = 0, turns = 0, interrupted = false;
 const history = []; // native history survives fake app-server restarts too
 const saveHistory = () => fs.writeFileSync(path.join(here, vars.THREAD + ".history.json"), JSON.stringify(history));
 const reply = (id, result) => out({ id, result });
-async function run(script) {
+async function run(script, turnVars = { ...vars }) {
   for (const step of script) {
     if (interrupted) return;
-    if ("out" in step) out(fill(step.out, vars));
+    if ("out" in step) out(fill(step.out, turnVars));
     else if ("raw" in step) process.stdout.write(step.raw + "\\n");
     else if ("stderr" in step) process.stderr.write(step.stderr + "\\n");
     else if ("sleep" in step) await sleep(step.sleep);
@@ -216,7 +216,7 @@ async function run(script) {
     else if ("ask" in step) {
       const id = "srv-" + ++seq;
       const answer = new Promise((resolve) => pending.set(id, resolve));
-      out({ id, method: step.ask, params: fill({ threadId: "$THREAD", turnId: "$TURN", itemId: "item-" + seq, ...(step.params || {}) }, vars) });
+      out({ id, method: step.ask, params: fill({ threadId: "$THREAD", turnId: "$TURN", itemId: "item-" + seq, ...(step.params || {}) }, turnVars) });
       await answer;
     }
   }

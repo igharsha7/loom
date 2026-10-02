@@ -182,7 +182,7 @@ Claude settings); override per session through the protocol instead.
 A second agent audited the port; Claude checked each round's findings against the
 code, Sol fixed them, Claude reviewed and ran the suite. Rounds 1–4 covered Phase 5
 only; rounds 5–8 covered all five phases, including what earlier fixes introduced.
-Findings per round: 5, 4, 6, 4, then 25, 24, 14, 10, 16, 5, 8. All fixed, each with a
+Findings per round: 5, 4, 6, 4, then 25, 24, 14, 10, 16, 5, 8, 11. All fixed, each with a
 regression test.
 
 - [x] Phase 5: dropped turns are named explicitly (`dropped: { from, turns, keep }`
@@ -209,8 +209,7 @@ regression test.
   question everywhere (routes, status, reloaded cards); multi-select questions;
   Codex file-read approvals; sparse Claude and Codex limit reports; per-window
   limit state.
-- [x] Tests: 1835 passing (plus 132 DOM). `process.test.ts` #16 failed once
-  under full-suite load ("cannot inspect"); under investigation. Known unrelated: `daemon.test.ts`
+- [x] Tests: 1852 passing (plus 132 DOM). Known unrelated: `daemon.test.ts`
   "real models" depends on the live Codex catalog; `app-queue-dom` is
   occasionally flaky. `codex.test.ts` "interrupts the running turn" failed once
   under full-suite load and couldn't be reproduced (6 runs alone, 2 full runs).
@@ -254,6 +253,16 @@ regression test.
   before; unknown drivers are preserved. Shared adapter conformance suite in
   `test/providers/conformance.test.ts`. Adding a provider: adapter + driver +
   an entry in `builtInDrivers` + conformance fixtures.
+- [x] Round 12 (11 findings: 4 general, 7 in the registry; all fixed): macOS
+  process-group inspection retries a transient EPERM (the cause of the flaky
+  process test, and of finished writers being held until Stop); instruction
+  fingerprints cover Claude rules and managed CLAUDE.md and skip fenced
+  examples; usage limits are keyed by driver and account; continuation
+  ownership survives rebinding; default-model sessions resume on
+  restart-model drivers; failed fencing during instance creation keeps the
+  instance for Stop; model discovery uses the agent's own config; setup reads
+  driver checks; the conformance suite checks late output, surviving writers
+  and real rollback.
 - [ ] UI for the recovery states (pending rewind, pending compaction, a turn
   held after an unsettled writer) — Phase 7.
   Today the way out is the CLI or the API.

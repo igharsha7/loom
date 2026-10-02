@@ -214,20 +214,31 @@ export async function interruptProcess(child: ChildProcess, processGroup = false
  * are outside this guarantee; Windows needs a Job Object before native mode. */
 export async function quiesceProcessGroup(pid: number): Promise<void> {
   if (process.platform === "win32") throw new NativeQuiescenceUnknown("native process containment is unavailable on Windows");
-  const alive = () => {
-    try { process.kill(-pid, 0); return true; }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw new NativeQuiescenceUnknown(`cannot inspect native process group ${pid}; quiescence unknown`); }
-  };
-  if (!alive()) return;
-  const signal = (value: NodeJS.Signals) => {
-    try { process.kill(-pid, value); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw new NativeQuiescenceUnknown(`cannot terminate native process group ${pid}; quiescence unknown`); }
-  };
-  signal("SIGINT");
-  const began = Date.now(); let forced = false;
-  while (alive()) {
-    if (Date.now() - began >= 6000) throw new NativeQuiescenceUnknown(`native process group ${pid} did not terminate; inspect descendants before reconciliation`);
-    if (!forced && Date.now() - began >= 3000) { signal("SIGKILL"); forced = true; }
+  const began = Date.now(); let forced = false, interrupted = false;
+  while (true) {
+    let uncertain = false;
+    try { process.kill(-pid, 0); }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ESRCH") return;
+      if (code !== "EPERM") throw new NativeQuiescenceUnknown(`cannot inspect native process group ${pid}; quiescence unknown`);
+      // macOS may briefly report EPERM while an exiting group has zombies.
+      // Retry within the same deadline; only ESRCH proves the group is gone.
+      uncertain = true;
+    }
+    const elapsed = Date.now() - began;
+    if (elapsed >= 6000) throw new NativeQuiescenceUnknown(`native process group ${pid} did not terminate; inspect descendants before reconciliation`);
+    if (!uncertain) {
+      const value = elapsed >= 3000 ? "SIGKILL" : "SIGINT";
+      if (!forced && (value === "SIGKILL" || !interrupted)) {
+        try { process.kill(-pid, value); if (value === "SIGKILL") forced = true; else interrupted = true; }
+        catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === "ESRCH") return;
+          if (code !== "EPERM") throw new NativeQuiescenceUnknown(`cannot terminate native process group ${pid}; quiescence unknown`);
+        }
+      }
+    }
     await new Promise(resolve => setTimeout(resolve, 25));
   }
 }

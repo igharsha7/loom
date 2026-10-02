@@ -167,7 +167,7 @@ export class ProviderService {
     const identity = this.adapters.get(input.instanceId)?.instance?.continuationIdentity;
     const expectedKey = identity?.continuationKey ?? `${adapter.provider}:instance:${input.instanceId}`;
     const binding = stored && this.ownsBinding(adapter, stored) ? stored : undefined;
-    const restart = adapter.capabilities.sessionModelSwitch === "restart" && input.model !== undefined && input.model !== binding?.runtimePayload?.model;
+    const restart = adapter.capabilities.sessionModelSwitch === "restart" && input.model !== undefined && (input.model ?? undefined) !== binding?.runtimePayload?.model;
     const cursor = restart ? undefined : binding?.resumeCursor ?? undefined;
     const cwd = binding?.runtimePayload?.cwd ?? input.cwd;
     const model = input.model === null ? undefined : input.model ?? binding?.runtimePayload?.model;
