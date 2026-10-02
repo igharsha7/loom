@@ -23,6 +23,7 @@
  *     trace backend that isn't running.
  */
 
+import { providerRegistry } from "../providers/registry.js";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -157,16 +158,7 @@ export async function ask(
         return a;
       },
     },
-    {
-      bin: "claude",
-      label: "claude",
-      args: (q) => {
-        const a = ["-p", q, "--output-format", "text"];
-        // Only claude takes the MCP document directly; see src/core/mcp.ts.
-        if (opts.mcpConfigPath) a.push("--mcp-config", opts.mcpConfigPath);
-        return a;
-      },
-    },
+    ...providerRegistry.list().flatMap(driver => driver.auxiliary ? [driver.auxiliary.command("ask", opts)] : []),
   ]);
 
   if (!chosen) {

@@ -12,6 +12,7 @@ import { GrokAdapter } from "./grok.js";
 import { ModelAdapter } from "./model.js";
 import { OpenCodeAdapter } from "./opencode.js";
 import { providerRegistry } from "../providers/registry.js";
+import { UnavailableAdapter } from "./unavailable.js";
 import { ProviderAgent } from "../providers/agent.js";
 
 export type AgentFactory = (
@@ -71,7 +72,7 @@ registerAgentKind("kiro", (cfg, dir) => new KiroBridge(cfg.id, dir, cfg.options)
  * that no view would offer you.
  *
  * The registration stays because deleting it would break the projects that
- * already name it: `createAgent` throws on an unknown kind, and every agent in
+ * already name it: `createAgent` preserves unknown kinds as unavailable entries, and every agent in
  * .loom/config.json is constructed when the project opens, so a withdrawn
  * registration is a project that won't open rather than an agent that quietly
  * stops. Same standing `echo` has — buildable if you ask for it by name, never
@@ -89,9 +90,7 @@ export function createAgent(cfg: AgentConfig, projectDir: string): AnyAgent {
   const factory = factories.get(cfg.kind);
   if (!factory && providerRegistry.get(cfg.kind)) return new ProviderAgent(cfg.id, cfg.kind, projectDir, cfg.options);
   if (!factory) {
-    throw new Error(
-      `unknown agent kind "${cfg.kind}" (known: ${[...factories.keys()].join(", ")})`,
-    );
+    return new UnavailableAdapter(cfg.id, cfg.kind, projectDir);
   }
   return factory(cfg, projectDir);
 }

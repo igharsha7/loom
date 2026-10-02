@@ -12,6 +12,7 @@
  * isolation-first tool (separate worktrees) structurally can't own.
  */
 
+import { providerRegistry } from "../providers/registry.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import { withoutCanon } from "./team-canon.js";
@@ -34,10 +35,6 @@ const RECENT_DECISIONS = 40;
  * with `memoryFiles` in config.
  */
 const NATIVE_MEMORY: Record<string, string[]> = {
-  "claude-code": ["CLAUDE.md", ".claude/CLAUDE.md", "AGENTS.md"],
-  // Codex reads AGENTS.md — that convention is OpenAI's, and it's the one most
-  // widely shared. `.codex/` is its own directory when a repo keeps them apart.
-  codex: ["AGENTS.md", ".codex/AGENTS.md", "codex.md"],
   opencode: ["AGENTS.md", ".opencode/AGENTS.md", "opencode.md"],
   "grok-code": ["AGENTS.md", ".grok/AGENTS.md", "GROK.md"],
   antigravity: [".antigravity/memory.md", "AGENTS.md", ".windsurfrules"],
@@ -49,7 +46,7 @@ const NATIVE_MEMORY: Record<string, string[]> = {
 
 export function nativeMemoryFiles(agent: AgentConfig): string[] {
   if (agent.memoryFiles) return agent.memoryFiles;
-  return NATIVE_MEMORY[agent.kind] ?? ["AGENTS.md"];
+  return providerRegistry.get(agent.kind)?.presentation?.memoryFiles ?? NATIVE_MEMORY[agent.kind] ?? ["AGENTS.md"];
 }
 
 export interface ImportedBlock {

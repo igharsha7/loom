@@ -741,7 +741,8 @@ it.each(["CLAUDE.local.md", "AGENTS.override.md", "ancestor", "import", "missing
   const file = path.join(which === "ancestor" ? parent : sub, which === "ancestor" ? "AGENTS.md" : which.includes("import") ? "policy.md" : which);
   if (which !== "missing import") fs.writeFileSync(file, "before");
   if (which.includes("import")) fs.writeFileSync(path.join(sub, "CLAUDE.md"), "Read @policy.md");
-  const prepared = await brain.prepare(request(brain), "codex", sub, {});
+  const kind = which === "CLAUDE.local.md" || which.includes("import") ? "claude-code" : "codex";
+  const prepared = await brain.prepare(request(brain), kind, sub, {});
   fs.writeFileSync(file, "after");
   await expect(brain.submit(prepared)).rejects.toMatchObject({ code: "stale" });
 });
@@ -767,5 +768,19 @@ it("observes external imports with escaped spaces and cyclic imports (port audit
   fs.writeFileSync(imported, "before\n@project/CLAUDE.md");
   const prepared = await brain.prepare(request(brain), "claude-code", sub, {});
   fs.writeFileSync(imported, "after\n@project/CLAUDE.md");
+  await expect(brain.submit(prepared)).rejects.toMatchObject({ code: "stale" });
+});
+
+
+it.each([false, true])("rejects changed project Claude rules before submission (git=%s, #6)", async git => {
+  const { brain, dir } = await setup();
+  if (git) {
+    execFileSync("git", ["init", "-q"], { cwd: dir });
+    fs.writeFileSync(path.join(dir, ".gitignore"), ".loom/\n.claude/\n");
+  }
+  const rule = path.join(dir, ".claude", "rules", "nested", "policy.md");
+  fs.mkdirSync(path.dirname(rule), { recursive: true }); fs.writeFileSync(rule, "before");
+  const prepared = await brain.prepare(request(brain), "claude-code", dir, {});
+  fs.writeFileSync(rule, "after");
   await expect(brain.submit(prepared)).rejects.toMatchObject({ code: "stale" });
 });

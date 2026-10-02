@@ -94,6 +94,7 @@ export function describeCondition(c: QueueCondition): string {
 }
 
 export interface QueueState {
+  version?: { epoch: string; revision: number };
   items: QueueItem[];
   paused: boolean;
   /** Why it's paused, when it paused itself (a refused send, a Stop, a restart). */
@@ -144,6 +145,8 @@ export function parseTarget(raw: unknown): QueueTarget {
 export class PromptQueue {
   private state: QueueState = { items: [], paused: false };
   private seq = 0;
+  private readonly epoch = crypto.randomUUID();
+  private revision = 0;
 
   /** `file` null keeps it in memory (tests, projects with no .loom). */
   constructor(
@@ -163,7 +166,7 @@ export class PromptQueue {
   }
 
   snapshot(): QueueState {
-    return { items: this.state.items.map((i) => ({ ...i, target: { ...i.target } as QueueTarget, ...(i.continuity ? { continuity: { ...i.continuity } } : {}) })), paused: this.state.paused, ...(this.state.reason ? { reason: this.state.reason } : {}) };
+    return { version: { epoch: this.epoch, revision: this.revision }, items: this.state.items.map((i) => ({ ...i, target: { ...i.target } as QueueTarget, ...(i.continuity ? { continuity: { ...i.continuity } } : {}) })), paused: this.state.paused, ...(this.state.reason ? { reason: this.state.reason } : {}) };
   }
 
   get paused(): boolean {
@@ -287,6 +290,7 @@ export class PromptQueue {
   }
 
   private changed(): void {
+    this.revision++;
     if (this.file) {
       try {
         fs.mkdirSync(path.dirname(this.file), { recursive: true });

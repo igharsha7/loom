@@ -1,7 +1,6 @@
-import { builtInDrivers } from "./builtInDrivers.js";
+import { builtInDrivers, fenceLegacyWriter } from "./builtInDrivers.js";
 import type { AnyProviderDriver, ProviderEnvironment, ProviderInstance, WriterRecovery } from "./driver.js";
 import { NativeDispatchRejected } from "./settlement.js";
-import { fenceLocal } from "./drivers/local.js";
 
 export class ProviderRegistry {
   private readonly active = new Map<string, { kind: string; instance?: ProviderInstance; rejected?: boolean }>();
@@ -44,12 +43,17 @@ export class ProviderRegistry {
     try {
       const instance = await driver.create({ instanceId, config, environment });
       let disposed = false;
+      let disposing: Promise<void> | undefined;
       const registry = this;
       const materialized: ProviderInstance = { ...instance, async dispose() {
         if (disposed) return;
-        await instance.dispose(); // failed fencing retains ownership and remains retryable
-        disposed = true;
-        registry.active.delete(key);
+        if (disposing) return disposing;
+        disposing = (async () => {
+          await instance.dispose(); // failed fencing retains ownership and remains retryable
+          disposed = true;
+          if (registry.active.get(key)?.instance === materialized) registry.active.delete(key);
+        })().finally(() => { disposing = undefined; });
+        return disposing;
       } };
       this.active.set(key, { kind, instance: materialized, rejected: true });
       const expected = driver.continuationIdentity(instanceId, config);
@@ -73,7 +77,7 @@ export class ProviderRegistry {
   /** Old journals retain their original process identity; new journals carry opaque driver records. */
   async fenceRecovery(record: { writer?: WriterRecovery; processGroupId?: number; processIdentity?: string }): Promise<boolean> {
     if (record.writer) return this.get(record.writer.driverKind)?.fence(record.writer.identity) ?? false;
-    return fenceLocal({ type: "process-group", value: record });
+    return fenceLegacyWriter({ type: "process-group", value: record });
   }
 }
 export const providerRegistry = new ProviderRegistry(builtInDrivers);

@@ -8,6 +8,9 @@ import { CODEX_MODELS, codexModelCatalog } from "./models.js";
 const checks = localChecks("codex", codexBin, "codex-app-server-v2", "codex", " or open Codex.app once");
 export const codexDriver: ProviderDriver<NativeConfig> = {
   kind: "codex", metadata: { displayName: "Codex", supportsMultipleInstances: true },
+  presentation: { vendor: "openai", aliases: ["chatgpt", "gpt", "openai"], memoryFiles: ["AGENTS.md", ".codex/AGENTS.md", "codex.md"],
+    blurb: "Codex (OpenAI / ChatGPT): strong at implementation and running tests",
+    installHint: "install Codex.app, or npm i -g @openai/codex", loginHint: "codex login" },
   configSchema: nativeConfigSchema, defaultConfig: () => ({}), capabilities: codexCapabilities,
   permissions: {
     default: "auto",

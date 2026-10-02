@@ -10,6 +10,12 @@ import { state } from '../state.js';
  * Creating this module only binds functions; startup and cleanup belong to project.js.
  */
 export function createQueue(view) {
+    var retiredEpochs = new Set();
+    var frames = 0;
+    function httpSnapshot(j, started) {
+      if (frames !== started && j.version && view.queue.version && j.version.epoch !== view.queue.version.epoch) return;
+      applyQueue(j);
+    }
 
 
     /** A held prompt's condition, short enough for the row. */
@@ -27,11 +33,17 @@ export function createQueue(view) {
 
 
     function loadQueue(){
-      api("/api/projects/" + view.pid + "/queue").then(applyQueue).catch(function(){});
+      var started = frames;
+      api("/api/projects/" + view.pid + "/queue").then(function(j){ httpSnapshot(j, started); }).catch(function(){});
     }
 
     function applyQueue(j){
       if (!j || !j.queue) return;
+      var version = view.queue.version;
+      if (j.version && retiredEpochs.has(j.version.epoch)) return;
+      if (j.version && version && j.version.epoch !== version.epoch) retiredEpochs.add(version.epoch);
+      if (j.version && version && j.version.epoch === version.epoch && j.version.revision < version.revision) return;
+      if (j.version) view.queue.version = j.version;
       view.queue.items = j.queue;
       view.queue.paused = !!j.paused;
       view.queue.reason = j.reason || "";
@@ -42,6 +54,7 @@ export function createQueue(view) {
 
     function onQueueFrame(frame){
       if (frame.projectId && frame.projectId !== view.pid) return;
+      frames++;
       applyQueue(frame);
     }
 
@@ -60,8 +73,9 @@ export function createQueue(view) {
 
     /** Every action here is the same round trip: act, then redraw from the server's answer. */
     function qAct(path, opts){
+      var started = frames;
       return api("/api/projects/" + view.pid + "/queue" + path, opts)
-        .then(applyQueue)
+        .then(function(j){ httpSnapshot(j, started); })
         .catch(function(err){ toast(err.message); loadQueue(); });
     }
 
@@ -107,9 +121,10 @@ export function createQueue(view) {
     function queueFromComposer(text, plan){
       var body = { text: text, target: queueTarget(), chat: view.chatId };
       if (plan) body.plan = true;
+      var started = frames;
       return api("/api/projects/" + view.pid + "/queue", { method: "POST", body: JSON.stringify(body) })
         .then(function(j){
-          applyQueue(j);
+          httpSnapshot(j, started);
           toast("queued — " + (view.queue.items.length) + " waiting");
         });
     }
@@ -121,6 +136,10 @@ export function createQueue(view) {
       if (!el) return;
       if (!view.queue.items.length) { el.style.display = "none"; el.innerHTML = ""; return; }
       el.style.display = "flex";
+      var oldBox = el.querySelector("[data-qedit]");
+      var draft = oldBox && oldBox.getAttribute("data-qedit") === view.queue.editing ? oldBox.value : null;
+      var focused = oldBox && document.activeElement === oldBox;
+      var selection = oldBox ? [oldBox.selectionStart, oldBox.selectionEnd, oldBox.selectionDirection, oldBox.scrollTop] : null;
       var note = view.queue.paused ? (view.queue.reason || "paused") : (view.queue.waitingFor || "");
       var h = '<div class="cqhead"><span>Queue · ' + view.queue.items.length + "</span>" +
         (note ? '<span class="cqwait">' + esc(note) + "</span>" : "") +
@@ -139,7 +158,7 @@ export function createQueue(view) {
           '<span class="cqn" title="drag to reorder">' + (i + 1) + "</span>" +
           '<div class="cqbody">' +
           (editing
-            ? '<textarea class="cqedit" data-qedit="' + esc(it.id) + '">' + esc(it.text) + "</textarea>" +
+            ? '<textarea class="cqedit" data-qedit="' + esc(it.id) + '">' + esc(draft === null ? it.text : draft) + "</textarea>" +
               '<div class="cqmeta"><button class="cqbtn" type="button" data-q="save">Save</button>' +
               '<button class="cqbtn" type="button" data-q="cancel">Cancel</button>' +
               "<span>⌘⏎ saves · Esc cancels</span></div>"
@@ -158,7 +177,11 @@ export function createQueue(view) {
           "</div></div>";
       });
       el.innerHTML = h;
+      var replacement = el.querySelector("[data-qedit]");
+      if (replacement && oldBox && draft !== null) replacement.replaceWith(oldBox);
       bindQueue(el);
+      var newBox = el.querySelector("[data-qedit]");
+      if (newBox && focused && selection) { newBox.focus(); newBox.setSelectionRange(selection[0], selection[1], selection[2]); newBox.scrollTop = selection[3]; }
     }
 
 
@@ -205,14 +228,15 @@ export function createQueue(view) {
         });
         var find = function(sel){ return row.querySelector(sel); };
         var text = find('[data-q="edit"]');
-        if (text) text.onclick = function(){ view.queue.editing = id; drawQueue(); };
+        if (text) text.onclick = function(){ view.queue.editing = id; view.queue.editorMounted = false; drawQueue(); };
         var sel = find('[data-q="target"]');
         if (sel) sel.onchange = function(){
           qAct("/" + encodeURIComponent(id), { method: "PATCH", body: JSON.stringify({ target: sel.value }) });
         };
         var box = find("[data-qedit]");
         if (box) {
-          box.focus();
+          if (!view.queue.editorMounted) box.focus();
+          view.queue.editorMounted = true;
           var save = function(){
             var v = box.value.trim();
             view.queue.editing = null;

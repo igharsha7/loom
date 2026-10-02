@@ -182,7 +182,7 @@ Claude settings); override per session through the protocol instead.
 A second agent audited the port; Claude checked each round's findings against the
 code, Sol fixed them, Claude reviewed and ran the suite. Rounds 1–4 covered Phase 5
 only; rounds 5–8 covered all five phases, including what earlier fixes introduced.
-Findings per round: 5, 4, 6, 4, then 25, 24, 14, 10, 16, 5, 8, 11. All fixed, each with a
+Findings per round: 5, 4, 6, 4, then 25, 24, 14, 10, 16, 5, 8, 11, 9. All fixed, each with a
 regression test.
 
 - [x] Phase 5: dropped turns are named explicitly (`dropped: { from, turns, keep }`
@@ -209,7 +209,7 @@ regression test.
   question everywhere (routes, status, reloaded cards); multi-select questions;
   Codex file-read approvals; sparse Claude and Codex limit reports; per-window
   limit state.
-- [x] Tests: 1852 passing (plus 132 DOM). Known unrelated: `daemon.test.ts`
+- [x] Tests: 1870 passing (plus 132 DOM). Known unrelated: `daemon.test.ts`
   "real models" depends on the live Codex catalog; `app-queue-dom` is
   occasionally flaky. `codex.test.ts` "interrupts the running turn" failed once
   under full-suite load and couldn't be reproduced (6 runs alone, 2 full runs).
@@ -249,7 +249,8 @@ regression test.
   instances, and per-driver continuity facts, capabilities, health, account and
   continuation identity, instruction discovery and writer fencing (opaque, not
   tied to process groups). Brain, the runtime, health and usage read from it;
-  no provider names remain in Brain or the runtime. Persisted data loads as
+  dispatch and continuity policy use driver facts. Legacy helper names and
+  product/provider presentation still contain concrete names (see boundary below). Persisted data loads as
   before; unknown drivers are preserved. Shared adapter conformance suite in
   `test/providers/conformance.test.ts`. Adding a provider: adapter + driver +
   an entry in `builtInDrivers` + conformance fixtures.
@@ -263,6 +264,19 @@ regression test.
   instance for Stop; model discovery uses the agent's own config; setup reads
   driver checks; the conformance suite checks late output, surviving writers
   and real rollback.
+- [x] Round 13 (9 findings plus layering, all fixed): queue snapshots are
+  versioned so an older response can't undo a newer change, and an unsaved
+  queue edit survives redraws (the real cause of the flaky queue DOM test);
+  concurrent disposal can't release a replacement instance; a resolved default
+  model no longer restarts sessions on restart-model drivers; historical usage
+  keeps the driver and account it was reported under; project `.claude/rules`
+  are fingerprinted, rule scanning is bounded and ignores irrelevant entries,
+  and inline code isn't parsed as an import; a project whose configured driver
+  is unavailable still opens; more provider policy moved into driver records
+  (what remains is listed in the notes for Phase 6).
+- [ ] Interrupt tests (`codex.test.ts`, `claude-code.test.ts`) race: Stop can
+  arrive before the turn starts, which correctly cancels it. Make them wait for
+  the turn to start. `app-composer-dom` approvals test times out under load.
 - [ ] UI for the recovery states (pending rewind, pending compaction, a turn
   held after an unsettled writer) — Phase 7.
   Today the way out is the CLI or the API.
@@ -281,3 +295,23 @@ regression test.
   conversation" choice in place of the confirm dialogs.
 - [ ] One live text path for provider agents: upstream now sends their text both as
   `delta` frames and as `stream` frames (see notes, upstream changes).
+
+### Follow-up audit — 2026-10-02
+
+- Fixed concurrent disposal with a shared, retryable fencing promise and owner-checked release.
+- Sessions persist optional `runtimePayload.requestedModel` (string or null), separately from the adapter-resolved model. Legacy bindings still load; an ambiguous legacy default adopts the existing cursor rather than discarding it.
+- Queue HTTP and socket snapshots share a volatile epoch/revision; queue files are unchanged. Browser snapshots preserve the editing DOM node, draft, focus, selection and scroll.
+- Historical limits resolve historical provider/driver ownership, never the current agent kind. Ambiguous custom limits labels now carry optional `driverKind` and reached scope in new events; old events still replay with legacy label inference.
+- Instruction source paths belong to built-in driver records; the observer is generic. Claude covers ancestor project rules and user rules, imports, inline/fenced code exclusion. Scans bound entries (10,000), directories (1,000), depth (32), elapsed time (1s) and file/content bytes. Supported symlinks are bounded and deduplicated, including outside-tree links; broken irrelevant links do not block. Codex does not scan Claude sources. Observations are re-read at safety boundaries, not cached across preparation/submission.
+- Unavailable saved drivers materialize an unavailable adapter: project/status/recovery still open, enabled state/config/bindings remain, normal disable/remove/reassign paths work.
+- The queue edit/reorder/delete/pause DOM test uses held conditions rather than a timed busy turn.
+- Driver records now own built-in memory paths, vendor/aliases/briefings, orchestration priority/options, setup hints, usage window labels, and internal Claude CLI/API transports for extraction and observability. Legacy exports remain facades. Brain engine selection and prompts are unchanged.
+
+The boundary is behavioral, not a claim that every provider name has vanished.
+Phase 6 deliberately retains: ADE product catalogs and browser labels/icons,
+runner credential mount provisioning, legacy provider-name compatibility facades
+and historical label migration, operator-selected internal engine defaults,
+non-registry Antigravity/OpenCode/Grok/bridge policy, provider management/login UI,
+and real remote drivers. Runner credential setup is infrastructure provisioning,
+not session dispatch or continuity ownership. These retained items do not route
+native cursors or determine native settlement/limits policy.

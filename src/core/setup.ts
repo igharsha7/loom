@@ -80,8 +80,6 @@ export interface SetupReport {
 }
 
 const INSTALL: Record<string, string> = {
-  "claude-code": "npm i -g @anthropic-ai/claude-code",
-  codex: "install Codex.app, or npm i -g @openai/codex",
   opencode: "curl -fsSL https://opencode.ai/install | bash",
   "grok-code": "install the grok CLI from docs.x.ai",
   "antigravity-cli": "curl -fsSL https://antigravity.google/cli/install.sh | bash",
@@ -90,8 +88,6 @@ const INSTALL: Record<string, string> = {
 };
 
 const AUTH: Record<string, string> = {
-  "claude-code": "run `claude`, then /login",
-  codex: "codex login",
   opencode: "opencode auth login",
   "grok-code": "run `grok` once and sign in",
   model: "loom providers:set <provider> --key <your key>",
@@ -289,8 +285,8 @@ export async function setupReport(): Promise<SetupReport> {
         const installed = checks.find(check => check.name === "installed");
         const signedIn = checks.find(check => check.name === "signed in");
         return { kind: a.kind, label: a.label, found: installed?.ok ?? await driver.available(providerRegistry.decode(a.kind, {})).catch(() => false),
-          install: INSTALL[a.kind] ?? "", authed: signedIn?.ok ?? null,
-          ...(signedIn ? { authDetail: signedIn.detail } : {}), auth: AUTH[a.kind] ?? "" };
+          install: driver.presentation?.installHint ?? "", authed: signedIn?.ok ?? null,
+          ...(signedIn ? { authDetail: signedIn.detail } : {}), auth: driver.presentation?.loginHint ?? "" };
       }
       const found = Boolean(available[a.kind]);
       const auth = found ? await probeAuth(a.kind) : { authed: null as boolean | null };

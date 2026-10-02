@@ -30,6 +30,7 @@
  * task's agent output streams into that task's own chat.
  */
 
+import { providerRegistry } from "../providers/registry.js";
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -523,7 +524,7 @@ export function orchestratorBriefing(opts: {
   planDir?: string;
 }): string {
   const roster = opts.workers
-    .map((w) => `- "${w.id}" — ${KIND_BLURBS[w.kind] ?? w.kind}${w.role && w.role !== w.id ? ` (role: ${w.role})` : ""}`)
+    .map((w) => `- "${w.id}" — ${providerRegistry.get(w.kind)?.presentation?.blurb ?? KIND_BLURBS[w.kind] ?? w.kind}${w.role && w.role !== w.id ? ` (role: ${w.role})` : ""}`)
     .join("\n");
   return [
     `[Loom Orchestra] You are the ORCHESTRATOR for project "${opts.project}".`,
@@ -661,8 +662,6 @@ export function renderTaskFile(run: OrchestraRun, t: OrchestraTask): string {
 }
 
 const KIND_BLURBS: Record<string, string> = {
-  "claude-code": "Claude Code (Anthropic): strong at multi-file changes, refactors, careful reasoning",
-  codex: "Codex (OpenAI / ChatGPT): strong at implementation and running tests",
   "antigravity-cli": "Antigravity (Google Gemini): fast implementation, broad knowledge",
   "grok-code": "Grok Code (xAI): quick edits and scripts",
   opencode: "OpenCode: open-model agent, good for well-specified tasks",
@@ -888,17 +887,12 @@ export class OrchestraEngine {
     const byId = roster.find((a) => a.id.toLowerCase() === n);
     if (byId) return byId;
     const alias: Record<string, string> = {
-      claude: "claude-code",
-      "claude code": "claude-code",
-      chatgpt: "codex",
-      gpt: "codex",
-      openai: "codex",
       antigravity: "antigravity-cli",
       agy: "antigravity-cli",
       gemini: "antigravity-cli",
       grok: "grok-code",
     };
-    const kind = alias[n] ?? n;
+    const kind = providerRegistry.list().find(d => d.presentation?.aliases?.includes(n))?.kind ?? alias[n] ?? n;
     const byKind = roster.find((a) => a.kind === kind);
     if (byKind) return byKind;
     if (this.host.installedKinds().includes(kind)) return { id: kind, kind, role: kind };
@@ -929,7 +923,7 @@ export class OrchestraEngine {
     const roster = this.host.roster();
     const orchCfg = opts.orchestrator
       ? this.resolveAgent(opts.orchestrator)
-      : (roster.find((a) => a.kind === "claude-code") ?? roster[0] ?? null);
+      : ([...roster].sort((a, b) => (providerRegistry.get(b.kind)?.presentation?.orchestratorPriority ?? 0) - (providerRegistry.get(a.kind)?.presentation?.orchestratorPriority ?? 0))[0] ?? roster[0] ?? null);
     if (!orchCfg) throw new Error(`no agent "${opts.orchestrator ?? ""}" can orchestrate here — add one first`);
 
     const workerNames = opts.workers?.length ? opts.workers : roster.map((a) => a.id);
@@ -2375,17 +2369,9 @@ export function prBody(run: OrchestraRun, extra: string[] = []): string {
  * granted"). Codex, sandboxed, just ran them. These are the checks a reviewer
  * runs — tests, typecheck, build, and read-only git — and nothing else.
  */
-export const ORCHESTRATOR_VERIFY_TOOLS = [
-  "npm test", "npm run test", "npm run build", "npm run typecheck", "npm run lint",
-  "pnpm test", "yarn test", "bun test", "node --test", "npx vitest run", "npx tsc --noEmit",
-  "cargo test", "cargo check", "go test", "go build", "pytest", "python -m pytest",
-  "git log", "git diff", "git status", "git show",
-].map((c) => `Bash(${c}:*)`);
-
+export { ORCHESTRATOR_VERIFY_TOOLS } from "../providers/drivers/orchestrator.js";
 function orchestratorOptions(cfg: AgentConfig): Record<string, unknown> | undefined {
-  if (cfg.kind !== "claude-code") return cfg.options;
-  const extra = Array.isArray(cfg.options?.extraArgs) ? (cfg.options!.extraArgs as string[]) : [];
-  return { ...(cfg.options ?? {}), extraArgs: [...extra, "--allowedTools", ORCHESTRATOR_VERIFY_TOOLS.join(",")] };
+  return providerRegistry.get(cfg.kind)?.orchestratorOptions?.(cfg.options ?? {}) ?? cfg.options;
 }
 
 export function taskSummary(t: OrchestraTask): Record<string, unknown> {

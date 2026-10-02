@@ -42,7 +42,7 @@ export interface ProviderBinding {
   /** The native thread/session id. */
   resumeCursor: unknown | null;
   /** What the session was started with, to restart it the same way. */
-  runtimePayload: { cwd?: string; model?: string } | null;
+  runtimePayload: { cwd?: string; model?: string; requestedModel?: string | null } | null;
   runtimeMode: RuntimeMode;
   /** Epoch ms of the last start, turn or activity. */
   lastSeenAt: number;
@@ -123,7 +123,7 @@ const BindingFile = z.object({
     threadId: z.string().min(1), instanceId: z.string().min(1), provider: z.string().min(1).max(256),
     continuationKey: z.string().min(1).max(1024).optional(),
     status: z.enum(["starting", "running", "stopped", "error"]), resumeCursor: z.unknown().nullable(),
-    runtimePayload: z.object({ cwd: z.string().optional(), model: z.string().optional() }).nullable(),
+    runtimePayload: z.object({ cwd: z.string().optional(), model: z.string().optional(), requestedModel: z.string().nullable().optional() }).nullable(),
     runtimeMode: z.enum(["approval-required", "auto-accept-edits", "full-access"]), lastSeenAt: z.number(),
     turnLedger: z.object({ since: z.number(), fromStart: z.boolean(),
       turns: z.array(z.object({ id: z.string().min(1), at: z.number() })) }).nullable().optional(),

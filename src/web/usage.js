@@ -7,9 +7,6 @@
  */
 import { esc,tokens } from './format.js';
 
-var CLAUDE_WINDOWS = { five_hour: "5-hour", seven_day: "weekly", seven_day_opus: "weekly Opus",
-  seven_day_sonnet: "weekly Sonnet", seven_day_overage_included: "weekly (overage)", overage: "overage" };
-
 /** Fold one event into the project's agent statuses. True when a meter changed. */
 function observeUsage(project, e){
   if (!project || !e || !e.agentId) return false;
@@ -39,18 +36,19 @@ function observeUsage(project, e){
   }
   if (p.state === "usage_limits" && Array.isArray(p.windows)) {
     // Limits belong to an account. The registry supplies each roster entry's identity.
-    var provider = p.provider, account = p.accountKey || (agent.provider && agent.provider.accountKey) || provider;
+    var provider = p.provider, account = p.accountKey || provider;
     if (!provider) return false;
+    var historical = project.agents.filter(function(owner){ return owner.provider && owner.provider.limitsProvider === provider; })[0];
+    var driver = p.driverKind || (historical && (historical.provider.driverKind || historical.kind)) || (provider === "claude" ? "claude-code" : provider);
     project.agents.forEach(function(a){
       var owner = a.provider && a.provider.accountKey;
-      var driver = agent.provider && agent.provider.driverKind || agent.kind;
       var ownerDriver = a.provider && a.provider.driverKind || a.kind;
       if (ownerDriver !== driver || (owner ? owner !== account : a.id !== agent.id)) return;
       var byId = {}, order = [];
       ((a.limits && a.limits.windows) || []).concat(p.windows).forEach(function(w){
         if (!w || !w.id) return; if (!(w.id in byId)) order.push(w.id); byId[w.id] = w;
       });
-      var scope = p.reachedScope || (agent.provider && agent.provider.reachedScope) || (provider === "claude" ? "window" : "account");
+      var scope = p.reachedScope || (a.provider && a.provider.reachedScope) || (provider === "claude" ? "window" : "account");
       var blocked = scope === "account" ? [] : (a._blockedLimits || (a.limits && a.limits.reached ? [a.limits.reached] : [])).slice();
       if (scope !== "account") p.windows.forEach(function(w){ if (w.id !== p.reached) blocked = blocked.filter(function(id){ return id !== w.id; }); });
       if (p.reached && blocked.indexOf(p.reached) < 0) blocked.push(p.reached);
@@ -62,8 +60,9 @@ function observeUsage(project, e){
   return false;
 }
 
-function windowName(w){
-  if (CLAUDE_WINDOWS[w.id]) return CLAUDE_WINDOWS[w.id];
+function windowName(w, agent){
+  var names = agent.provider && agent.provider.usageWindows || {};
+  if (names[w.id]) return names[w.id];
   var m = w.windowMinutes;
   if (m === 10080) return "weekly";
   if (m && m % 60 === 0) return (m / 60) + "-hour";
@@ -88,17 +87,17 @@ function usageMeter(agent){
   } else if (ctx && ctx.usedTokens) lines.push("Context: " + ctx.usedTokens.toLocaleString() + " tokens");
   var hot = null;
   ((lim && lim.windows) || []).forEach(function(w){
-    lines.push("Usage, " + windowName(w) + ": " + Math.round(w.usedPercent) + "%" + resets(w.resetsAt));
+    lines.push("Usage, " + windowName(w, agent) + ": " + Math.round(w.usedPercent) + "%" + resets(w.resetsAt));
     if (w.usedPercent >= 80 && (!hot || w.usedPercent > hot.usedPercent)) hot = w;
   });
-  if (lim && lim.reached) lines.push("Limit reached: " + windowName({ id: lim.reached }));
+  if (lim && lim.reached) lines.push("Limit reached: " + windowName({ id: lim.reached }, agent));
   var title = esc(lines.join("\n"));
   var h = "";
   if (ctx && ctx.compacting) h += '<span class="ctxm live" title="' + title + '">compacting…</span>';
   else if (pct !== null) h += '<span class="ctxm' + (pct >= 85 ? " warn" : "") + '" title="' + title + '"><span class="ctxbar"><i style="width:' + pct + '%"></i></span>' + pct + "%</span>";
   else if (ctx && ctx.usedTokens) h += '<span class="ctxm" title="' + title + '">' + tokens(ctx.usedTokens) + "</span>";
   if (lim && lim.reached) h += '<span class="ctxm err" title="' + title + '">limit</span>';
-  else if (hot) h += '<span class="ctxm warn" title="' + title + '">' + esc(windowName(hot)) + " " + Math.round(hot.usedPercent) + "%</span>";
+  else if (hot) h += '<span class="ctxm warn" title="' + title + '">' + esc(windowName(hot, agent)) + " " + Math.round(hot.usedPercent) + "%</span>";
   else if (!h) h += '<span class="ctxm" title="' + title + '">limits</span>';
   return h;
 }

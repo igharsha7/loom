@@ -14,6 +14,7 @@
  *   - Phase 6: the landing train — lanes, the slot lease, the next step (D79–D82)
  */
 
+import { providerRegistry } from "../providers/registry.js";
 import { globToRegExp, normPath } from "./team-leases.js";
 
 // ── checks ──
@@ -104,8 +105,6 @@ export function fixPrompt(opts: { pr: number; check: string; log: string; attemp
 // ── review (D18) ──
 
 const VENDOR: Record<string, string> = {
-  "claude-code": "anthropic",
-  codex: "openai",
   "antigravity-cli": "google",
   "grok-code": "xai",
   opencode: "opencode",
@@ -113,7 +112,7 @@ const VENDOR: Record<string, string> = {
 };
 
 export function vendorOf(kind: string): string {
-  return VENDOR[kind] ?? kind;
+  return providerRegistry.get(kind)?.presentation?.vendor ?? VENDOR[kind] ?? kind;
 }
 
 /**

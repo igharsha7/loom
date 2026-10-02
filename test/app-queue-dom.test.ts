@@ -196,10 +196,11 @@ describe("web app · the prompt queue", () => {
   it("edits, reorders, drops and pauses — all before it runs", async () => {
     const m = mount();
     await ready(m);
-    await sendPrompt(m, "sleep:6000 working");
-    await sendPrompt(m, "one");
-    await sendPrompt(m, "two");
-    await sendPrompt(m, "three");
+    // Conditions keep the queue stable for arbitrarily slow CI, while the
+    // pause button remains available for the same user action below.
+    for (const text of ["one", "two", "three"]) {
+      await rest("POST", "/queue", { text, target: "echo", when: { kind: "at", at: Date.now() + 3_600_000 } });
+    }
     await waitUntil(() => all(m, "#cqueue .cqitem").length === 3, { timeoutMs: 15_000 });
 
     // edit: click the text, change it, save

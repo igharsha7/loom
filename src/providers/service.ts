@@ -147,7 +147,9 @@ export class ProviderService {
     if (adapter.hasSession(input.threadId)) {
       const session = adapter.listSessions().find(s => s.threadId === input.threadId);
       if (session) {
-        const changed = input.model !== undefined && (input.model ?? undefined) !== session.model;
+        const payload = this.directory.get(input.threadId, input.instanceId)?.runtimePayload;
+        const requested = payload?.requestedModel !== undefined ? payload.requestedModel : (input.model === null ? null : session.model);
+        const changed = input.model !== undefined && input.model !== requested;
         if (changed && adapter.capabilities.sessionModelSwitch === "unsupported")
           throw new ProviderError("unsupported", "ensureSession", "this driver cannot switch models", { mayHaveStarted: false });
         if (changed && adapter.capabilities.sessionModelSwitch === "restart") restart = true;
@@ -167,14 +169,16 @@ export class ProviderService {
     const identity = this.adapters.get(input.instanceId)?.instance?.continuationIdentity;
     const expectedKey = identity?.continuationKey ?? `${adapter.provider}:instance:${input.instanceId}`;
     const binding = stored && this.ownsBinding(adapter, stored) ? stored : undefined;
-    const restart = adapter.capabilities.sessionModelSwitch === "restart" && input.model !== undefined && (input.model ?? undefined) !== binding?.runtimePayload?.model;
+    const restart = adapter.capabilities.sessionModelSwitch === "restart" && input.model !== undefined && input.model !== (binding?.runtimePayload?.requestedModel !== undefined ? binding.runtimePayload.requestedModel : (input.model === null ? null : binding?.runtimePayload?.model));
     const cursor = restart ? undefined : binding?.resumeCursor ?? undefined;
     const cwd = binding?.runtimePayload?.cwd ?? input.cwd;
     const model = input.model === null ? undefined : input.model ?? binding?.runtimePayload?.model;
+    const requestedModel = input.model !== undefined ? input.model
+      : binding?.runtimePayload?.requestedModel !== undefined ? binding.runtimePayload.requestedModel : model ?? null;
     const launch = async (resumeCursor: unknown) => {
       // A new native session: every turn it will ever have gets recorded.
       this.directory.upsert({ threadId: input.threadId, instanceId: input.instanceId, provider: adapter.provider,
-        continuationKey: expectedKey, status: "starting", resumeCursor: resumeCursor ?? null, runtimePayload: { cwd, ...(model ? { model } : {}) },
+        continuationKey: expectedKey, status: "starting", resumeCursor: resumeCursor ?? null, runtimePayload: { cwd, ...(model ? { model } : {}), requestedModel },
         runtimeMode: input.runtimeMode, ...(resumeCursor === undefined ? { turnLedger: { since: Date.now(), fromStart: true, turns: [] } } : {}) });
       try {
         return await adapter.startSession({ threadId: input.threadId, instanceId: input.instanceId, cwd,
@@ -182,7 +186,7 @@ export class ProviderService {
           ...(resumeCursor !== undefined ? { resumeCursor } : {}) });
       } catch (error) {
         this.directory.upsert({ threadId: input.threadId, instanceId: input.instanceId, provider: adapter.provider,
-          continuationKey: expectedKey, status: "error", resumeCursor: resumeCursor ?? null, runtimePayload: { cwd, ...(model ? { model } : {}) }, runtimeMode: input.runtimeMode });
+          continuationKey: expectedKey, status: "error", resumeCursor: resumeCursor ?? null, runtimePayload: { cwd, ...(model ? { model } : {}), requestedModel }, runtimeMode: input.runtimeMode });
         // Starting a session never submits a turn, whatever went wrong.
         if (isProviderError(error) || error instanceof NativeQuiescenceUnknown) throw error;
         throw new ProviderError("transport", "ensureSession", error instanceof Error ? error.message : String(error),
@@ -221,7 +225,7 @@ export class ProviderService {
     this.directory.upsert({ threadId: session.threadId, instanceId: session.instanceId, provider: session.provider, status,
       continuationKey: this.directory.get(session.threadId, session.instanceId)?.continuationKey,
       resumeCursor: session.resumeCursor ?? this.directory.get(session.threadId, session.instanceId)?.resumeCursor ?? null,
-      runtimePayload: { cwd: session.cwd, ...(session.model ? { model: session.model } : {}) }, runtimeMode: session.runtimeMode });
+      runtimePayload: { ...this.directory.get(session.threadId, session.instanceId)?.runtimePayload, cwd: session.cwd, ...(session.model ? { model: session.model } : {}) }, runtimeMode: session.runtimeMode });
   }
 
   /** Start a turn on a live session (starting or resuming one first). */

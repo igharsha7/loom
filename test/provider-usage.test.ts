@@ -40,3 +40,21 @@ it("keeps identically named accounts on different drivers separate (B3)", () => 
     payload: { state: "usage_limits", provider: "codex", accountKey: "work", windows: [] } });
   expect(agents[1]!.limits.reached).toBe("five_hour"); expect(agents[0]!.limits.reached).toBeNull();
 });
+
+it("does not reassign historical limits when the emitting agent changes driver (#5)", () => {
+  const agents = [{ id: "switched", kind: "codex", provider: { driverKind: "codex", accountKey: "work" }, limits: null as any },
+    { id: "claude", kind: "claude-code", provider: { driverKind: "claude-code", accountKey: "work" }, limits: null as any }];
+  observeUsage({ agents }, { agentId: "switched", kind: "status", ts: 1,
+    payload: { state: "usage_limits", provider: "claude", accountKey: "work", windows: [], reached: "five_hour" } });
+  expect(agents[0]!.limits).toBeNull(); expect(agents[1]!.limits.reached).toBe("five_hour");
+});
+
+it("uses the historical owner's window scope after the reporter changes driver (#5)", () => {
+  const switched = { id: "switched", kind: "codex", provider: { driverKind: "codex", accountKey: "work", reachedScope: "account" }, limits: null as any };
+  const historical = { id: "claude", kind: "claude-code", provider: { driverKind: "claude-code", accountKey: "work", reachedScope: "window" }, limits: null as any };
+  const project = { agents: [switched, historical] };
+  const report = (id: string, reached?: string) => observeUsage(project, { agentId: "switched", kind: "status", ts: 1,
+    payload: { state: "usage_limits", provider: "claude", accountKey: "work", windows: [{ id, usedPercent: 100 }], reached } });
+  report("five_hour", "five_hour"); report("seven_day", "seven_day"); report("seven_day");
+  expect(historical.limits.reached).toBe("five_hour"); expect(switched.limits).toBeNull();
+});

@@ -292,3 +292,98 @@ it("uses Claude's offline auth status check and preserves unknown auth (B7)", as
     expect((await driver.selfCheck({ bin })).some(check => check.name === "signed in")).toBe(false);
   } finally { output.mockRestore(); }
 });
+
+it("shares concurrent disposal and cannot release a replacement's ownership (#1)", async () => {
+  let release!: () => void;
+  const dispose = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
+  const registry = new ProviderRegistry([{ ...remote, async create(input) { return { ...await remote.create(input), dispose }; } }]);
+  const first = await registry.create(remote.kind, "same", {}, environment("/server"));
+  const a = first.dispose(), b = first.dispose();
+  expect(dispose).toHaveBeenCalledOnce();
+  await expect(registry.create(remote.kind, "same", {}, environment("/server"))).rejects.toThrow(/already materialized/);
+  release(); await a;
+  const replacement = await registry.create(remote.kind, "same", {}, environment("/server"));
+  await b;
+  expect(registry.instances()).toEqual([replacement]);
+  await expect(registry.create(remote.kind, "same", {}, environment("/server"))).rejects.toThrow(/already materialized/);
+  const stop = replacement.dispose(); release(); await stop;
+});
+
+it("retains a resolved default across live turns and a cold directory reload (#2)", async () => {
+  const directory = new FileSessionDirectory(tmpDir("resolved-default"));
+  const adapter = new FakeAdapter("resolved", { capabilities: { sessionModelSwitch: "restart" } });
+  const start = adapter.startSession.bind(adapter), list = adapter.listSessions.bind(adapter);
+  vi.spyOn(adapter, "listSessions").mockImplementation(() => list().map(session => ({ ...session, model: session.model ?? "actual-default" })));
+  vi.spyOn(adapter, "startSession").mockImplementation(async input => {
+    const session = await start(input); session.model = input.modelSelection?.model ?? "actual-default"; return session;
+  });
+  const service = new ProviderService(directory); service.register(adapter);
+  const input = { threadId: "main", instanceId: adapter.instanceId, cwd: "/server", runtimeMode: "auto-accept-edits" as const, model: null };
+  const first = await service.ensureSession(input);
+  expect((await service.ensureSession(input)).via).toBe("live");
+  await service.stopAll();
+  const cold = new ProviderService(new FileSessionDirectory(path.dirname(path.dirname(directory.file)))); cold.register(adapter);
+  close.push(() => cold.stopAll());
+  expect((await cold.ensureSession(input)).session.resumeCursor).toBe(first.session.resumeCursor);
+  expect((await cold.ensureSession({ ...input, model: "named" })).via).toBe("fresh");
+  expect((await cold.ensureSession(input)).via).toBe("fresh");
+});
+
+it("opens a project with an unavailable driver and preserves normal recovery (#9)", async () => {
+  process.env.LOOM_HOME = tmpDir("missing-driver-home");
+  const dir = makeProjectDir({ agents: [{ id: "missing", kind: "retired-driver" }, { id: "echo", kind: "echo" }] });
+  const runtime = await ProjectRuntime.open({ id: "missing-driver", name: "test", dir });
+  close.push(() => runtime.close());
+  expect((await runtime.status()).agents.find(a => a.id === "missing")).toMatchObject({ available: false, enabled: true, busy: false });
+  await expect(createAgent({ id: "missing", kind: "retired-driver" }, dir).available()).resolves.toBe(false);
+  const unavailable = createAgent({ id: "missing", kind: "retired-driver" }, dir) as import("../../src/types.js").Adapter;
+  await expect(unavailable.send({ text: "work" })).rejects.toThrow(/unavailable/);
+  await runtime.sendMessage("work", "echo");
+  expect(runtime.config.agents.find(a => a.id === "missing")?.kind).toBe("retired-driver");
+});
+
+it("replays historical usage without the current driver's account identity (#5)", () => {
+  const usage = new NativeUsage();
+  usage.observe({ kind: "status", agentId: "switched", ts: 1, payload: { state: "usage_limits", provider: "claude", accountKey: "work", windows: [], reached: "five_hour" } });
+  expect(usage.limitsFor("codex", "work")).toBeNull();
+  expect(usage.limitsFor("claude-code", "work")?.reached).toBe("five_hour");
+});
+
+it("derives memory, review vendor and internal transport from driver records (#11)", async () => {
+  const { nativeMemoryFiles } = await import("../../src/core/memory.js");
+  const { vendorOf } = await import("../../src/core/team-landing.js");
+  const { claudeText } = await import("../../src/core/claude-cli.js");
+  const driver = providerRegistry.require("claude-code");
+  const internal = vi.spyOn(driver, "internalText").mockResolvedValue("fake internal answer");
+  try {
+    expect(nativeMemoryFiles({ id: "claude", kind: driver.kind })).toEqual(driver.presentation!.memoryFiles);
+    expect(vendorOf(driver.kind)).toBe(driver.presentation!.vendor);
+    expect(await claudeText("question", { model: "fake" })).toBe("fake internal answer");
+    expect(internal).toHaveBeenCalledWith("question", { model: "fake" });
+    expect(driver.orchestratorOptions!({ extraArgs: ["existing"] }).extraArgs).toEqual(expect.arrayContaining(["existing", "--allowedTools"]));
+    expect(driver.auxiliary!.command("ask", { mcpConfigPath: "fake.json" }).args("question")).toContain("fake.json");
+    expect(driver.auxiliary!.command("decision").args("question")).toContain("haiku");
+  } finally { internal.mockRestore(); }
+});
+
+it("uses registered policy records for a driver with no built-in core branches (#11)", async () => {
+  const driver = { ...remote, kind: "registry-policy-record", presentation: { vendor: "new-vendor", memoryFiles: ["REMOTE.md"],
+    aliases: ["remote alias"], blurb: "Remote policy from its driver" } };
+  providerRegistry.register(driver);
+  const { nativeMemoryFiles } = await import("../../src/core/memory.js");
+  const { vendorOf } = await import("../../src/core/team-landing.js");
+  const { OrchestraEngine, orchestratorBriefing } = await import("../../src/core/orchestra.js");
+  const cfg = { id: "remote-worker", kind: driver.kind };
+  expect(nativeMemoryFiles(cfg)).toEqual(["REMOTE.md"]); expect(vendorOf(driver.kind)).toBe("new-vendor");
+  const resolved = OrchestraEngine.prototype.resolveAgent.call({ host: { roster: () => [cfg], installedKinds: () => [] } } as any, "remote alias");
+  expect(resolved).toBe(cfg);
+  expect(orchestratorBriefing({ project: "test", goal: "work", workers: [cfg] } as any)).toContain("Remote policy from its driver");
+});
+
+it("preserves explicit historical usage ownership for an unavailable driver (#5)", () => {
+  const usage = new NativeUsage();
+  usage.observe({ kind: "status", agentId: "switched", ts: 1, payload: { state: "usage_limits", provider: "codex",
+    driverKind: "retired-usage-driver", accountKey: "work", reachedScope: "window", windows: [], reached: "old" } });
+  expect(usage.limitsFor("codex", "work")).toBeNull();
+  expect(usage.limitsFor("retired-usage-driver", "work")?.reached).toBe("old");
+});

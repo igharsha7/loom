@@ -477,7 +477,7 @@ export class LoomDaemon {
       this.broadcastFrame({
         type: "queue",
         projectId: info.id,
-        queue: q.items,
+        queue: q.items, version: q.version,
         paused: q.paused,
         ...(q.reason ? { reason: q.reason } : {}),
         ...(waitingFor ? { waitingFor } : {}),

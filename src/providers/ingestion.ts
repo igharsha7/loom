@@ -188,9 +188,12 @@ export class RuntimeIngestion {
       case "account.rate-limits.updated": {
         const provider = providerRegistry.get(event.provider)?.limits.provider ?? event.provider;
         const accountKey = this.options.accountKey?.();
-        status("usage_limits", { provider, windows: event.payload.windows,
+        const owners = providerRegistry.list().filter(d => d.limits.provider === provider);
+        const explicitOwner = owners.length !== 1 || owners[0]?.kind !== event.provider;
+        status("usage_limits", { provider, ...(explicitOwner ? { driverKind: event.provider } : {}), windows: event.payload.windows,
           ...(accountKey && accountKey !== provider ? { accountKey } : {}),
-          ...(event.payload.reachedScope ? { reachedScope: event.payload.reachedScope } : {}),
+          ...(event.payload.reachedScope ? { reachedScope: event.payload.reachedScope }
+            : explicitOwner && providerRegistry.get(event.provider) ? { reachedScope: providerRegistry.require(event.provider).limits.reachedScope } : {}),
           ...(event.payload.reached ? { reached: event.payload.reached } : {}) });
         return;
       }

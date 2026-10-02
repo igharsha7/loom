@@ -24,6 +24,7 @@
  * Explorer, the Timeline, and the Time-Travel Replay.
  */
 
+import { providerRegistry } from "../providers/registry.js";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -231,24 +232,9 @@ export function extractDecisionsRegex(text: string): RawDecision[] {
 
 /** Call the Anthropic API to extract decisions; empty on any failure. */
 async function llmExtract(turnText: string, apiKey: string): Promise<RawDecision[]> {
-  if (typeof globalThis.fetch !== "function") return [];
-  try {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({
-        model: DECISION_MODEL,
-        max_tokens: 1000,
-        messages: [{ role: "user", content: DECISION_EXTRACT_PROMPT + turnText.slice(0, 3000) }],
-      }),
-    });
-    if (!res.ok) return [];
-    const j = (await res.json()) as { content?: Array<{ text?: string }> };
-    const text = (j.content ?? []).map((c) => c.text ?? "").join("").trim();
-    return parseDecisionsJson(text);
-  } catch {
-    return [];
-  }
+  const auxiliary = providerRegistry.get("claude-code")?.auxiliary;
+  const text = await auxiliary?.apiText(DECISION_EXTRACT_PROMPT + turnText.slice(0, 3000), { apiKey, model: DECISION_MODEL, maxTokens: 1000 });
+  return text ? parseDecisionsJson(text) : [];
 }
 
 // ---------------------------------------------------------------------------
@@ -263,9 +249,6 @@ export type CliExtractor = (prompt: string) => Promise<string | null>;
 
 /** agy's cheap tier; the extraction is a small structured read, not reasoning. */
 const AGY_MODEL = process.env.LOOM_DECISION_AGY_MODEL || "gemini-3.6-flash-low";
-/** The claude alias used when agy isn't installed. Small + fast is right. */
-const CLAUDE_MODEL = process.env.LOOM_DECISION_CLAUDE_MODEL || "haiku";
-
 /** Where the agy installer drops the binary; it isn't always on the daemon's PATH. */
 const AGY_INSTALLED = path.join(os.homedir(), ".local", "bin", "agy");
 
@@ -328,7 +311,8 @@ export const defaultCliExtractor: CliExtractor = async (prompt) => {
   }
   // `claude -p --output-format json` puts the completion in `.result`; the
   // parser below tolerates either that wrapper or bare text.
-  return await runCli("claude", ["-p", prompt, "--output-format", "json", "--model", CLAUDE_MODEL], 90_000);
+  const command = providerRegistry.get("claude-code")?.auxiliary?.command("decision");
+  return command ? await runCli(command.bin, command.args(prompt), 90_000) : null;
 };
 
 /**

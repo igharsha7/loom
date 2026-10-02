@@ -4,9 +4,22 @@ import { ClaudeProviderAdapter, claudeBin, type ClaudeHistory } from "../claude/
 import { claudeCapabilities } from "./capabilities.js";
 import { cliOutput } from "../../adapters/base.js";
 import { CLAUDE_MODELS } from "./models.js";
+import { claudeAuxiliary } from "../claude/auxiliary.js";
+import { claudeText } from "../claude/cli.js";
+import { ORCHESTRATOR_VERIFY_TOOLS } from "./orchestrator.js";
 const checks = localChecks("claude-code", claudeBin, "claude-agent-sdk-stream-json-v1", "claude");
 export const claudeDriver: ProviderDriver<NativeConfig> = {
   kind: "claude-code", metadata: { displayName: "Claude Code", supportsMultipleInstances: true },
+  presentation: { vendor: "anthropic", aliases: ["claude", "claude code"], memoryFiles: ["CLAUDE.md", ".claude/CLAUDE.md", "AGENTS.md"],
+    blurb: "Claude Code (Anthropic): strong at multi-file changes, refactors, careful reasoning", orchestratorPriority: 1,
+    installHint: "npm i -g @anthropic-ai/claude-code", loginHint: "run `claude`, then /login",
+    usageWindows: { five_hour: "5-hour", seven_day: "weekly", seven_day_opus: "weekly Opus", seven_day_sonnet: "weekly Sonnet",
+      seven_day_overage_included: "weekly (overage)", overage: "overage" } },
+  internalText: claudeText, auxiliary: claudeAuxiliary,
+  orchestratorOptions(options) {
+    const extra = Array.isArray(options.extraArgs) ? options.extraArgs as string[] : [];
+    return { ...options, extraArgs: [...extra, "--allowedTools", ORCHESTRATOR_VERIFY_TOOLS.join(",")] };
+  },
   configSchema: nativeConfigSchema, defaultConfig: () => ({}), capabilities: claudeCapabilities,
   permissions: {
     default: "auto",

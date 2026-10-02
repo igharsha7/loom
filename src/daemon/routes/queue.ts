@@ -13,7 +13,7 @@ export function registerQueueRoutes(app: Express, withRuntime: WithRuntime): voi
     const q = rt.queue.snapshot();
     const head = q.items[0];
     const waitingFor = head && !q.paused ? rt.queueBlocker(head) : null;
-    return { queue: q.items, paused: q.paused, ...(q.reason ? { reason: q.reason } : {}), ...(waitingFor ? { waitingFor } : {}) };
+    return { queue: q.items, version: q.version, paused: q.paused, ...(q.reason ? { reason: q.reason } : {}), ...(waitingFor ? { waitingFor } : {}) };
   };
 
   const queueError = (res: express.Response, err: unknown) =>

@@ -45,6 +45,18 @@ export interface ProviderInstance {
 export interface ProviderDriver<C = Record<string, unknown>> {
   kind: string;
   metadata: { displayName: string; supportsMultipleInstances: boolean };
+  presentation?: {
+    vendor?: string; aliases?: string[]; memoryFiles?: string[]; blurb?: string;
+    orchestratorPriority?: number; usageWindows?: Record<string, string>;
+    installHint?: string; loginHint?: string;
+  };
+  orchestratorOptions?(options: Record<string, unknown>): Record<string, unknown>;
+  auxiliary?: {
+    command(job: "ask" | "decision", options?: { mcpConfigPath?: string }): { bin: string; label: string; args(prompt: string): string[] };
+    apiText(prompt: string, options: { apiKey: string; model: string; maxTokens: number }): Promise<string | null>;
+    triageText(prompt: string): Promise<string | null>;
+  };
+  internalText?(prompt: string, options?: { model?: string; timeoutMs?: number }): Promise<string>;
   configSchema: Decoder<C>;
   defaultConfig(): C;
   capabilities: AdapterCapabilities;

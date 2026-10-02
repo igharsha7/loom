@@ -10,44 +10,10 @@
  * still works if the backend is down.
  */
 
-import { spawn } from "node:child_process";
-import os from "node:os";
+import { providerRegistry } from "../providers/registry.js";
+export { parseCliOutput, parseAnthropicText } from "../providers/claude/auxiliary.js";
 import type { LoomEvent } from "../types.js";
 import { SERVICE_NAME, SPAN_TABLE, chLiteral, chQuery } from "./clickhouse.js";
-
-/**
- * The `claude` CLI in print mode emits either JSON (`--output-format json`,
- * whose `.result` is the text) or, on older CLIs, the raw text itself. Pull the
- * completion out of whichever we got; return null for an empty/again-parseable
- * result so triage falls back to the deterministic root cause.
- */
-export function parseCliOutput(raw: string): string | null {
-  const text = (raw || "").trim();
-  if (!text) return null;
-  try {
-    const j = JSON.parse(text) as { result?: unknown; is_error?: boolean };
-    if (j.is_error) return null;
-    const r = typeof j.result === "string" ? j.result.trim() : "";
-    return r || null;
-  } catch {
-    return text; // not JSON — treat as plain text
-  }
-}
-
-/**
- * A copy of the environment with Claude Code's nesting markers removed. When the
- * daemon is launched from inside a Claude Code session (or CI), the child
- * `claude` would otherwise inherit a child-session OAuth token that returns
- * empty completions. Stripping these is a no-op in a normal terminal.
- */
-function cliEnv(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k === "CLAUDECODE" || /^CLAUDE_CODE/i.test(k)) continue;
-    env[k] = v;
-  }
-  return env;
-}
 
 export type TriageSpan = {
   ts: number;
@@ -190,12 +156,6 @@ function heuristic(agent: string, spans: TriageSpan[]): { rootCause: string; sug
 const TRIAGE_MODEL = process.env.LOOM_TRIAGE_MODEL || "claude-haiku-4-5-20251001";
 
 /** Concatenate the text blocks of an Anthropic /v1/messages response. */
-export function parseAnthropicText(json: unknown): string | null {
-  const j = json as { content?: Array<{ type?: string; text?: string }> };
-  const text = (j?.content ?? []).map((c) => (typeof c.text === "string" ? c.text : "")).join("").trim();
-  return text || null;
-}
-
 /** The triage prompt — the agent's spans, newest first, and what to answer. */
 export function triagePrompt(agent: string, spans: TriageSpan[]): string {
   const lines = spans
@@ -219,51 +179,13 @@ async function llmPhrase(agent: string, spans: TriageSpan[]): Promise<string | n
   if (process.env.LOOM_TRIAGE_NO_LLM === "1") return null;
   const prompt = triagePrompt(agent, spans);
 
+  const auxiliary = providerRegistry.get("claude-code")?.auxiliary;
   const key = process.env.ANTHROPIC_API_KEY;
-  if (key && typeof globalThis.fetch === "function") {
-    try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
-        body: JSON.stringify({ model: TRIAGE_MODEL, max_tokens: 320, messages: [{ role: "user", content: prompt }] }),
-      });
-      if (res.ok) {
-        const text = parseAnthropicText(await res.json());
-        if (text) return text;
-      }
-    } catch {
-      /* fall through to CLI */
-    }
+  if (key && auxiliary) {
+    const text = await auxiliary.apiText(prompt, { apiKey: key, model: TRIAGE_MODEL, maxTokens: 320 });
+    if (text) return text;
   }
-  return await claudeCli(prompt);
-}
-
-/**
- * Best-effort: run the prompt through the signed-in `claude` CLI in print mode.
- * We ask for JSON so we can read `.result` reliably, run in a neutral cwd (no
- * project trust dialog, no giant CLAUDE.md pulled into context), and strip the
- * Claude Code nesting vars so a daemon started from inside a session still gets
- * a real completion. Falls back to null (→ heuristic) on timeout/empty.
- */
-function claudeCli(prompt: string): Promise<string | null> {
-  return new Promise((resolve) => {
-    let child: ReturnType<typeof spawn>;
-    try {
-      child = spawn("claude", ["-p", prompt, "--output-format", "json"], {
-        stdio: ["ignore", "pipe", "ignore"],
-        cwd: os.tmpdir(),
-        env: cliEnv(),
-      });
-    } catch {
-      resolve(null);
-      return;
-    }
-    let out = "";
-    const kill = setTimeout(() => { try { child.kill(); } catch { /* ignore */ } resolve(null); }, 30_000);
-    child.stdout?.on("data", (d: Buffer) => (out += d.toString()));
-    child.on("error", () => { clearTimeout(kill); resolve(null); });
-    child.on("close", () => { clearTimeout(kill); resolve(parseCliOutput(out)); });
-  });
+  return auxiliary?.triageText(prompt) ?? null;
 }
 
 /**

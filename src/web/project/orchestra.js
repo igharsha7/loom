@@ -43,7 +43,7 @@ export function createOrchestra(view) {
       var ids = roster.map(function(a){ return a.id; });
       // Claude Code conducts by default when it's here; otherwise whoever's first.
       if (!c.orchestrator || ids.indexOf(c.orchestrator) < 0) {
-        var cc = roster.filter(function(a){ return a.kind === "claude-code"; })[0] || roster[0];
+        var cc = roster.slice().sort(function(a,b){ return ((b.provider || {}).orchestratorPriority || 0) - ((a.provider || {}).orchestratorPriority || 0); })[0] || roster[0];
         c.orchestrator = cc ? cc.id : null;
       }
       return c;

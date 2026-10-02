@@ -50,9 +50,9 @@ export class NativeUsage {
       case "usage_limits": {
         if (typeof p.provider !== "string" || !Array.isArray(p.windows)) return;
         // A report can carry one window (Claude sends one per event): merge by id.
-        const driver = providerRegistry.get(driverKind ?? (typeof p.driverKind === "string" ? p.driverKind : ""))
-          ?? providerRegistry.list().find(d => d.limits.provider === p.provider);
-        const account = JSON.stringify([driver?.kind ?? p.provider, typeof p.accountKey === "string" ? p.accountKey : p.provider]);
+        const kind = typeof p.driverKind === "string" ? p.driverKind : driverKind;
+        const driver = kind ? providerRegistry.get(kind) : providerRegistry.list().find(d => d.limits.provider === p.provider);
+        const account = JSON.stringify([kind ?? driver?.kind ?? p.provider, typeof p.accountKey === "string" ? p.accountKey : p.provider]);
         const previous = this.limits.get(account);
         const windows = new Map((previous?.windows ?? []).map(w => [w.id, w]));
         for (const w of p.windows as ProviderLimits["windows"]) if (w && typeof w.id === "string") windows.set(w.id, w);

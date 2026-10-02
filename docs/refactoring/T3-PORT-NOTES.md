@@ -322,8 +322,10 @@ test fix (#212). These are the changes that touch the port:
   project agent/service lifetime instead of Effect services and scopes. Config
   is decoded before materialization; disposal must retain failed fencing handles.
 - Brain still owns evidence, packets, receipts and review. Built-in compatibility
-  keys and instruction fingerprints retain their previous formats, including
-  in-session model switching and round-11 instruction discovery. A new driver
+  keys retain their previous formats, including in-session model switching.
+  Instruction fingerprints keep the hash encoding but now observe per-driver
+  sources (including project rules); existing bindings load and changed hashes
+  cause conservative reconstruction. A new driver
   supplies its own policy; Brain has no provider-specific construction branch.
 - Driver ids are open persisted strings. An unavailable driver does not discard
   saved cursors/bindings. Session files accept an optional `continuationKey`;
@@ -340,3 +342,36 @@ test fix (#212). These are the changes that touch the port:
   settlement, cancellation, Stop retry, restart/resume, rollback and compaction
   scenarios against every built-in. Phase 6 management UI and real remote drivers
   remain out of scope.
+
+## Follow-up audit boundary and compatibility (2026-10-02)
+
+The registry boundary is dispatch, continuation identity, instruction discovery,
+settlement, health and account usage policy. It is not "no provider names remain".
+Drivers also supply memory conventions, vendor identity, aliases/briefings,
+orchestration priority and flags, setup hints and usage-window presentation.
+Concrete Claude internal CLI/API commands now live under `providers/claude`;
+core/observability facades retain their old entry points and engine preferences.
+The behavioral engine defaults, prompts, fallback ordering and timeouts remain.
+
+Persisted addition: optional session `runtimePayload.requestedModel` distinguishes
+null (requested default) from the resolved model. Old records lack that evidence:
+null adopts their cursor, explicit names use their resolved model as the fallback.
+Queue epoch/revision is wire-only and resets on materialization; queue files do
+not change. New usage events add `driverKind` and the driver's reached scope for ambiguous labels; legacy
+Codex/Claude payloads retain their shapes. Historical replay infers old labels
+without consulting the current roster's kind/account.
+
+Claude observes project `.claude/rules` on ancestors and user rules. Symlinks are
+supported, including intentional outside-tree targets, with realpath cycle
+protection and explicit entry/depth/time/content limits; containment was not
+imposed because Claude itself follows these links. Irrelevant regular files are
+not statted; dangling irrelevant links are skipped. Codex's driver observation
+is independent. Repeated observations at prepare/submit are intentional freshness
+checks: caching them would reintroduce the race. Source-set changes invalidate
+old fingerprints once, causing reconstruction rather than dropping persisted data.
+
+Phase 6 retains product catalogs and browser labels/icons, runner credential
+mount provisioning, legacy public names and historical label migration,
+operator-selected internal engine defaults, remaining non-registry ADE policy,
+management/login UI and remote-provider implementations. These are explicit
+remaining seams, not evidence that all provider-specific code has been removed.

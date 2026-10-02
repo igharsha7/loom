@@ -7,6 +7,7 @@ import { cliAvailable, cliOutput, firstLine } from "../../adapters/base.js";
 import type { ProviderAdapter } from "../adapter.js";
 import type { InstanceInput, ProviderContinuity, ProviderDriver, ProviderInstance, WriterIdentity } from "../driver.js";
 import type { ProviderSession } from "../contracts.js";
+import { codexInstructions, claudeInstructions } from "./instructions.js";
 import { nativeInstructions } from "../instructions.js";
 import { processGroupIdentity, stopRecordedProcessGroup } from "../process.js";
 import { NativeDispatchRejected } from "../settlement.js";
@@ -18,7 +19,7 @@ export const nativeConfigSchema = z.looseObject({ bin: z.string().optional(), mo
 export type NativeConfig = z.infer<typeof nativeConfigSchema>;
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 export function continuity(kind: string, window: number): ProviderContinuity {
-  return { supported: true, protocolRevision: "turn-input-v2", defaultContextWindow: window, instructionDependencies: nativeInstructions,
+  return { supported: true, protocolRevision: "turn-input-v2", defaultContextWindow: window, instructionDependencies: cwd => nativeInstructions(cwd, kind === "codex" ? codexInstructions() : claudeInstructions()),
     compatibilityKey({ options, workspaceId }) {
       // Preserve the pre-registry hashes: both built-ins switch models in session.
       const { model: _model, ...stable } = options;

@@ -189,7 +189,7 @@ export class ProjectRuntime {
     );
     if (this.continuity) this.harnesses.start();
     // The last readings survive a restart: replay the recent reports.
-    for (const e of log.list({ kinds: ["status", "run_complete", "error"], limit: 500 })) this.nativeUsage.observe(e, this.config.agents.find(a => a.id === e.agentId)?.kind);
+    for (const e of log.list({ kinds: ["status", "run_complete", "error"], limit: 500 })) this.nativeUsage.observe(e);
     this.conversations = new ConversationStore(info.dir);
     const runtime = this;
     this.accounting = new RuntimeAccounting({
@@ -3071,7 +3071,7 @@ export class ProjectRuntime {
           ...sampling(cfg),
           ...(cfg.avatar ? { avatar: cfg.avatar } : {}),
           ...(isNativeKind(cfg.kind) ? { provider: { driverKind: cfg.kind, accountKey: providerRegistry.accountKey(cfg.kind, cfg.options ?? {}),
-            limitsProvider: providerRegistry.require(cfg.kind).limits.provider, reachedScope: providerRegistry.require(cfg.kind).limits.reachedScope },
+            limitsProvider: providerRegistry.require(cfg.kind).limits.provider, reachedScope: providerRegistry.require(cfg.kind).limits.reachedScope, ...providerRegistry.require(cfg.kind).presentation },
             context: this.nativeUsage.context(cfg.id), limits: this.nativeUsage.limitsFor(cfg.kind, providerRegistry.accountKey(cfg.kind, cfg.options ?? {})) } : {}),
         };
       }),
