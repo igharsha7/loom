@@ -321,7 +321,7 @@ Decided with the user 2026-10-02.
   models), `provider_status` frames, and the model picker re-rendering live.
   Live check: Codex 8 models in ~1 s, Claude 12 in ~2 s, both with sign-in,
   no turn taken and nothing left running. Tests set `LOOM_PROVIDER_PROBES=0`.
-- [ ] OpenCode as a registry driver. Upstream main (#213, merged 2026-10-03)
+- [x] OpenCode as a registry driver. Upstream main (#213, merged 2026-10-03)
   added native continuity for OpenCode inside the legacy
   `src/adapters/opencode.ts`, with a hard-coded native-kind list. On this
   branch a native kind is a registry driver with a `ProviderAdapter`, so the
@@ -332,6 +332,19 @@ Decided with the user 2026-10-02.
   `/api/session/active` for quiescence, `session.next.*` events, `baseUrl`
   health) and its fake server (`test/opencode-fake.ts`). Done when
   `test/opencode-continuity.test.ts` runs unskipped.
+  Done 2026-10-03: `src/providers/opencode/adapter.ts` and
+  `src/providers/drivers/opencode.ts`; the legacy `src/adapters/opencode.ts` is
+  gone. One warm `opencode serve` per agent (or `baseUrl`), a session per chat,
+  Loom-chosen `msg_` ids as turn ids, admission as acceptance, leaving
+  `/api/session/active` as settlement (writers finish inside the session),
+  permission and question requests answered through Loom, manual compaction,
+  conversation rollback by `revert/stage` + `commit` (files stay with Loom's
+  checkpoints), late events attributed by reply id, and the model catalogue as
+  OpenCode reports it (provider, free models, Zen/Go). "Ask" mode stays
+  unsupported (upstream saw the headless API ignore deny rules). Tests: 20 in
+  `test/opencode-continuity.test.ts` and the 12 conformance scenarios via a
+  scripted fake `opencode` CLI (`fakeOpenCodeCli`). Not yet run against a live
+  model: revert and permission replies are checked against 1.18.34's `/doc`.
 - [ ] Instances: several accounts per driver (the registry's continuation and
   account identity), auth status, install/update detection, native session
   history import.

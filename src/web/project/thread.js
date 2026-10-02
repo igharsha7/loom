@@ -313,6 +313,8 @@ export function createThread(view) {
 
     function reconcileApprovals(){
       if (!view.historyLoaded || !state.approvals || state.approvals.pid !== view.pid) return;
+      // A queued flush can run after the page is gone (a closed window has no document).
+      if (typeof document === "undefined" || !document) return;
       var feed = document.getElementById("feed"); if (!feed) return;
       Array.prototype.forEach.call(feed.querySelectorAll(".apcard:not(.done)[data-approval]"), function(c){
         var id = c.getAttribute("data-approval");

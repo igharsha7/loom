@@ -68,12 +68,6 @@ export const ADES: AdeSpec[] = [
   ...providerRegistry.list().map(driver => ({ kind: driver.kind, label: driver.metadata.displayName,
     tier: "adapter" as const, probe: () => driver.available(providerRegistry.decode(driver.kind, {})) })),
   {
-    kind: "opencode",
-    label: "OpenCode",
-    tier: "adapter",
-    probe: () => cliAvailable("opencode"),
-  },
-  {
     kind: "grok-code",
     label: "Grok Code",
     tier: "adapter",

@@ -603,6 +603,11 @@ export class ClaudeCodeAdapter extends ProviderAgent {
   constructor(id: string, projectDir: string, options: Record<string, unknown> = {}) { super(id, "claude-code", projectDir, options); }
 }
 
+/** OpenCode as a Loom agent. */
+export class OpenCodeAdapter extends ProviderAgent {
+  constructor(id: string, projectDir: string, options: Record<string, unknown> = {}) { super(id, "opencode", projectDir, options); }
+}
+
 /** Codex as a Loom agent. */
 export class CodexAdapter extends ProviderAgent {
   constructor(id: string, projectDir: string, options: Record<string, unknown> = {}) { super(id, "codex", projectDir, options); }

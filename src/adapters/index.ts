@@ -10,7 +10,6 @@ import { KiroBridge } from "./bridges/kiro.js";
 import { EchoAdapter } from "./echo.js";
 import { GrokAdapter } from "./grok.js";
 import { ModelAdapter } from "./model.js";
-import { OpenCodeAdapter } from "./opencode.js";
 import { providerRegistry } from "../providers/registry.js";
 import { UnavailableAdapter } from "./unavailable.js";
 import { ProviderAgent } from "../providers/agent.js";
@@ -50,9 +49,8 @@ export function tierForKind(kind: string): "adapter" | "bridge" | null {
 }
 
 registerAgentKind("echo", (cfg, dir) => new EchoAdapter(cfg.id, "echo", dir));
-// Codex and Claude Code run as warm provider sessions (src/providers/).
+// Codex, Claude Code and OpenCode run as warm provider sessions (src/providers/).
 for (const driver of providerRegistry.list()) registerAgentKind(driver.kind, (cfg, dir) => new ProviderAgent(cfg.id, driver.kind, dir, cfg.options));
-registerAgentKind("opencode", (cfg, dir) => new OpenCodeAdapter(cfg.id, dir, cfg.options));
 registerAgentKind("grok-code", (cfg, dir) => new GrokAdapter(cfg.id, dir, cfg.options));
 // An agent that is a model endpoint rather than a command — see adapters/model.ts.
 registerAgentKind("model", (cfg, dir) => new ModelAdapter(cfg.id, dir, cfg.options));

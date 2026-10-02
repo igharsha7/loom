@@ -9,7 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { LoomEvent, ProjectConfig } from "../src/types.js";
-import { parseModelRef } from "../src/adapters/opencode.js";
+import { parseModelRef } from "../src/providers/opencode/adapter.js";
 import { readDaemonConfig, writeProjectConfig } from "../src/core/registry.js";
 import { resolveSteps } from "../src/core/routes.js";
 import { DaemonClient } from "../src/daemon/client.js";

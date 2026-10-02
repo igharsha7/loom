@@ -19,7 +19,13 @@ import { launched, spawnHarness, stopHarness } from "./process.js";
 import { agentEnv } from "../adapters/base.js";
 import { VERSION } from "../version.js";
 
-export interface ProviderModel { id: string; name?: string; isDefault?: boolean; resolvedModel?: string }
+export interface ProviderModel {
+  id: string; name?: string; isDefault?: boolean; resolvedModel?: string;
+  /** Who serves it, when the harness routes to several (OpenCode: Zen, Go, a connected provider). */
+  provider?: string;
+  /** Costs nothing to use, as the harness reports it. */
+  free?: boolean;
+}
 export interface ProviderAuth {
   status: "signed-in" | "signed-out" | "unknown";
   /** Email or account name, when the harness says. */

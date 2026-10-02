@@ -72,19 +72,6 @@ export const PERMISSION_PROFILES: Record<string, PermissionProfile> = {
       ask: { flags: "--permission-mode plan", label: "Ask — plan mode: proposes, makes no changes", ask: "read-only" },
     },
   },
-  opencode: {
-    default: "auto",
-    modes: {
-      bypass: { flags: 'permission: {"*":"allow"}', label: "Bypass — every tool allowed" },
-      auto: { flags: "opencode defaults", label: "Auto — opencode's own defaults" },
-      ask: {
-        flags: "—",
-        label: "Ask — not available for OpenCode",
-        unsupported:
-          "opencode 1.18.31's headless API ignores both a deny-all permission config and its read-only plan agent — a file write went through",
-      },
-    },
-  },
   /**
    * A model agent (adapters/model.ts) has no CLI flags — Loom runs its tool
    * loop itself, so these say what Loom does rather than what a command line

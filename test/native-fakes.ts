@@ -330,3 +330,120 @@ export const turnsOf = (bin: string): Array<{ turn: number; pid: number; thread?
   if (!fs.existsSync(file)) return [];
   return fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as { turn: number; pid: number; thread?: string });
 };
+
+export interface FakeOpenCodeCliOptions {
+  /** Events after each admitted prompt. Defaults to OPENCODE_OK. */
+  script?: Step[];
+  /** Per-turn scripts (turn 1, turn 2, …); a turn past the end uses `script`. */
+  scripts?: Step[][];
+  /** POST /prompt answers this status instead of admitting. */
+  refusePrompt?: number;
+  version?: string;
+}
+
+/** An OpenCode event for the running turn ($SESSION, $TURN = the user message, $MSG = the reply). */
+export const opencodeEvent = (type: string, properties: Record<string, unknown> = {}): Step =>
+  ({ event: type, properties: { sessionID: "$SESSION", assistantMessageID: "$MSG", ...properties } });
+/** The reply is complete and the session goes idle. */
+export const opencodeDone = (error?: string): Step => ({ done: error ? { error } : {} });
+
+/** A complete, ordinary OpenCode turn. */
+export const OPENCODE_OK: Step[] = [
+  opencodeEvent("session.next.step.started", { model: { providerID: "opencode", id: "big-pickle" } }),
+  opencodeEvent("session.next.text.delta", { textID: "t0", delta: "Did the work." }),
+  opencodeEvent("session.next.step.ended", { finish: "stop", cost: 0, tokens: { input: 900, output: 20, reasoning: 0, cache: { read: 100, write: 0 } } }),
+  opencodeDone(),
+];
+
+/**
+ * A fake `opencode` that serves `opencode serve`'s HTTP API (the 1.18 shapes
+ * test/opencode-fake.ts records). A turn's steps run when a prompt is
+ * admitted; `{ done }` completes the reply and takes the session off
+ * /api/session/active. Sessions persist next to the binary, so a restarted
+ * server still has them. Returns its path.
+ */
+export function fakeOpenCodeCli(options: FakeOpenCodeCliOptions = {}): string {
+  const dir = tmpDir("fake-opencode"), bin = path.join(dir, "opencode");
+  const config = { script: options.script ?? OPENCODE_OK, scripts: options.scripts ?? [], refusePrompt: options.refusePrompt ?? 0, version: options.version ?? "1.18.34" };
+  fs.writeFileSync(bin, `#!/usr/bin/env node
+${RUNNER}
+const http = require("node:http");
+const config = ${JSON.stringify(config)};
+const args = process.argv.slice(2);
+record("calls.jsonl", args);
+if (args.includes("--version")) { console.log(config.version); process.exit(0); }
+if (args[0] !== "serve") { console.error("unexpected args"); process.exit(2); }
+const port = Number(args[args.indexOf("--port") + 1]);
+const store = path.join(here, "sessions.json");
+const sessions = fs.existsSync(store) ? JSON.parse(fs.readFileSync(store, "utf8")) : {};
+const save = () => fs.writeFileSync(store, JSON.stringify(sessions));
+const active = new Set(), streams = new Set(), staged = {};
+let seq = 0, turns = 0;
+const id = (p) => p + "_" + Date.now().toString(16).padStart(12, "0") + String(++seq).padStart(14, "0");
+const push = (type, properties) => { const line = "data: " + JSON.stringify({ id: id("evt"), type, properties }) + "\\n\\n"; for (const r of streams) r.write(line); };
+const send = (res, status, body) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(body)); };
+const body = (req) => new Promise((resolve) => { let raw = ""; req.on("data", (c) => raw += c); req.on("end", () => { try { resolve(raw ? JSON.parse(raw) : {}); } catch { resolve({}); } }); });
+const fillAll = (v, vars) => JSON.parse(JSON.stringify(v).replace(/\\$(SESSION|TURN|MSG)/g, (_, k) => vars[k]));
+async function run(script, vars, s) {
+  for (const step of script) {
+    if (vars.interrupted) return;
+    if ("event" in step) push(step.event, fillAll(step.properties, vars));
+    else if ("sleep" in step) await sleep(step.sleep);
+    else if ("exit" in step) process.exit(step.exit);
+    else if ("spawn" in step) require("node:child_process").spawn(process.execPath, ["-e", step.spawn], { stdio: ["ignore", "inherit", "inherit"] }).unref();
+    else if ("done" in step) {
+      s.messages.push({ id: vars.MSG, type: "assistant", time: { created: Date.now(), completed: Date.now() }, finish: step.done.error ? "error" : "stop",
+        ...(step.done.error ? { error: { message: step.done.error } } : {}), tokens: { input: 900, output: 20, reasoning: 0, cache: { read: 100, write: 0 } }, model: s.model });
+      save();
+      active.delete(vars.SESSION);
+      push("session.idle", { sessionID: vars.SESSION });
+    }
+  }
+}
+const running = {};
+http.createServer(async (req, res) => {
+  const p = new URL(req.url, "http://x").pathname;
+  if (p === "/api/health") return send(res, 200, { healthy: true });
+  if (p === "/api/model") return send(res, 200, { data: [{ providerID: "opencode", id: "big-pickle", name: "Big Pickle", limit: { context: 200000, output: 32000 }, cost: [{ input: 0, output: 0 }] }] });
+  if (p === "/api/provider") return send(res, 200, { data: [{ id: "opencode", name: "OpenCode Zen" }] });
+  if (p === "/event") { res.writeHead(200, { "content-type": "text/event-stream" }); res.write("data: {\\"type\\":\\"server.connected\\",\\"properties\\":{}}\\n\\n"); streams.add(res); req.on("close", () => streams.delete(res)); return; }
+  if (p === "/api/session/active") return send(res, 200, { data: Object.fromEntries([...active].map((s) => [s, { type: "busy" }])) });
+  if (p === "/api/session" && req.method === "POST") {
+    const b = await body(req), sid = id("ses");
+    sessions[sid] = { model: b.model || { providerID: "opencode", id: "big-pickle" }, messages: [] }; save();
+    return send(res, 200, { data: { id: sid, model: sessions[sid].model } });
+  }
+  const m = /^\\/api\\/session\\/([^/]+)(?:\\/(.*))?$/.exec(p);
+  if (!m) return send(res, 404, { message: "no route" });
+  const sid = decodeURIComponent(m[1]), rest = m[2] || "", s = sessions[sid];
+  if (!s) return send(res, 404, { _tag: "SessionNotFoundError", message: "Session not found: " + sid });
+  if (rest === "" ) return send(res, 200, { data: { id: sid, model: s.model } });
+  if (rest === "model") { s.model = (await body(req)).model; save(); return send(res, 200, {}); }
+  if (rest === "message") return send(res, 200, { data: s.messages });
+  if (rest === "interrupt") { if (running[sid]) running[sid].interrupted = true; active.delete(sid); push("session.idle", { sessionID: sid }); return send(res, 200, {}); }
+  if (rest === "compact") {
+    send(res, 200, {});
+    const mid = id("msg");
+    setTimeout(() => { push("session.next.compaction.started", { sessionID: sid, messageID: mid, reason: "manual" }); push("session.next.compaction.ended", { sessionID: sid, messageID: mid, reason: "manual", text: "", recent: "" }); }, 10);
+    return;
+  }
+  if (rest === "revert/stage") { const b = await body(req); if (!s.messages.some((x) => x.id === b.messageID)) return send(res, 400, { message: "no message" }); staged[sid] = b.messageID; return send(res, 200, { data: { messageID: b.messageID } }); }
+  if (rest === "revert/commit") { const at = s.messages.findIndex((x) => x.id === staged[sid]); if (at < 0) return send(res, 400, { message: "nothing staged" }); s.messages.splice(at); delete staged[sid]; save(); record("history.jsonl", { session: sid, messages: s.messages.map((x) => x.id) }); return send(res, 200, {}); }
+  if (rest === "prompt" && req.method === "POST") {
+    const b = await body(req);
+    if (config.refusePrompt) return send(res, config.refusePrompt, { message: "refused" });
+    const vars = { SESSION: sid, TURN: b.id, MSG: id("msg"), interrupted: false };
+    s.messages.push({ id: b.id, type: "user", text: b.prompt.text, time: { created: Date.now() } }); save();
+    turns++;
+    record("turns.jsonl", { turn: turns, pid: process.pid, thread: sid });
+    active.add(sid);
+    running[sid] = vars;
+    send(res, 200, { data: { admittedSeq: s.messages.length, id: b.id, sessionID: sid, delivery: "steer" } });
+    void run(config.scripts[turns - 1] || config.script, vars, s);
+    return;
+  }
+  send(res, 404, { message: "no route " + p });
+}).listen(port, "127.0.0.1");
+`, { mode: 0o755 });
+  return bin;
+}

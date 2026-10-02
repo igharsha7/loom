@@ -376,6 +376,10 @@ export function createComposer(view) {
       setTimeout(function(){ document.addEventListener("mousedown", menuAway); }, 0);
       var active = cur.model || "";
       var allModels = [], rowsNow = [], hi = 0;
+      // Models the harness itself reports as free (OpenCode marks its own).
+      var freeIds = {};
+      var noteFree = function(details){ freeIds = {}; (details || []).forEach(function(m){ if (m && m.free) freeIds[m.id] = true; }); };
+      var isFree = function(mm){ return /:free$/.test(mm) || !!freeIds[mm]; };
       function choose(val){
         if (val === "__custom__"){
           closeMenu();
@@ -411,10 +415,10 @@ export function createComposer(view) {
           : [{ label: "Default", sub: "whatever " + agentLabel(cur.kind, cur.id) + " picks", value: "" }];
         // Free models first: on a provider's free tier they cost nothing, and
         // "which of these 300 is free" shouldn't take a search to answer.
-        var free = shown.filter(function(mm){ return /:free$/.test(mm); });
-        var paid = shown.filter(function(mm){ return !/:free$/.test(mm); });
+        var free = shown.filter(isFree);
+        var paid = shown.filter(function(mm){ return !isFree(mm); });
         var ordered = free.concat(paid).slice(0, cap);
-        rowsNow = head.concat(ordered.map(function(mm){ return { label: mm, value: mm, group: /:free$/.test(mm) ? "Free" : (free.length ? "Paid" : "") }; }));
+        rowsNow = head.concat(ordered.map(function(mm){ return { label: mm, value: mm, group: isFree(mm) ? "Free" : (free.length ? "Paid" : "") }; }));
         if (!f) rowsNow.push({ label: "Custom model\u2026", value: "__custom__", plus: true });
         // A model agent stores "vendor/model" apart from its provider, while
         // the list leads with the provider: match either way.
@@ -445,6 +449,7 @@ export function createComposer(view) {
       }
       api("/api/projects/" + view.pid + "/agents/" + encodeURIComponent(agentId) + "/models").then(function(j){
         allModels = (j && j.models) || [];
+        noteFree(j && j.details);
         // Say where the list came from. "asked the tool" and "the aliases we
         // ship" are different claims, and only one of them goes stale silently.
         var mn = document.getElementById("cmenu");
@@ -484,6 +489,7 @@ export function createComposer(view) {
           var snap = (providers || []).filter(function(p){ return p.agentId === agentId; })[0];
           if (!snap || !snap.models || !snap.models.length) return;
           allModels = snap.models.map(function(m){ return m.id; });
+          noteFree(snap.models);
           render(sb2.value);
         };
       }).catch(function(err){

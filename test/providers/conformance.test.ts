@@ -11,7 +11,7 @@ import { RuntimeIngestion, type IngestedEvent } from "../../src/providers/ingest
 import { NativeQuiescenceUnknown } from "../../src/providers/settlement.js";
 import * as processes from "../../src/providers/process.js";
 import { makeProjectDir, waitUntil } from "../helpers.js";
-import { CLAUDE_OK, CODEX_OK, claudeResult, claudeText, codexDone, codexNotify, fakeClaude, fakeCodex, stdinOf, turnsOf, type Step } from "../native-fakes.js";
+import { CLAUDE_OK, CODEX_OK, OPENCODE_OK, claudeResult, claudeText, codexDone, codexNotify, fakeClaude, fakeCodex, fakeOpenCodeCli, opencodeDone, opencodeEvent, stdinOf, turnsOf, type Step } from "../native-fakes.js";
 
 interface Fixture {
   make(script?: Step[]): string;
@@ -22,6 +22,8 @@ interface Fixture {
   compact: Step[];
   late(): string;
   history?(bin: string): Record<string, unknown>;
+  /** The native turns left after a rollback, when the driver isn't Codex or Claude. */
+  rolledBack?(bin: string, cursor: string): string[];
 }
 const started = codexNotify("turn/started", { turn: { id: "$TURN" } });
 const fixtures: Record<string, Fixture> = {
@@ -64,6 +66,21 @@ const fixtures: Record<string, Fixture> = {
         const list = await messages(session), id = crypto.randomUUID(); snapshots.set(id, list.slice(0, list.findIndex(m => m.uuid === before) + 1)); return { sessionId: id };
       } } };
     },
+  },
+};
+// OpenCode settles at turn level by itself: a session leaves /api/session/active
+// only once every tool it ran has finished, so its writers stay inside the turn.
+const tool = (id: string, kind: "command" | "child") => opencodeEvent("session.next.tool.called", { callID: id, tool: kind === "child" ? "task" : "bash", input: { command: "write", description: "writes" } });
+const toolDone = (id: string) => opencodeEvent("session.next.tool.success", { callID: id, content: [{ type: "text", text: "finished" }] });
+fixtures.opencode = {
+  make: script => fakeOpenCodeCli({ ...(script ? { script } : {}) }), ok: OPENCODE_OK, refusal: () => fakeOpenCodeCli({ refusePrompt: 500 }),
+  writer: (kind, finish) => finish ? [tool("cmd", kind), { sleep: 120 }, toolDone("cmd"), opencodeDone()] : [tool("cmd", kind)],
+  compact: OPENCODE_OK,
+  late: () => fakeOpenCodeCli({ scripts: [[tool("late-tool", "command"), opencodeDone(), { sleep: 300 }, toolDone("late-tool")], [{ sleep: 600 }, ...OPENCODE_OK]] }),
+  history: () => ({ pollMs: 20, turnTimeoutMs: 1500 }),
+  rolledBack(bin, cursor) {
+    const sessions = JSON.parse(fs.readFileSync(path.join(path.dirname(bin), "sessions.json"), "utf8")) as Record<string, { messages: Array<{ id: string; type: string }> }>;
+    return sessions[cursor]!.messages.filter(m => m.type === "user").map(m => m.id);
   },
 };
 const dispose: Array<() => Promise<void>> = [];
@@ -178,7 +195,9 @@ for (const driver of builtInDrivers) describe(`${driver.metadata.displayName} ad
     await value.adapter.validateRollback!("main", turns[1]!);
     const rolled = await value.adapter.rollbackThread!("main", turns[1]!);
     expect(rolled.resumeCursor).toBeTruthy();
-    if (driver.kind === "codex") {
+    if (fixture.rolledBack) {
+      expect(fixture.rolledBack(bin, String(rolled.resumeCursor))).toEqual([turns[0]]);
+    } else if (driver.kind === "codex") {
       const history = JSON.parse(fs.readFileSync(path.join(path.dirname(bin), `${String(rolled.resumeCursor)}.history.json`), "utf8"));
       expect(history).toEqual([turns[0]]);
     } else {

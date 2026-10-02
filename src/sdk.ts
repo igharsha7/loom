@@ -32,10 +32,9 @@ export {
 } from "./adapters/base.js";
 export { registerAgentKind, createAgent, knownAgentKinds } from "./adapters/index.js";
 export { EchoAdapter } from "./adapters/echo.js";
-export { ProviderAgent, ClaudeCodeAdapter, CodexAdapter } from "./providers/agent.js";
+export { ProviderAgent, ClaudeCodeAdapter, CodexAdapter, OpenCodeAdapter } from "./providers/agent.js";
 export type { ProviderAdapter } from "./providers/adapter.js";
 export type { ProviderDriver, ProviderInstance, ProviderEnvironment, ProviderContinuity, ProviderHealth, ContinuationIdentity, WriterIdentity, WriterRecovery } from "./providers/driver.js";
 export { ProviderRegistry, providerRegistry } from "./providers/registry.js";
 export { NativeDispatchRejected, NativeSessionMissing, NativeQuiescenceUnknown } from "./providers/settlement.js";
-export { OpenCodeAdapter } from "./adapters/opencode.js";
 export { AntigravityBridge } from "./adapters/bridges/antigravity.js";

@@ -15,6 +15,13 @@ export function claudeInstructions(): InstructionSources {
     files: [path.join(home, "CLAUDE.md"), path.join(managed, "CLAUDE.md")], rules: [path.join(home, "rules")], imports: true };
 }
 
+/** OpenCode reads AGENTS.md (CLAUDE.md when there is none) up the tree, and its global AGENTS.md. */
+export function opencodeInstructions(): InstructionSources {
+  const home = process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), ".config");
+  return { ancestorFiles: ["AGENTS.md", "CLAUDE.md"], files: [path.join(home, "opencode", "AGENTS.md"), path.join(os.homedir(), ".claude", "CLAUDE.md")],
+    ancestorRules: [], rules: [], imports: false };
+}
+
 /** Compatibility entry point for callers that explicitly observe both harnesses. */
 export function legacyInstructionSources(): InstructionSources {
   const codex = codexInstructions(), claude = claudeInstructions();

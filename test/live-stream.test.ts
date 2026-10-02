@@ -16,7 +16,6 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { EchoAdapter } from "../src/adapters/echo.js";
 import { splitQualifiedModel } from "../src/adapters/model.js";
-import { OpenCodeAdapter } from "../src/adapters/opencode.js";
 import { EventLog } from "../src/core/eventlog.js";
 import { readDaemonConfig } from "../src/core/registry.js";
 import { DaemonClient } from "../src/daemon/client.js";
@@ -63,20 +62,7 @@ describe("paging a thread backwards", () => {
   }
 });
 
-describe("opencode's live text", () => {
-  it("streams session.next deltas for its own session only", () => {
-    const a = new OpenCodeAdapter("opencode", tmpDir("oc"), {});
-    const got: StreamDelta[] = [];
-    a.onStream((d) => got.push(d));
-    const sse = (a as unknown as { handleSse(e: unknown): void; sessionId: string | null });
-    sse.sessionId = "ses_mine";
-    sse.handleSse({ type: "session.next.text.delta", properties: { sessionID: "ses_mine", delta: "Warp" } });
-    sse.handleSse({ type: "session.next.text.delta", properties: { sessionID: "ses_other", delta: "not mine" } });
-    sse.handleSse({ type: "session.next.reasoning.delta", properties: { sessionID: "ses_mine", delta: "hmm" } });
-    sse.handleSse({ type: "session.next.text.delta", properties: { sessionID: "ses_mine", delta: " threads" } });
-    expect(got).toEqual([{ text: "Warp" }, { text: "hmm", reasoning: true }, { text: " threads" }]);
-  });
-});
+// OpenCode's live text is covered by test/opencode-continuity.test.ts ("streams only its own session's text").
 
 describe("the echo agent types when asked to", () => {
   it("streams the reply word by word, then logs it once", async () => {
