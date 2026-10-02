@@ -94,8 +94,37 @@ export function registerAgentsRoutes(app: Express, withRuntime: WithRuntime): vo
     withRuntime(async (rt, req, res) => {
       const agent = rt.config.agents.find((a) => a.id === String(req.params.agentId));
       if (!agent) return void res.status(404).json({ error: "unknown agent" });
+      // The live snapshot is what the harness itself reported; fall back to
+      // asking (or remembering) only while it has nothing.
+      const live = rt.providerSnapshots.get(agent.id);
+      if (live?.models.length) {
+        return void res.json({ kind: agent.kind, count: live.models.length, models: live.models.map((m) => m.id),
+          details: live.models, source: live.modelSource === "native" ? "native" : live.modelSource, checkedAt: live.modelsAt });
+      }
       const { models, source } = await listModelsForKind(agent.kind, agent.options ?? {});
       res.json({ kind: agent.kind, count: models.length, models, source });
+    }),
+  );
+
+  // Each agent's harness as it reports itself: version, sign-in and models.
+  // Kept current by the runtime and pushed as `provider_status` frames.
+  app.get(
+    "/api/projects/:id/provider-status",
+    withRuntime(async (rt, _req, res) => {
+      res.json({ providers: rt.providerSnapshots.list() });
+    }),
+  );
+
+  // Ask every harness again now (or one, with { agentId }).
+  app.post(
+    "/api/projects/:id/provider-status/refresh",
+    withRuntime(async (rt, req, res) => {
+      const agentId = (req.body as { agentId?: unknown } | undefined)?.agentId;
+      if (typeof agentId === "string") {
+        if (!rt.config.agents.some((a) => a.id === agentId)) return void res.status(404).json({ error: "unknown agent" });
+        await rt.providerSnapshots.refresh(agentId);
+      } else await rt.providerSnapshots.sync({ force: true });
+      res.json({ providers: rt.providerSnapshots.list() });
     }),
   );
 

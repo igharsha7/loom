@@ -29,6 +29,13 @@ export class ClientDelivery<T extends FrameConnection> {
     private readonly onFailure: (client: T, error: unknown) => void = () => {},
   ) {}
 
+  /** Whether any open connection would receive this project's frames. */
+  watching(projectId: string): boolean {
+    for (const [client, scope] of this.clients)
+      if (client.readyState === 1 && visible(scope, { kind: "project", projectId })) return true;
+    return false;
+  }
+
   publish(payload: Record<string, unknown>, audience: FrameAudience): void {
     const frame = JSON.stringify(payload);
     for (const [client, scope] of this.clients) {

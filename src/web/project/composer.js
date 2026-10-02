@@ -449,7 +449,8 @@ export function createComposer(view) {
         // ship" are different claims, and only one of them goes stale silently.
         var mn = document.getElementById("cmenu");
         if (mn && j && j.source){
-          var note = j.source === "cli" ? "Listed by " + esc(agentLabel(cur.kind, cur.id)) + " itself"
+          var note = j.source === "native" ? "Reported by " + esc(agentLabel(cur.kind, cur.id)) + " \u00b7 kept current automatically"
+            : j.source === "cli" ? "Listed by " + esc(agentLabel(cur.kind, cur.id)) + " itself"
             : j.source === "api" ? "From every provider with a key \u00b7 " + (j.count || 0) + " models"
             : j.source === "builtin" ? esc(agentLabel(cur.kind, cur.id)) + " can\u2019t list its models \u2014 these are its documented aliases"
             : "No model list for this agent";
@@ -476,6 +477,15 @@ export function createComposer(view) {
           sb.focus();
         }
         render("");
+        // A newer list from the harness re-renders the open picker in place.
+        view.onProviderStatus = function(providers){
+          var sb2 = document.getElementById("cmsearch");
+          if (!sb2) { view.onProviderStatus = null; return; }
+          var snap = (providers || []).filter(function(p){ return p.agentId === agentId; })[0];
+          if (!snap || !snap.models || !snap.models.length) return;
+          allModels = snap.models.map(function(m){ return m.id; });
+          render(sb2.value);
+        };
       }).catch(function(err){
         var list = document.getElementById("cmlist"); if (list) list.innerHTML = '<div class="cmmore">Couldn\u2019t list models \u2014 ' + esc(err && err.message || "") + "</div>";
         clog("error", "models", "list failed: " + (err && err.message), err && err.stack);

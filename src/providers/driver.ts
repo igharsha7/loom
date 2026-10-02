@@ -3,6 +3,7 @@ import type { AdapterCapabilities, ProviderSession } from "./contracts.js";
 import type { AgentCheck } from "../adapters/base.js";
 import type { McpServerEntry } from "../types.js";
 import type { PermissionProfile } from "../core/permissions.js";
+import type { ProviderProbe } from "./probe.js";
 
 export interface Decoder<T> { parse(value: unknown): T }
 export interface InstructionSnapshot { fingerprint: string }
@@ -66,6 +67,9 @@ export interface ProviderDriver<C = Record<string, unknown>> {
   continuationIdentity(instanceId: string, config: C): ContinuationIdentity;
   accountKey(config: C): string;
   models?(config: C): Promise<{ models: string[]; source: "cli" | "builtin" | "api" | "none" }>;
+  /** Ask the harness itself for its sign-in and models, without taking a turn.
+   * Feeds the live provider snapshot; `models` stays the offline fallback. */
+  probe?(config: C, cwd: string): Promise<ProviderProbe>;
   available(config: C): Promise<boolean>;
   health(config: C): Promise<ProviderHealth>;
   selfCheck(config: C): Promise<AgentCheck[]>;

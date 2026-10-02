@@ -748,6 +748,7 @@ export function createThread(view) {
           if (frame.type === "team") { onTeamFrame(frame); return; }
           // the prompt queue changed — sent, edited, reordered, paused
           if (frame.type === "queue") { view.onQueueFrame(frame); return; }
+          if (frame.type === "provider_status") { view.providerStatus = frame.providers || []; if (view.onProviderStatus) view.onProviderStatus(view.providerStatus); return; }
           // a reply as it's being written (not logged; the message follows)
           if (frame.type === "stream") { if (view.historyLoaded) onStreamFrame(frame); else if (pendingStream.length < 2000) pendingStream.push(frame); return; }
           // a dev server started, stopped, crashed, or printed a line

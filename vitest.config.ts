@@ -18,6 +18,9 @@ export default defineConfig({
       // an otherwise sub-second file. Off everywhere; the tests that exercise
       // those paths turn them back on and inject a fake CLI.
       LOOM_DECISIONS_NO_CLI: "1",
+      // A provider probe starts the real `codex app-server` / Claude SDK to
+      // read its models and sign-in. Tests drive snapshots with fake drivers.
+      LOOM_PROVIDER_PROBES: "0",
       LOOM_TRIAGE_NO_LLM: "1",
       // Skill discovery reads the user's real ~/.claude (skills and plugin
       // caches) — which is the point in production and poison in a test: the

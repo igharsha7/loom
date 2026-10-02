@@ -171,10 +171,8 @@ Claude settings); override per session through the protocol instead.
   Codex (`gpt-6-astra`) → Claude → Codex. Claude answered BLUE from a
   reconstruction packet; Codex answered BLUE from a delta on its parked session.
   Project untouched.
-- [ ] Open decision: continuity on by default. Continuity today refuses parallel
-  orchestra and turns off semantic briefings and memory extraction, so switching
-  it on for everyone changes those features. Without it, a switched-to agent
-  starts the chat with no history. Needs the user's call.
+- [x] Decided (2026-10-02): continuity on by default, with every feature it
+  used to refuse working alongside it (Phase 6 below).
 - [ ] Web UI for the switch offer and the switch itself (Phase 7).
 
 ## Audit of Phases 1–5 (Sol, GPT 6.1 Sol via Codex) ✅ (2026-10-01)
@@ -297,10 +295,37 @@ regression test.
 - [ ] Next audits go area by area (checkpoints, sessions, Brain) rather than
   across the whole port.
 
-## Phase 6 — Provider management
+## Phase 6 — Provider management, and Brain on by default
 
-- [ ] Instances (several accounts per driver), auth status, install/update
-  detection, native session history import.
+Decided with the user 2026-10-02.
+
+- [ ] Brain continuity on by default (`brain.continuity` defaults to true;
+  an explicit false still turns it off).
+- [ ] Parallel orchestra, parallel subagents and autonomous routes work with
+  Brain on (today each is refused): each parallel worker gets its own Brain
+  binding and packets; results come back into the chat as ordinary evidence.
+- [ ] Memory extraction and semantic retrieval work with Brain on: an extracted
+  memory becomes a candidate item sourced to its turn (never a decision by
+  itself), included as labelled "remembered context" within the packet budget
+  and promotable or droppable; semantic search only ranks candidates.
+- [x] Model lists update automatically, as in t3code: a live per-instance
+  snapshot (status, version, auth, models) refreshed at startup, on settings
+  change, every 5 minutes while a client is open, and on demand; changes pushed
+  to clients over the websocket. Codex from paginated `model/list`; Claude from
+  the Agent SDK's reported models (not t3code's manifest file).
+  Done 2026-10-03: `src/providers/probe.ts` (Codex app-server `account/read` +
+  paginated `model/list`; Claude SDK initialization with a never-yielding
+  prompt, no session file, hooks or MCP), `src/providers/snapshots.ts`
+  (refresh at open, on config save, every 5 min while a client watches, and
+  `POST /api/projects/:id/provider-status/refresh`; failed probes keep the last
+  models), `provider_status` frames, and the model picker re-rendering live.
+  Live check: Codex 8 models in ~1 s, Claude 12 in ~2 s, both with sign-in,
+  no turn taken and nothing left running. Tests set `LOOM_PROVIDER_PROBES=0`.
+- [ ] Instances: several accounts per driver (the registry's continuation and
+  account identity), auth status, install/update detection, native session
+  history import.
+- Phase 7 (after this): UI in Loom's own look, inspired by t3code, including
+  question, permission and approval popups.
 
 ## Phase 7 — UI overhaul
 

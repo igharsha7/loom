@@ -4,6 +4,7 @@ import { ClaudeProviderAdapter, claudeBin, type ClaudeHistory } from "../claude/
 import { claudeCapabilities } from "./capabilities.js";
 import { cliOutput } from "../../adapters/base.js";
 import { CLAUDE_MODELS } from "./models.js";
+import { probeClaude } from "../probe.js";
 import { claudeAuxiliary } from "../claude/auxiliary.js";
 import { claudeText } from "../claude/cli.js";
 import { ORCHESTRATOR_VERIFY_TOOLS } from "./orchestrator.js";
@@ -38,6 +39,11 @@ export const claudeDriver: ProviderDriver<NativeConfig> = {
   accountKey: config => config.accountKey ?? "claude", available: checks.available,
   async health(config) { const health = await checks.health(config); return { ...health, tested: health.version === "2.1.278" }; },
   models: async () => ({ models: CLAUDE_MODELS, source: "builtin" }),
+  async probe(config, cwd) {
+    const bin = claudeBin(config.bin);
+    if (!bin) return { auth: { status: "unknown" }, models: [], modelSource: "none", error: "claude CLI not found" };
+    return probeClaude(bin, { cwd });
+  },
   async selfCheck(config) {
     const result = await checks.selfCheck(config), bin = claudeBin(config.bin);
     if (bin) {

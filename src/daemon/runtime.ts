@@ -100,6 +100,7 @@ import { droppedHistory } from "../core/continuity/store.js";
 import { ContinuityError, NativeDispatchRejected } from "../core/continuity/contracts.js";
 import { HarnessMonitor, isNativeKind } from "../core/continuity/capabilities.js";
 import { ProviderAgent } from "../providers/agent.js";
+import { ProviderSnapshots } from "../providers/snapshots.js";
 import { LiveDeltaThrottle, type LiveFrame } from "../providers/live.js";
 import { AdapterBase, nativeChatOf, type AgentCheck } from "../adapters/base.js";
 import type { LiveText } from "../types.js";
@@ -171,6 +172,12 @@ export class ProjectRuntime {
   /** Streamed text and tool progress from provider agents, coalesced for clients. Not persisted. */
   private readonly live = new LiveDeltaThrottle((d) => { for (const cb of this.liveListeners) cb(d); });
 
+  /** Each agent's harness as it reports itself now: version, sign-in, models. */
+  readonly providerSnapshots!: ProviderSnapshots;
+  /** Whether a client is watching this project; set by the daemon. Periodic
+   * provider refreshes run only while someone is. */
+  watching: () => boolean = () => false;
+
   private constructor(info: ProjectInfo, config: ProjectConfig, log: EventLog) {
     this.info = info;
     this.config = config;
@@ -188,6 +195,12 @@ export class ProjectRuntime {
       },
     );
     if (this.continuity) this.harnesses.start();
+    this.providerSnapshots = new ProviderSnapshots({
+      targets: () => this.config.agents.filter(a => a.enabled !== false && providerRegistry.get(a.kind))
+        .map(a => ({ id: a.id, kind: a.kind, options: this.policyOptions(a) })),
+      cwd: (agentId) => this.agentDir(agentId),
+      hasDemand: () => this.watching(),
+    });
     // The last readings survive a restart: replay the recent reports.
     for (const e of log.list({ kinds: ["status", "run_complete", "error"], limit: 500 })) this.nativeUsage.observe(e);
     this.conversations = new ConversationStore(info.dir);
@@ -435,6 +448,8 @@ export class ProjectRuntime {
     }
     // Watch the project's MCP servers, if it has any — see mcpHealth.
     rt.startMcpHealthLoop();
+    // Tests set LOOM_PROVIDER_PROBES=0: a probe starts the real harness.
+    if (process.env.LOOM_PROVIDER_PROBES !== "0") rt.providerSnapshots.start();
     void detectAdes()
       .then((found) => (rt.installedKinds = Object.keys(found).filter((k) => found[k])))
       .catch(() => { });
@@ -1083,6 +1098,8 @@ export class ProjectRuntime {
     // we just wrote the file, so don't let configStale() see our own write and
     // schedule a pointless reload
     this.configMtime = configMtimeOf(this.info.dir);
+    // A new or reconfigured agent gets its snapshot now; unchanged ones are left alone.
+    if (process.env.LOOM_PROVIDER_PROBES !== "0") void this.providerSnapshots?.sync();
   }
 
   // ── Skills (SKILL.md context blocks injected into the briefing) ──
@@ -3302,6 +3319,7 @@ export class ProjectRuntime {
     await this.orchestra.shutdown().catch(() => { });
     this.closed = true;
     this.harnesses.stop();
+    this.providerSnapshots.close();
     this.live.close();
     this.briefings.close();
     if (this.mcpTimer) { clearInterval(this.mcpTimer); this.mcpTimer = null; }

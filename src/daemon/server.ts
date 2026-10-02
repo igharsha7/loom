@@ -473,6 +473,10 @@ export class LoomDaemon {
     rt.onServerEvent((f) => {
       this.broadcastFrame({ type: "server", projectId: info.id, ...f }, info.id);
     });
+    rt.watching = () => this.delivery.watching(info.id);
+    rt.providerSnapshots.onChange((providers) => {
+      this.broadcastFrame({ type: "provider_status", projectId: info.id, providers }, info.id);
+    });
     rt.onQueueChange((q) => {
       const head = q.items[0];
       const waitingFor = head && !q.paused ? rt.queueBlocker(head) : null;
