@@ -197,7 +197,9 @@ export interface RuntimeEventPayloads {
   "thread.started": { providerThreadId?: string };
   "thread.state.changed": { state: RuntimeThreadState; beforeTokens?: number; afterTokens?: number; trigger?: "auto" | "manual" };
   "thread.token-usage.updated": { usage: ThreadTokenUsage };
-  "turn.started": { model?: string; effort?: string };
+  /** `local`: allocation only; native acceptance needs later evidence. */
+  "turn.started": { model?: string; effort?: string; local?: boolean };
+  "turn.accepted": Record<string, never>;
   "turn.completed": { state: RuntimeTurnState; stopReason?: string | null; errorMessage?: string;
     totalCostUsd?: number; tokenUsage?: TurnTokenUsage; model?: string };
   "turn.aborted": { reason: string; detail?: { stderr?: string } };

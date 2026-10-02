@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
@@ -47,15 +48,43 @@ export async function observeWorkspace(dir: string): Promise<{ workspace: Worksp
     if (failure.code !== "ENOENT" && !/not a git repository/i.test(failure.stderr ?? ""))
       throw new ContinuityError("stale", "Git workspace observation failed; inspect repository state before dispatch");
   }
-  const files: Array<[string, string]> = [];
-  for (const name of ["AGENTS.md", "CLAUDE.md", ".claude/CLAUDE.md", ".codex/AGENTS.md"]) {
-    const file = path.join(checkout, name);
-    if (!fs.existsSync(file)) continue;
+  // Conservative union of the harnesses' ancestor and user instruction files.
+  // Imports may legitimately resolve outside a subproject or checkout.
+  const files = new Map<string, string>(), visited = new Map<string, { text: string; depth: number }>();
+  let instructionBytes = 0;
+  const readInstruction = (file: string, depth = 0): void => {
+    file = path.resolve(file);
+    if (!fs.existsSync(file)) { files.set(file, "missing"); return; }
     const actual = fs.realpathSync(file);
-    if (!actual.startsWith(checkout + path.sep) || fs.statSync(actual).size > 1_000_000)
-      throw new ContinuityError("invalid", `instruction file is outside the workspace or too large: ${name}`);
-    files.push([name, digest(fs.readFileSync(actual, "utf8"))]);
+    let entry = visited.get(actual);
+    if (!entry) {
+      const stat = fs.statSync(actual);
+      instructionBytes += stat.size;
+      if (!stat.isFile() || stat.size > 1_000_000 || instructionBytes > 4_000_000 || visited.size >= 1000)
+        throw new ContinuityError("invalid", `instruction files exceed observation limits: ${file}`);
+      entry = { text: fs.readFileSync(actual, "utf8"), depth: 5 };
+      visited.set(actual, entry);
+    }
+    files.set(file, digest(JSON.stringify([actual, entry.text])));
+    if (entry.depth <= depth) return;
+    entry.depth = depth;
+    const text = entry.text;
+    if (depth >= 4) return;
+    // Over-observing a literal @path is harmless; missing imports are hashed too,
+    // so creating a file after preparation also invalidates the snapshot.
+    for (const match of text.matchAll(/(?:^|\s)@((?:\\ |[^\s`"'<>])+)/g)) {
+      const imported = match[1]!.replace(/\\ /g, " ");
+      readInstruction(imported.startsWith("~/") ? path.join(os.homedir(), imported.slice(2)) : path.resolve(path.dirname(file), imported), depth + 1);
+    }
+  };
+  for (let parent = checkout; ; parent = path.dirname(parent)) {
+    for (const name of ["AGENTS.override.md", "AGENTS.md", "CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md", ".codex/AGENTS.md"])
+      readInstruction(path.join(parent, name));
+    if (parent === path.dirname(parent)) break;
   }
+  const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex");
+  for (const file of [path.join(codexHome, "AGENTS.override.md"), path.join(codexHome, "AGENTS.md"),
+    path.join(process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude"), "CLAUDE.md")]) readInstruction(file);
   // Hash dirty tracked contents, not just porcelain labels: two edits to the
   // same dirty file must invalidate a prepared snapshot.
   const dirtyContent: Array<[string, string]> = [];
@@ -78,7 +107,7 @@ export async function observeWorkspace(dir: string): Promise<{ workspace: Worksp
     } catch { throw new ContinuityError("stale", "dirty workspace exceeds observation limits or changed during observation; narrow it before dispatch"); }
   }
   return { workspace: { id: digest(checkout), checkout, head, dirty,
-    revision: digest(JSON.stringify([head, state, dirtyContent])) }, instructions: digest(JSON.stringify(files)) };
+    revision: digest(JSON.stringify([head, state, dirtyContent])) }, instructions: digest(JSON.stringify([...files].sort(([a], [b]) => a.localeCompare(b)))) };
 }
 
 type Message = ContextPacket["messages"][number];
@@ -184,9 +213,14 @@ export class ContinuityEngine {
     const { model: _model, ...stable } = options;
     const fingerprint = digest(JSON.stringify([kind, stable, observed.workspace.id, "turn-input-v2"]));
     const slot = digest(JSON.stringify([request.conversationId, request.agentInstanceId, observed.workspace.id, fingerprint]));
-    const binding = this.store.binding(slot, () => ({ id: randomUUID(), conversationId: request.conversationId,
+    let binding = this.store.binding(slot, () => ({ id: randomUUID(), conversationId: request.conversationId,
       agentInstanceId: request.agentInstanceId, harnessKind: kind, workspaceId: observed.workspace.id,
       compatibilityFingerprint: fingerprint, nativeSessionId: null, sessionEpoch: 1, retention: "unknown" }));
+    // Compaction invalidates delivery and ownership, even when the native id survives.
+    if (binding.retention === "compacted") {
+      binding = { ...binding, sessionEpoch: binding.sessionEpoch + 1, retention: "unknown" };
+      this.store.updateBinding(binding);
+    }
     const current = this.store.requestEvent(request.id);
     if (!current) throw new ContinuityError("invalid", "capture request before preparing context");
     const chat = request.conversationId, through = this.log.lastId(), source = (event: LoomEvent) => this.store.source(event, this.projectId);
@@ -238,26 +272,19 @@ export class ContinuityEngine {
       packet.coverage.push({ source: message.source, disposition: "referenced", reason: "older user message; full text in the evidence file" });
     }
 
-    // Observations: everything since the basis (never a silent window), then
-    // what the basis had to omit. A session's own output is already native.
-    const since = basis?.snapshot.throughEventId ?? 0, window = basis ? 2000 : 300;
-    const recent = this.store.observations(chat, since, through, window);
-    packet.unlisted!.observations = Math.max(0, this.store.countObservations(chat, since, through) - recent.length);
-    const dropped = this.store.dropped(chat);
-    const holes = (basis?.coverage ?? []).filter(c => c.disposition === "omitted").slice(0, 900)
-      .flatMap(c => { const event = this.store.event(c.source.eventId); return event && !dropped.isDropped(event.id) ? [event] : []; });
-    const own = (event: LoomEvent) => basis !== undefined && event.payload.loomBindingId === binding.id && event.payload.loomSessionEpoch === binding.sessionEpoch;
-    const seen = new Set<number>([current.id]);
-    for (const event of recent.concat(holes)) {
-      if (seen.has(event.id) || event.id > through || isUser(event) || event.payload.reasoning || own(event) || delivered.evidence.has(event.id)) continue;
-      seen.add(event.id);
+    // Query the undelivered backlog itself. Omitted sources remain candidates,
+    // regardless of the previous packet's coverage or snapshot frontier.
+    const recent = this.store.missingObservations(chat, through, basis ? 2000 : 300, basis ? binding : undefined);
+    packet.unlisted!.observations = Math.max(0, this.store.countObservations(chat, 0, through) - recent.length);
+    for (const event of recent) {
+      if (event.payload.reasoning) continue;
       const outcome = event.payload.outcome;
       const evidence: Evidence = { source: source(event), text: eventText(event),
         outcome: outcome === "pending" || outcome === "success" || outcome === "failure" || outcome === "cancelled" || outcome === "unknown" ? outcome : "reported" };
-      if (fits(evidencePart(evidence), 1)) {
+      if (packet.evidence.length < 1000 && fits(evidencePart(evidence), 1)) {
         packet.evidence.push(evidence); used += partBytes(evidencePart(evidence));
         packet.coverage.push({ source: evidence.source, disposition: "exact", reason: "observation not yet in this session" });
-      } else packet.coverage.push({ source: evidence.source, disposition: "omitted", reason: "optional evidence exceeds added-context target" });
+      } else packet.coverage.push({ source: evidence.source, disposition: "omitted", reason: "optional evidence exceeds added-context target or count limit" });
     }
 
     const archive = new Map<number, { source: SourceRef; text: string }>();

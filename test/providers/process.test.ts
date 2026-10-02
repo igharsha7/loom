@@ -66,3 +66,17 @@ it("requires recovery evidence when a live recorded group cannot be identified (
     expect(signal.mock.calls).toEqual([[-12345, 0]]);
   } finally { signal.mockRestore(); }
 });
+
+it("a closed Claude prompt queue rejects without native acceptance (port audit #1)", async () => {
+  const adapter = new ClaudeProviderAdapter("queue-race", { bin: fakeClaude() });
+  const events: ProviderRuntimeEvent[] = [];
+  adapter.onEvent(e => events.push(e));
+  try {
+    await adapter.startSession({ threadId: "main", instanceId: "queue-race", cwd: tmpDir("queue-race"), runtimeMode: "auto-accept-edits" });
+    const session = (adapter as unknown as { sessions: Map<string, { prompts: { close(): void } }> }).sessions.get("main")!;
+    session.prompts.close();
+    await expect(adapter.sendTurn({ threadId: "main", instanceId: "queue-race", input: "not delivered" })).rejects.toMatchObject({ notSubmitted: true });
+    expect(events.filter(e => e.type === "turn.started").map(e => e.payload)).toEqual([{ local: true }]);
+    expect(events.some(e => e.type === "turn.aborted")).toBe(true);
+  } finally { await adapter.stopAll(); }
+});

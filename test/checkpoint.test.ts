@@ -760,3 +760,53 @@ it("collects recovery pins orphaned before journal publication (finding #5)", as
   expect(await find(dir, prepared.undo.id)).toBeNull();
   expect(git(dir, "for-each-ref", "--format=%(refname)", "refs/loom/checkpoints")).not.toContain("/recovery/");
 });
+
+it("collects pins from a crashed direct restore without a journal (port audit #6)", async () => {
+  const { prepareRestore } = await import("../src/core/checkpoint.js");
+  const dir = repo(), target = (await capture(dir, "target"))!;
+  const prepared = await prepareRestore(dir, target.id);
+  await capture(dir, "newest");
+  await prune(dir, 1);
+  expect(await find(dir, prepared.undo.id)).not.toBeNull();
+  const now = Date.now(), clock = vi.spyOn(Date, "now").mockReturnValue(now + 61_000);
+  try { await prune(dir, 1); } finally { clock.mockRestore(); }
+  expect(await find(dir, prepared.undo.id)).toBeNull();
+  expect(git(dir, "for-each-ref", "--format=%(refname)", "refs/loom/checkpoints")).not.toContain("/recovery/");
+});
+
+it("does not read subproject history for modern root checkpoint refs (port audit #7)", async () => {
+  const root = repo(), sub = path.join(root, "sub");
+  write(sub, "app.txt", "hello");
+  await capture(root, "modern root");
+  write(sub, ".loom/log.jsonl", '{"kind":"checkpoint","payload":{}}\n');
+  const read = vi.spyOn(fs, "readFileSync");
+  try {
+    await capture(sub, "sub"); await list(sub);
+    expect(read.mock.calls.some(([file]) => String(file) === path.join(sub, ".loom/log.jsonl"))).toBe(false);
+  } finally { read.mockRestore(); }
+});
+
+it("scans history once for unchanged unowned legacy refs (port audit #7)", async () => {
+  const root = repo(), sub = path.join(root, "sub");
+  write(sub, "app.txt", "hello");
+  const cp = (await capture(root, "root"))!;
+  const commit = git(root, "commit-tree", `${cp.commit}^{tree}`, "-p", "HEAD", "-m", "loom checkpoint: legacy").trim();
+  git(root, "update-ref", `refs/loom/checkpoints/${cp.id}`, commit);
+  write(sub, ".loom/log.jsonl", '{"kind":"checkpoint","payload":{}}\n');
+  const read = vi.spyOn(fs, "readFileSync");
+  try {
+    await list(sub); await list(sub); await capture(sub, "new");
+    expect(read.mock.calls.filter(([file]) => String(file) === path.join(sub, ".loom/log.jsonl"))).toHaveLength(1);
+  } finally { read.mockRestore(); }
+});
+
+it("collects old recovery pairs created without intent blobs (port audit #6)", async () => {
+  const { prepareRestore } = await import("../src/core/checkpoint.js");
+  const dir = repo(), target = (await capture(dir, "target"))!;
+  const prepared = await prepareRestore(dir, target.id);
+  git(dir, "update-ref", "-d", `refs/loom/checkpoints/recovery/${prepared.undo.id}/journal`);
+  await capture(dir, "newest");
+  const now = Date.now(), clock = vi.spyOn(Date, "now").mockReturnValue(now + 61_000);
+  try { await prune(dir, 1); } finally { clock.mockRestore(); }
+  expect(git(dir, "for-each-ref", "--format=%(refname)", "refs/loom/checkpoints")).not.toContain("/recovery/");
+});

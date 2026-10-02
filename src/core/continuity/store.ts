@@ -347,6 +347,20 @@ export class ContinuityStore {
       ORDER BY id DESC LIMIT ?`).all(chat, since, through, ...live.args, limit) as Row[];
     return rows.map(r => this.event(Number(r.id))!);
   }
+  /** Undelivered observations, including sources omitted by any earlier packet. */
+  missingObservations(chat: string, through: number, limit: number, binding?: Binding): LoomEvent[] {
+    const live = this.notDropped(chat);
+    const retained = binding ? ` AND NOT (coalesce(json_extract(events.payload,'$.loomBindingId'),'')=?
+      AND coalesce(json_extract(events.payload,'$.loomSessionEpoch'),-1)=?)
+      AND id NOT IN (SELECT json_extract(x.value,'$.source.eventId') FROM continuity_receipts r JOIN continuity_packets p ON p.id=r.packet_id,
+        json_each(p.data,'$.evidence') x WHERE r.binding_id=? AND json_extract(r.data,'$.status')='accepted'
+        AND json_extract(p.data,'$.target.sessionEpoch')=?)` : "";
+    const rows = this.db.prepare(`SELECT id FROM events WHERE coalesce(chat,'${MAIN_CHAT}')=? AND id<=?${live.sql}
+      AND kind IN ('message','tool_call','file_edit','turn_diff','run_complete','error') AND NOT (${USER_SOURCE})
+      AND coalesce(json_extract(payload,'$.reasoning'),0)=0${retained} ORDER BY id DESC LIMIT ?`)
+      .all(chat, through, ...live.args, ...(binding ? [binding.id, binding.sessionEpoch, binding.id, binding.sessionEpoch] : []), limit) as Row[];
+    return rows.map(r => this.event(Number(r.id))!);
+  }
   countObservations(chat: string, since: number, through: number): number {
     const live = this.notDropped(chat);
     return Number((this.db.prepare(`SELECT count(*) AS n FROM events WHERE coalesce(chat,'${MAIN_CHAT}')=? AND id>? AND id<=?${live.sql}

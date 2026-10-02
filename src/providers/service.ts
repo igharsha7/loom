@@ -150,7 +150,8 @@ export class ProviderService {
   }
 
   private async start(adapter: ProviderAdapter, input: EnsureSessionInput): Promise<EnsuredSession> {
-    const binding = this.directory.get(input.threadId, input.instanceId);
+    const stored = this.directory.get(input.threadId, input.instanceId);
+    const binding = stored?.provider === adapter.provider ? stored : undefined;
     const cursor = binding?.resumeCursor ?? undefined;
     const cwd = binding?.runtimePayload?.cwd ?? input.cwd;
     const model = input.model === null ? undefined : input.model ?? binding?.runtimePayload?.model;

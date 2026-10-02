@@ -132,6 +132,9 @@ export class RuntimeIngestion {
         s.lastReply = "";
         status("turn_started", { session: s.providerThreadId ?? null, ...(event.payload.model ? { model: event.payload.model } : {}) });
         // The provider took the turn: Brain's acceptance evidence.
+        if (s.tags && !event.payload.local) status("native_turn_accepted");
+        return;
+      case "turn.accepted":
         if (s.tags) status("native_turn_accepted");
         return;
       case "content.delta": {

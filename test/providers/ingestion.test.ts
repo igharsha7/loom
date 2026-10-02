@@ -350,3 +350,23 @@ it("forwards empty Codex account snapshots so recovery can clear reached reasons
   const { run } = ingest([ev("account.rate-limits.updated", { windows: [] })]);
   expect(run().at(-1)?.payload).toEqual({ state: "usage_limits", provider: "codex", windows: [] });
 });
+
+it("does not accept local Claude turn allocation, but accepts native Codex starts (port audit #1)", () => {
+  for (const local of [true, false]) {
+    const { ingestion, out, run } = ingest([]);
+    ingestion.tagTurn("main", "cx", { loomRunId: "run", loomBindingId: "b", loomSessionEpoch: 1 });
+    run([ev("turn.started", { local }, { provider: local ? "claude-code" : "codex" }), ev("turn.aborted", { reason: "closed before consumption" })]);
+    expect(kinds(out).includes("status:native_turn_accepted")).toBe(!local);
+    expect(kinds(out)).toContain("error");
+  }
+});
+
+
+it("accepts Claude only after a separate native acceptance signal (port audit #1)", () => {
+  const { ingestion, out, run } = ingest([]);
+  ingestion.tagTurn("main", "cx", { loomRunId: "run", loomBindingId: "b", loomSessionEpoch: 1 });
+  run([ev("turn.started", { local: true }, { provider: "claude-code" })]);
+  expect(kinds(out)).not.toContain("status:native_turn_accepted");
+  run([ev("turn.accepted", {}, { provider: "claude-code" })]);
+  expect(kinds(out).filter(k => k === "status:native_turn_accepted")).toHaveLength(1);
+});

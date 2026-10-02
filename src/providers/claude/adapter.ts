@@ -177,6 +177,7 @@ interface Tool { name: string; input: Record<string, unknown>; itemType: Canonic
 
 interface Turn {
   id: TurnId;
+  accepted?: boolean;
   model?: string;
   /** The message id of the response being streamed, for delta item ids. */
   streamingMessageId?: string;
@@ -457,7 +458,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     const turnId = randomUUID();
     s.turn = { id: turnId, ...(s.info.model ? { model: s.info.model } : {}) };
     s.info = { ...s.info, status: "running", activeTurnId: turnId, updatedAt: Date.now() };
-    this.emit(input.threadId, "turn.started", s.info.model ? { model: s.info.model } : {}, { turnId });
+    this.emit(input.threadId, "turn.started", { local: true, ...(s.info.model ? { model: s.info.model } : {}) }, { turnId });
     try {
       s.prompts.push({ type: "user", message: { role: "user", content: [{ type: "text", text: input.input }] },
         parent_tool_use_id: null, uuid: turnId } as SDKUserMessage);
@@ -623,6 +624,14 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     const threadId = s.info.threadId;
     const turnId = s.turn?.id;
     const at = turnId ? { turnId } : {};
+    // Allocation and queueing are local. Only the native stream proves that
+    // Claude received the turn; an interrupt before this stays uncertain.
+    if (s.turn && !s.turn.accepted && (msg.type === "result" ||
+      msg.type === "assistant" && !msg.parent_tool_use_id ||
+      msg.type === "user" && !msg.parent_tool_use_id && msg.uuid === turnId)) {
+      s.turn.accepted = true;
+      this.emit(threadId, "turn.accepted", {}, at);
+    }
     switch (msg.type) {
       case "system":
         // The SDK's level roster is authoritative and independent of edge

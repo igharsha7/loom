@@ -369,3 +369,18 @@ it("checks cancellation after session initialization, before native submission (
   expect(directory.get("main", "codex")?.turnLedger?.turns).toEqual([]);
   await service.stopAll();
 });
+
+it("discards the old provider cursor, model, cwd and ledger when an agent changes kind (port audit #8)", async () => {
+  const { service, directory } = setup();
+  await service.sendTurn({ threadId: "main", instanceId: "codex", ...base, model: "codex-model", input: "one" });
+  expect(directory.get("main", "codex")!.turnLedger!.turns.length).toBeGreaterThan(0);
+  await service.unregister("codex");
+  const replacement = new FakeAdapter("codex", { provider: "claude-code" });
+  service.register(replacement);
+  const ensured = await service.ensureSession({ threadId: "main", instanceId: "codex", ...base, cwd: "/new" });
+  expect(ensured.via).toBe("fresh");
+  expect(replacement.calls[0]!.args[0]).toMatchObject({ cwd: "/new" });
+  expect(replacement.calls[0]!.args[0]).not.toHaveProperty("resumeCursor");
+  expect(replacement.calls[0]!.args[0]).not.toHaveProperty("modelSelection");
+  expect(directory.get("main", "codex")!.turnLedger).toMatchObject({ fromStart: true, turns: [] });
+});

@@ -182,7 +182,7 @@ Claude settings); override per session through the protocol instead.
 A second agent audited the port; Claude checked each round's findings against the
 code, Sol fixed them, Claude reviewed and ran the suite. Rounds 1–4 covered Phase 5
 only; rounds 5–8 covered all five phases, including what earlier fixes introduced.
-Findings per round: 5, 4, 6, 4, then 25, 24, 14, 10, 16, 5. All fixed, each with a
+Findings per round: 5, 4, 6, 4, then 25, 24, 14, 10, 16, 5, 8. All fixed, each with a
 regression test.
 
 - [x] Phase 5: dropped turns are named explicitly (`dropped: { from, turns, keep }`
@@ -209,7 +209,7 @@ regression test.
   question everywhere (routes, status, reloaded cards); multi-select questions;
   Codex file-read approvals; sparse Claude and Codex limit reports; per-window
   limit state.
-- [x] Tests: 1779 passing (plus 132 DOM). Known unrelated: `daemon.test.ts`
+- [x] Tests: 1798 passing (plus 132 DOM). Known unrelated: `daemon.test.ts`
   "real models" depends on the live Codex catalog; `app-queue-dom` is
   occasionally flaky. `codex.test.ts` "interrupts the running turn" failed once
   under full-suite load and couldn't be reproduced (6 runs alone, 2 full runs).
@@ -234,6 +234,19 @@ regression test.
   `Loom-Project` trailer); completed rewinds' undo points are pruned normally.
   A turn whose writer may still be running keeps the agent busy until Stop (or
   `loom interrupt`) shuts the session down; the busy error says so.
+- [x] Round 11 (8 findings, all fixed, plus a design review of Brain): Claude's
+  native acceptance is a separate signal from local turn allocation, so a prompt
+  that never reached Claude isn't counted as delivered; delta evidence is capped
+  at the schema's 1,000; compaction starts a new epoch so pre-compaction
+  deliveries aren't trusted; omitted observations stay in a backlog instead of
+  the first 900; instruction fingerprints follow ancestors, local, override and
+  imported files; journal-less restore pins are cleaned up; the legacy
+  checkpoint migration runs once; a provider change under the same agent id
+  starts a fresh session instead of reusing the old cursor.
+- [ ] Provider registry (decided 2026-10-02, before Phase 6): one driver record
+  per provider (identity, config, adapter factory, health, continuity facts,
+  capabilities) read by Brain, the runtime, health, usage tracking and persisted
+  state; a shared adapter conformance suite. Brain's engine stays as is.
 - [ ] UI for the recovery states (pending rewind, pending compaction, a turn
   held after an unsettled writer) — Phase 7.
   Today the way out is the CLI or the API.

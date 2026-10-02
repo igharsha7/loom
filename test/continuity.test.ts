@@ -684,3 +684,88 @@ it("can submit when Loom's changing log database is tracked (finding #13)", asyn
   const prepared = await brain.prepare(req, "codex", dir, { bin: fakeCodex() });
   expect(await brain.submit(prepared)).toMatchObject({ runId: prepared.receipt.runId });
 });
+
+/** Accept a packet without launching a native harness. */
+async function acceptAuditPacket(brain: ContinuityEngine, log: EventLog, prepared: Awaited<ReturnType<ContinuityEngine["prepare"]>>) {
+  const turn = await brain.submit(prepared);
+  const tags = { loomRunId: turn.runId, loomBindingId: turn.bindingId, loomSessionEpoch: turn.sessionEpoch };
+  brain.ingest(log.append({ kind: "status", agentId: "claude", payload: { ...tags, state: "turn_started", session: "audit-native" } }));
+  brain.ingest(log.append({ kind: "run_complete", agentId: "claude", payload: tags }));
+  brain.settled(turn.runId);
+}
+
+it("caps small delta evidence at 1000 entries (port audit #2)", async () => {
+  const { brain, log, dir } = await setup();
+  await acceptAuditPacket(brain, log, await brain.prepare(request(brain), "codex", dir, {}));
+  for (let i = 0; i < 1200; i++) log.append({ kind: "message", agentId: "other", payload: { text: `o${i}` } });
+  const prepared = await brain.prepare({ ...request(brain), targetAddedTokens: 40_000 }, "codex", dir, {});
+  expect(prepared.packet.evidence).toHaveLength(1000);
+  expect(prepared.packet.coverage.filter(c => c.disposition === "omitted")).toHaveLength(200);
+  expect(() => ContextPacketV1.parse(prepared.packet)).not.toThrow();
+});
+
+it("reconsiders omitted sources beyond the first 900 coverage entries (port audit #4)", async () => {
+  const { brain, log, dir } = await setup();
+  await acceptAuditPacket(brain, log, await brain.prepare(request(brain), "codex", dir, {}));
+  const work = Array.from({ length: 1200 }, (_, i) => log.append({ kind: "message", agentId: "other", payload: { text: `o${i}` } }));
+  const small = await brain.prepare({ ...request(brain), targetAddedTokens: 600 }, "codex", dir, {});
+  expect(small.packet.coverage.filter(c => c.disposition === "omitted").length).toBeGreaterThan(900);
+  await acceptAuditPacket(brain, log, small);
+  const next = await brain.prepare({ ...request(brain), targetAddedTokens: 40_000 }, "codex", dir, {});
+  expect(next.packet.coverage.some(c => c.source.eventId === work[0]!.id)).toBe(true);
+  await acceptAuditPacket(brain, log, next);
+  const last = await brain.prepare(request(brain), "codex", dir, {});
+  expect(last.packet.evidence.some(c => c.source.eventId === work[0]!.id)).toBe(true);
+});
+
+it("compaction resets delivery and native output ownership (port audit #3)", async () => {
+  const { brain, log, dir } = await setup();
+  const old = log.append({ kind: "message", agentId: "other", payload: { text: "old evidence" } });
+  const first = await brain.prepare(request(brain), "codex", dir, {});
+  await acceptAuditPacket(brain, log, first);
+  const own = log.append({ kind: "message", agentId: "claude", payload: { text: "old native output", loomBindingId: first.packet.target.id, loomSessionEpoch: first.packet.target.sessionEpoch } });
+  for (let i = 0; i < 301; i++) log.append({ kind: "message", agentId: "other", payload: { text: `new ${i}` } });
+  brain.ingest(log.append({ kind: "status", agentId: "claude", payload: { state: "native_compacted", session: "audit-native" } }));
+  const rebuilt = await brain.prepare(request(brain), "codex", dir, {});
+  expect(rebuilt.packet.target.sessionEpoch).toBe(first.packet.target.sessionEpoch + 1);
+  expect(rebuilt.packet.evidence.some(e => e.source.eventId === old.id || e.source.eventId === own.id)).toBe(false);
+  await acceptAuditPacket(brain, log, rebuilt);
+  const next = await brain.prepare(request(brain), "codex", dir, {});
+  expect(next.packet.evidence.map(e => e.source.eventId)).toEqual(expect.arrayContaining([old.id, own.id]));
+});
+
+it.each(["CLAUDE.local.md", "AGENTS.override.md", "ancestor", "import", "missing import"])("rejects stale preparation after changing %s (port audit #5)", async which => {
+  const { brain } = await setup();
+  const parent = tmpDir("instruction-parent"), sub = path.join(parent, "project");
+  fs.mkdirSync(sub);
+  const file = path.join(which === "ancestor" ? parent : sub, which === "ancestor" ? "AGENTS.md" : which.includes("import") ? "policy.md" : which);
+  if (which !== "missing import") fs.writeFileSync(file, "before");
+  if (which.includes("import")) fs.writeFileSync(path.join(sub, "CLAUDE.md"), "Read @policy.md");
+  const prepared = await brain.prepare(request(brain), "codex", sub, {});
+  fs.writeFileSync(file, "after");
+  await expect(brain.submit(prepared)).rejects.toMatchObject({ code: "stale" });
+});
+
+it.each(["codex", "claude"])("observes %s user instructions in a temporary home (port audit #5)", async provider => {
+  const { brain, dir } = await setup(), home = tmpDir("instruction-home");
+  const variable = provider === "codex" ? "CODEX_HOME" : "CLAUDE_CONFIG_DIR";
+  const file = path.join(home, provider === "codex" ? "AGENTS.override.md" : "CLAUDE.md");
+  vi.stubEnv(variable, home);
+  try {
+    fs.writeFileSync(file, "before");
+    const prepared = await brain.prepare(request(brain), provider === "codex" ? "codex" : "claude-code", dir, {});
+    fs.writeFileSync(file, "after");
+    await expect(brain.submit(prepared)).rejects.toMatchObject({ code: "stale" });
+  } finally { vi.unstubAllEnvs(); }
+});
+
+it("observes external imports with escaped spaces and cyclic imports (port audit #5)", async () => {
+  const { brain } = await setup(), parent = tmpDir("import-root"), sub = path.join(parent, "project");
+  fs.mkdirSync(sub);
+  fs.writeFileSync(path.join(sub, "CLAUDE.md"), "Read @../external\\ policy.md");
+  const imported = path.join(parent, "external policy.md");
+  fs.writeFileSync(imported, "before\n@project/CLAUDE.md");
+  const prepared = await brain.prepare(request(brain), "claude-code", sub, {});
+  fs.writeFileSync(imported, "after\n@project/CLAUDE.md");
+  await expect(brain.submit(prepared)).rejects.toMatchObject({ code: "stale" });
+});

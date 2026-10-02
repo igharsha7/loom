@@ -178,9 +178,19 @@ async function gitStore(dir: string): Promise<Store> {
 /** Old refs have no project field. Migrate ids recorded in this project's own
  * history; changed paths alone cannot distinguish a root capture from a subproject.
  * An explicit legacy id remains usable when its history is no longer available. */
+const legacyScans = new Map<string, string>();
 async function migrateLegacy(store: Store): Promise<void> {
-  const legacy = await listStore({ ...store, refs: REF_PREFIX });
+  // Inspect ref metadata before opening history. Modern root captures are not legacy.
+  const out = await quiet(["for-each-ref", "--format=%(refname)%00%(objectname)%00%(contents)%00", REF_PREFIX], store.dir);
+  const fields = out.split("\0"), legacy: Checkpoint[] = [];
+  for (let i = 0; i + 2 < fields.length; i += 3) {
+    const ref = fields[i]!.trim(), commit = fields[i + 1]!, message = fields[i + 2]!;
+    if (ref.slice(0, ref.lastIndexOf("/")) !== REF_PREFIX || message.includes("\nLoom-Project: ")) continue;
+    legacy.push({ id: ref.slice(ref.lastIndexOf("/") + 1), commit, label: "legacy", at: 0, branch: null, dirty: 0, store: "git" });
+  }
   if (!legacy.length) return;
+  const key = `${store.scratch}\0${store.refs}`, signature = JSON.stringify(legacy.map(c => [c.id, c.commit]));
+  if (legacyScans.get(key) === signature) return;
   const ids = new Set<string>();
   const remember = (payload: Record<string, unknown>) => {
     if (typeof payload.cwd === "string" && path.resolve(payload.cwd) !== path.resolve(store.dir)) return;
@@ -212,6 +222,7 @@ async function migrateLegacy(store: Store): Promise<void> {
     if ((await quiet(["show", "-s", "--format=%B", cp.commit], store.dir)).includes("\nLoom-Project: ")) continue;
     await moveLegacy(store, cp);
   }
+  legacyScans.set(key, signature);
 }
 
 async function moveLegacy(store: Store, cp: Checkpoint): Promise<void> {
@@ -503,8 +514,8 @@ export async function prepareRestore(dir: string, id: string, journal?: string):
   await restorePaths(dir, target, undo);
   // Separate recovery refs retain both trees without parenting undo commits on
   // targets. They live only until the restore and its conversation journal settle.
-  const intent = journal ? (await run(["hash-object", "-w", "--stdin"], dir, store.env, 30_000, false,
-    JSON.stringify({ journal: path.resolve(journal), at: Date.now() }))).trim() : undefined;
+  const intent = (await run(["hash-object", "-w", "--stdin"], dir, store.env, 30_000, false,
+    JSON.stringify({ journal: journal ? path.resolve(journal) : null, at: Date.now() }))).trim();
   await run(["update-ref", "--stdin"], dir, store.env, 30_000, false,
     `start\nupdate ${store.refs}/recovery/${undo.id}/target ${target.commit}\nupdate ${store.refs}/recovery/${undo.id}/undo ${undo.commit}\n` +
     (intent ? `update ${store.refs}/recovery/${undo.id}/journal ${intent}\n` : "") + "prepare\ncommit\n");
@@ -642,19 +653,7 @@ export async function releaseRestore(dir: string, prepared: { target: Checkpoint
 
 async function pruneStore(store: Store, keep: number): Promise<number> {
   const all = (await listStore(store)).sort((a, b) => (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
-  // A crash between preparation and journal publication must not leave an
-  // immortal pin. Give publication a minute, then collect pins without intent.
-  const recoveries = (await run(["for-each-ref", "--format=%(refname)%09%(objectname)", `${store.refs}/recovery/`], store.dir, store.env)).trim().split("\n");
-  for (const row of keep === 0 ? [] : recoveries) {
-    const [ref, object] = row.split("\t");
-    if (!ref?.endsWith("/journal") || !object) continue;
-    const intent = JSON.parse(await run(["cat-file", "blob", object], store.dir, store.env)) as { journal: string; at: number };
-    if (!fs.existsSync(intent.journal) && Date.now() - intent.at > 60_000) {
-      const id = ref.split("/").at(-2)!;
-      await releasePins(store, id);
-    }
-  }
-  const pinned = new Set((await quiet(["for-each-ref", "--format=%(objectname)", `${store.refs}/recovery/`], store.dir, store.env)).split("\n"));
+  const journalPins = new Set<string>();
   // Older versions have journals but no recovery refs. Honour those until they
   // are retried, including journals in linked checkouts sharing this repository.
   const dirs = new Set([store.dir]);
@@ -668,9 +667,33 @@ async function pruneStore(store: Store, keep: number): Promise<number> {
   for (const dir of dirs) {
     try {
       const journal = JSON.parse(fs.readFileSync(path.join(dir, ".loom", "rewind-pending.json"), "utf8"));
-      for (const cp of [journal.prepared?.target, journal.prepared?.undo]) if (typeof cp?.commit === "string") pinned.add(cp.commit);
+      for (const cp of [journal.prepared?.target, journal.prepared?.undo]) if (typeof cp?.commit === "string") journalPins.add(cp.commit);
     } catch { /* no readable journal */ }
   }
+  // A crash between preparation and journal publication must not leave an
+  // immortal pin. Give publication a minute, then collect pins without intent.
+  const recoveries = (await run(["for-each-ref", "--format=%(refname)%09%(objectname)", `${store.refs}/recovery/`], store.dir, store.env)).trim().split("\n");
+  for (const row of keep === 0 ? [] : recoveries) {
+    const [ref, object] = row.split("\t");
+    if (!ref?.endsWith("/journal") || !object) continue;
+    const intent = JSON.parse(await run(["cat-file", "blob", object], store.dir, store.env)) as { journal: string | null; at: number };
+    if ((!intent.journal || !fs.existsSync(intent.journal)) && Date.now() - intent.at > 60_000) {
+      const id = ref.split("/").at(-2)!;
+      await releasePins(store, id);
+    }
+  }
+  // Versions without intent blobs still have timestamped undo ids. Preserve
+  // any published journal, then collect old pairs left by a crashed direct call.
+  const refs = new Set(recoveries.map(row => row.split("\t")[0]));
+  for (const row of keep === 0 ? [] : recoveries) {
+    const [ref, object] = row.split("\t");
+    if (!ref?.endsWith("/undo") || !object || journalPins.has(object)) continue;
+    const id = ref.split("/").at(-2)!;
+    if (refs.has(`${store.refs}/recovery/${id}/journal`) || !/^c[0-9a-z]+$/.test(id)) continue;
+    if (Date.now() - parseInt(id.slice(1), 36) > 60_000) await releasePins(store, id);
+  }
+  const pinned = new Set((await quiet(["for-each-ref", "--format=%(objectname)", `${store.refs}/recovery/`], store.dir, store.env)).split("\n"));
+  for (const commit of journalPins) pinned.add(commit);
   const drop = all.slice(Math.max(0, keep)).filter(c => keep === 0 || !pinned.has(c.commit));
   for (const c of drop) await quiet(["update-ref", "-d", `${store.refs}/${c.id}`], store.dir, store.env);
   if (keep === 0) {
