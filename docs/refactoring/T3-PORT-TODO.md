@@ -182,7 +182,7 @@ Claude settings); override per session through the protocol instead.
 A second agent audited the port; Claude checked each round's findings against the
 code, Sol fixed them, Claude reviewed and ran the suite. Rounds 1–4 covered Phase 5
 only; rounds 5–8 covered all five phases, including what earlier fixes introduced.
-Findings per round: 5, 4, 6, 4, then 25, 24, 14, 10, 16, 5, 8, 11, 9. All fixed, each with a
+Findings per round: 5, 4, 6, 4, then 25, 24, 14, 10, 16, 5, 8, 11, 9, 9. All fixed, each with a
 regression test.
 
 - [x] Phase 5: dropped turns are named explicitly (`dropped: { from, turns, keep }`
@@ -209,7 +209,7 @@ regression test.
   question everywhere (routes, status, reloaded cards); multi-select questions;
   Codex file-read approvals; sparse Claude and Codex limit reports; per-window
   limit state.
-- [x] Tests: 1870 passing (plus 132 DOM). Known unrelated: `daemon.test.ts`
+- [x] Tests: 1885 passing (plus 134 DOM). Known unrelated: `daemon.test.ts`
   "real models" depends on the live Codex catalog; `app-queue-dom` is
   occasionally flaky. `codex.test.ts` "interrupts the running turn" failed once
   under full-suite load and couldn't be reproduced (6 runs alone, 2 full runs).
