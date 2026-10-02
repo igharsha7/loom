@@ -11,6 +11,7 @@ import { EchoAdapter } from "./echo.js";
 import { GrokAdapter } from "./grok.js";
 import { ModelAdapter } from "./model.js";
 import { OpenCodeAdapter } from "./opencode.js";
+import { providerRegistry } from "../providers/registry.js";
 import { ProviderAgent } from "../providers/agent.js";
 
 export type AgentFactory = (
@@ -44,13 +45,12 @@ export function registerAgentKind(
 
 /** The tier a kind builds as, or null if nothing registers that kind. */
 export function tierForKind(kind: string): "adapter" | "bridge" | null {
-  return tiers.get(kind) ?? null;
+  return tiers.get(kind) ?? (providerRegistry.get(kind) ? "adapter" : null);
 }
 
 registerAgentKind("echo", (cfg, dir) => new EchoAdapter(cfg.id, "echo", dir));
 // Codex and Claude Code run as warm provider sessions (src/providers/).
-registerAgentKind("claude-code", (cfg, dir) => new ProviderAgent(cfg.id, "claude-code", dir, cfg.options));
-registerAgentKind("codex", (cfg, dir) => new ProviderAgent(cfg.id, "codex", dir, cfg.options));
+for (const driver of providerRegistry.list()) registerAgentKind(driver.kind, (cfg, dir) => new ProviderAgent(cfg.id, driver.kind, dir, cfg.options));
 registerAgentKind("opencode", (cfg, dir) => new OpenCodeAdapter(cfg.id, dir, cfg.options));
 registerAgentKind("grok-code", (cfg, dir) => new GrokAdapter(cfg.id, dir, cfg.options));
 // An agent that is a model endpoint rather than a command — see adapters/model.ts.
@@ -87,6 +87,7 @@ export function isWithdrawnKind(kind: string): boolean {
 
 export function createAgent(cfg: AgentConfig, projectDir: string): AnyAgent {
   const factory = factories.get(cfg.kind);
+  if (!factory && providerRegistry.get(cfg.kind)) return new ProviderAgent(cfg.id, cfg.kind, projectDir, cfg.options);
   if (!factory) {
     throw new Error(
       `unknown agent kind "${cfg.kind}" (known: ${[...factories.keys()].join(", ")})`,
@@ -96,5 +97,5 @@ export function createAgent(cfg: AgentConfig, projectDir: string): AnyAgent {
 }
 
 export function knownAgentKinds(): string[] {
-  return [...factories.keys()];
+  return [...new Set([...factories.keys(), ...providerRegistry.list().map(d => d.kind)])];
 }

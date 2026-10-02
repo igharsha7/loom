@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { processGroupIdentity, stopRecordedProcessGroup } from "../providers/process.js";
+import { providerRegistry } from "../providers/registry.js";
+import type { WriterRecovery } from "../providers/driver.js";
 import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -17,7 +18,7 @@ import { EventLog } from "../core/eventlog.js";
 import { ensureBranch, addWorktree as gitAddWorktree, readOut, worktreePath } from "../core/git.js";
 import { logbook } from "../core/logbook.js";
 import { probeMcpServer, probeMcpServers, writeMcpSession } from "../core/mcp.js";
-import { NativeUsage, providerOf } from "./runtime/native-usage.js";
+import { NativeUsage } from "./runtime/native-usage.js";
 import { notify } from "../core/notify.js";
 import { OrchestraEngine, type OrchestraCoordinator } from "../core/orchestra.js";
 import { isPermissionMode, permissionFor, unsupportedReason, type PermissionMode } from "../core/permissions.js";
@@ -176,7 +177,11 @@ export class ProjectRuntime {
     this.log = log;
     if (config.brain?.continuity === true) this.continuity = new ContinuityEngine(log, info.id);
     this.harnesses = new HarnessMonitor(
-      () => this.config.agents.filter(a => a.enabled !== false && isNativeKind(a.kind)).map(a => ({ id: a.id, kind: a.kind, options: this.policyOptions(a) })),
+      () => this.config.agents.filter(a => a.enabled !== false && isNativeKind(a.kind)).map(a => {
+        const agent = this.agents.get(a.id);
+        return { id: a.id, kind: a.kind, options: this.policyOptions(a),
+          ...(agent instanceof ProviderAgent ? { health: () => agent.health() } : {}) };
+      }),
       (id, next, previous) => {
         if (!next.available) logbook.warn("harness", `${id} CLI is not reachable — native turns are refused until it answers`, next.error, info.id);
         else if (previous && !previous.available) logbook.info("harness", `${id} CLI is reachable again (${next.version ?? "unknown version"})`, undefined, info.id);
@@ -1490,7 +1495,8 @@ export class ProjectRuntime {
   /** Can this agent be handed a different model for one turn? */
   private switchesModelPerTurn(agentId: string): boolean {
     const kind = this.config.agents.find((a) => a.id === agentId)?.kind;
-    return kind === "model" || Boolean(this.continuity && (kind === "codex" || kind === "claude-code"));
+    const switching = kind ? providerRegistry.get(kind)?.capabilities.sessionModelSwitch : undefined;
+    return kind === "model" || Boolean(this.continuity && switching && switching !== "unsupported");
   }
 
   /** Bind (or unbind) who answers in a thread. */
@@ -1622,9 +1628,9 @@ export class ProjectRuntime {
     if (offered.has(p.reached)) return;
     offered.add(p.reached);
     this.switchOffered.set(agentId, offered);
-    const provider = providerOf(kind);
+    const provider = providerRegistry.accountKey(kind, this.config.agents.find(a => a.id === agentId)?.options ?? {});
     const alternatives = this.config.agents
-      .filter((a) => a.id !== agentId && isNativeKind(a.kind) && providerOf(a.kind) !== provider && this.agents.has(a.id) && isAdapter(this.agents.get(a.id)!) && !this.nativeUsage.limitsFor(a.kind)?.reached)
+      .filter((a) => a.id !== agentId && isNativeKind(a.kind) && providerRegistry.accountKey(a.kind, a.options ?? {}) !== provider && this.agents.has(a.id) && isAdapter(this.agents.get(a.id)!) && !this.nativeUsage.limitsFor(a.kind, providerRegistry.accountKey(a.kind, a.options ?? {}))?.reached)
       .map((a) => ({ agentId: a.id, kind: a.kind }));
     const window = (Array.isArray(p.windows) ? (p.windows as Array<{ id?: unknown; resetsAt?: unknown }>) : []).find((w) => w.id === p.reached);
     const where = chat ?? MAIN_CHAT;
@@ -2387,12 +2393,11 @@ export class ProjectRuntime {
       const journal = this.compactionJournal();
       try { await agent.compact(chat, session => {
         // Publish a complete intent only once the session exists, before the
-        // native request. Stop can fence this process group after a restart.
-        const processIdentity = session.processGroupId ? processGroupIdentity(session.processGroupId) : undefined;
-        if (processIdentity === null) throw new NativeDispatchRejected("native process exited before compaction submission");
+        // native request. Stop can fence the driver identity after a restart.
+        const writer = agent.recoveryIdentity(session);
         const tmp = `${journal}.${randomUUID()}.tmp`;
         const fd = fs.openSync(tmp, "wx", 0o600);
-        try { fs.writeFileSync(fd, JSON.stringify({ agentId, chat, cwd: agent.workspaceDir, processGroupId: session.processGroupId, processIdentity })); fs.fsyncSync(fd); }
+        try { fs.writeFileSync(fd, JSON.stringify({ agentId, chat, cwd: agent.workspaceDir, writer })); fs.fsyncSync(fd); }
         finally { fs.closeSync(fd); }
         try { fs.renameSync(tmp, journal); } finally { fs.rmSync(tmp, { force: true }); }
         const parent = fs.openSync(path.dirname(journal), "r");
@@ -2450,7 +2455,7 @@ export class ProjectRuntime {
       if (input.target?.kind === "orchestra") throw new ContinuityError("unsupported", "parallel orchestra is outside sequential native continuity");
       const target = input.target?.kind === "agent" ? input.target.agentId : bound.agentId ?? this.validHolder() ?? this.defaultAdapterId();
       const cfg = this.config.agents.find(a => a.id === target);
-      if (!cfg || !["codex", "claude-code"].includes(cfg.kind)) throw new ContinuityError("unsupported", "queued native continuity needs a supported harness");
+      if (!cfg || !isNativeKind(cfg.kind)) throw new ContinuityError("unsupported", "queued native continuity needs a supported harness");
       const captured = this.continuity.capture({ id: newId(16), text: input.text, conversationId: input.chat ?? MAIN_CHAT,
         agentInstanceId: target, source: input.source ?? "user", model: bound.agentId === target ? bound.model ?? null : null,
         plan: Boolean(input.plan), targetAddedTokens: this.contextBudget(target) });
@@ -2899,14 +2904,14 @@ export class ProjectRuntime {
     opts: { source?: "user" | "route" } = {},
   ): Promise<{ interrupted: string | null }> {
     if (fs.existsSync(this.compactionJournal())) {
-      let pending: { agentId?: string; processGroupId?: number; processIdentity?: string } = {};
+      let pending: { agentId?: string; writer?: WriterRecovery; processGroupId?: number; processIdentity?: string } = {};
       try { const parsed = JSON.parse(fs.readFileSync(this.compactionJournal(), "utf8")); if (parsed && typeof parsed === "object") pending = parsed; } catch { /* recover via CLI evidence */ }
       const agent = pending.agentId ? this.agents.get(pending.agentId) : undefined;
       if (agent && isAdapter(agent)) await agent.stop();
-      if (!(await stopRecordedProcessGroup(pending)) && !this.compactionOwned)
-        throw new ContinuityError("recovery_required", "compaction process identity cannot be verified; stop its native process, then run loom recover-compaction --evidence <details>");
+      if (!(await providerRegistry.fenceRecovery(pending)) && !this.compactionOwned)
+        throw new ContinuityError("recovery_required", "compaction writer identity cannot be verified; stop or fence its provider writers, then run loom recover-compaction --evidence <details>");
       if (this.anyBusy()) throw new ContinuityError("conflict", "wait for compaction to settle, then press Stop again");
-      if (fs.existsSync(this.compactionJournal())) this.reconcileCompaction("Stop confirmed native process group termination");
+      if (fs.existsSync(this.compactionJournal())) this.reconcileCompaction("Stop confirmed native writer fencing");
       return { interrupted: pending.agentId ?? null };
     }
     return this.turns.interrupt(opts);
@@ -3063,7 +3068,9 @@ export class ProjectRuntime {
           ...(cfg.instructions ? { instructions: cfg.instructions } : {}),
           ...sampling(cfg),
           ...(cfg.avatar ? { avatar: cfg.avatar } : {}),
-          ...(isNativeKind(cfg.kind) ? { context: this.nativeUsage.context(cfg.id), limits: this.nativeUsage.limitsFor(cfg.kind) } : {}),
+          ...(isNativeKind(cfg.kind) ? { provider: { driverKind: cfg.kind, accountKey: providerRegistry.accountKey(cfg.kind, cfg.options ?? {}),
+            limitsProvider: providerRegistry.require(cfg.kind).limits.provider },
+            context: this.nativeUsage.context(cfg.id), limits: this.nativeUsage.limitsFor(cfg.kind, providerRegistry.accountKey(cfg.kind, cfg.options ?? {})) } : {}),
         };
       }),
     );
@@ -3306,8 +3313,8 @@ export class ProjectRuntime {
     this.proxies.clear();
     if (!stopError && fs.existsSync(this.compactionJournal())) {
       try {
-        const pending = JSON.parse(fs.readFileSync(this.compactionJournal(), "utf8")) as { processGroupId?: number; processIdentity?: string };
-        if (await stopRecordedProcessGroup(pending)) {
+        const pending = JSON.parse(fs.readFileSync(this.compactionJournal(), "utf8")) as { writer?: WriterRecovery; processGroupId?: number; processIdentity?: string };
+        if (await providerRegistry.fenceRecovery(pending)) {
           fs.rmSync(this.compactionJournal(), { force: true });
           this.compactionOwned = false;
         } else if (this.compactionOwned) { fs.rmSync(this.compactionJournal(), { force: true }); this.compactionOwned = false; }

@@ -1,3 +1,4 @@
+import { providerRegistry } from "../providers/registry.js";
 /**
  * Permission modes — one dropdown, five CLIs with five different vocabularies.
  *
@@ -49,26 +50,7 @@ export interface PermissionProfile {
 }
 
 export const PERMISSION_PROFILES: Record<string, PermissionProfile> = {
-  "claude-code": {
-    default: "auto",
-    modes: {
-      bypass: { flags: "permissionMode: bypassPermissions", label: "Bypass — runs any tool, never asks" },
-      auto: { flags: "permissionMode: acceptEdits", label: "Auto — edits files; other tools only if pre-allowed" },
-      ask: {
-        flags: "permissionMode: default, canUseTool → Loom approvals",
-        label: "Always ask — every tool call waits for your approval in Loom",
-        ask: "approvals",
-      },
-    },
-  },
-  codex: {
-    default: "auto",
-    modes: {
-      bypass: { flags: "sandbox: danger-full-access, approvalPolicy: never", label: "Bypass — no sandbox, no approvals" },
-      auto: { flags: "sandbox: workspace-write, approvalPolicy: never", label: "Auto — writes inside the project, sandboxed" },
-      ask: { flags: "sandbox: read-only, approvalPolicy: untrusted", label: "Always ask — commands and edits wait for your approval in Loom", ask: "approvals" },
-    },
-  },
+  ...Object.fromEntries(providerRegistry.list().map(d => [d.kind, d.permissions])),
   "antigravity-cli": {
     default: "bypass",
     modes: {
@@ -129,7 +111,7 @@ export function isPermissionMode(v: unknown): v is PermissionMode {
 /** The mode an agent config runs in: its explicit choice, else the kind's default. */
 export function permissionFor(kind: string, options?: Record<string, unknown>): PermissionMode {
   const chosen = options?.permissions;
-  const profile = PERMISSION_PROFILES[kind];
+  const profile = PERMISSION_PROFILES[kind] ?? providerRegistry.get(kind)?.permissions;
   // A mode this agent can't honour (hand-edited config, or a newer table)
   // falls back to its default rather than pretending.
   if (isPermissionMode(chosen) && !profile?.modes[chosen].unsupported) return chosen;
@@ -138,12 +120,12 @@ export function permissionFor(kind: string, options?: Record<string, unknown>): 
 
 /** Why `mode` can't be used with `kind`, or null when it can. */
 export function unsupportedReason(kind: string, mode: PermissionMode): string | null {
-  return PERMISSION_PROFILES[kind]?.modes[mode].unsupported ?? null;
+  return (PERMISSION_PROFILES[kind] ?? providerRegistry.get(kind)?.permissions)?.modes[mode].unsupported ?? null;
 }
 
 /** The dropdown's rows for a kind — null for kinds with no mapping (bridges, echo). */
 export function permissionMenu(kind: string): Array<{ mode: PermissionMode } & PermissionCell> | null {
-  const p = PERMISSION_PROFILES[kind];
+  const p = PERMISSION_PROFILES[kind] ?? providerRegistry.get(kind)?.permissions;
   if (!p) return null;
   return PERMISSION_MODES.map((mode) => ({ mode, ...p.modes[mode] }));
 }

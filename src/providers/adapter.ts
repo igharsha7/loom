@@ -25,9 +25,17 @@ export interface ProviderAdapter {
 
   /** Start a session, or resume one from `resumeCursor`. Resolves once the session is ready. */
   startSession(input: SessionStartInput): Promise<ProviderSession>;
-  /** Start a turn on a live session. Resolves once the provider has accepted it. */
+  /** Allocate/submit a turn. Resolution alone is NOT delivery proof: a local
+   * `turn.started { local: true }` only allocates correlation. Emit `turn.accepted`
+   * after native evidence, or a native `turn.started` without `local`.
+   * All turn/item events must keep their original turn id, including late output.
+   * Refusal before submission must prove `notSubmitted`; uncertain submission
+   * must never masquerade as refusal or completion. */
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
-  /** Interrupt the active turn (or `turnId`). Resolves once the provider has acknowledged. */
+  /** Request cancellation of this turn. An acknowledgement is NOT quiescence.
+   * Terminal turn events report outcome; tracked command/child items must also
+   * finish, or the caller must Stop/fence the session before releasing its lease.
+   * Pending approval/question cards must have a cancellation path. */
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;
   respondToRequest(threadId: ThreadId, requestId: RequestId, decision: ApprovalDecision): Promise<void>;
   respondToUserInput(threadId: ThreadId, requestId: RequestId, answers: UserInputAnswers): Promise<void>;
@@ -42,7 +50,11 @@ export interface ProviderAdapter {
    */
   validateRollback?(threadId: ThreadId, beforeTurnId: TurnId): Promise<string[] | void>;
   rollbackThread?(threadId: ThreadId, beforeTurnId: TurnId, retainedTurnIds?: string[]): Promise<RollbackResult>;
-  /** Stop one session and wait for its process to be gone. */
+  /** Fence every writer belonging to a session (commands, descendants and
+   * remote workers). Resolve only after quiescence is proven. If proof fails,
+   * reject with NativeQuiescenceUnknown and retain handles for a later Stop.
+   * Do not emit a successful exit/terminal event merely because Stop was requested.
+   * A process group is one implementation; an opaque server lease is another. */
   stopSession(threadId: ThreadId): Promise<void>;
   stopAll(): Promise<void>;
   listSessions(): ProviderSession[];

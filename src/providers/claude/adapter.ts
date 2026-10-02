@@ -21,6 +21,7 @@
  * process group, and stopping it proves every tool it started is gone.
  */
 
+import { claudeCapabilities } from "../drivers/capabilities.js";
 import { isDeepStrictEqual } from "node:util";
 import fs from "node:fs";
 import path from "node:path";
@@ -213,7 +214,7 @@ interface Session {
 
 export class ClaudeProviderAdapter implements ProviderAdapter {
   readonly provider = "claude-code" as const;
-  readonly capabilities: AdapterCapabilities = { sessionModelSwitch: "in-session", supportsConversationRollback: true, manualCompaction: false };
+  readonly capabilities: AdapterCapabilities = claudeCapabilities;
   private readonly sessions = new Map<ThreadId, Session>();
   private readonly hub = new EventHub<ProviderRuntimeEvent>();
 

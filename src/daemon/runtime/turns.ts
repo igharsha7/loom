@@ -28,6 +28,7 @@ import type {
 import { MAIN_CHAT, isAdapter } from "../../types.js";
 import { planModeBriefing } from '../runtime-support.js';
 import { ProviderAgent } from "../../providers/agent.js";
+import { isNativeKind } from "../../core/continuity/capabilities.js";
 import type { ProviderKind } from "../../providers/contracts.js";
 import { FileSessionDirectory } from "../../providers/directory.js";
 import { worktreePath } from "../../core/git.js";
@@ -746,8 +747,8 @@ export class RuntimeTurns {
     const target = agentId ?? bound.agentId ?? this.host.validHolder() ?? this.host.defaultAdapterId();
     const agent = this.host.agent(target);
     const cfg = this.host.config.agents.find(a => a.id === target)!;
-    if (!isAdapter(agent) || !["codex", "claude-code"].includes(cfg.kind))
-      throw new ContinuityError("unsupported", "native continuity currently supports Codex and Claude Code only; bridges/OpenCode require a verified protocol");
+    if (!isAdapter(agent) || !isNativeKind(cfg.kind))
+      throw new ContinuityError("unsupported", "native continuity requires a registered driver with a verified protocol");
     if (/^\[(?:image|file)\]\s/m.test(text))
       throw new ContinuityError("unsupported", "attachment continuity is not verified for these CLI protocols; use an ordinary workspace file reference or the legacy attachment workflow");
     if (Array.isArray(cfg.options?.extraArgs) && cfg.options.extraArgs.length)

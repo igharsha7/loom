@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
+import { providerRegistry } from "../../providers/registry.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
@@ -17,7 +17,7 @@ const exec = promisify(execFile);
 export const estimateTokens = (text: string): number => Math.ceil(Buffer.byteLength(text, "utf8") / 3);
 
 /** Context windows to budget by until a harness reports its own (Codex's default model, Claude's 200k). */
-export const DEFAULT_CONTEXT_WINDOW: Record<string, number> = { codex: 272_000, "claude-code": 200_000 };
+export const DEFAULT_CONTEXT_WINDOW: Record<string, number> = Object.fromEntries(providerRegistry.list().map(d => [d.kind, d.continuity.defaultContextWindow]));
 export const PACKET_BUDGET = { share: 0.1, min: 6000, max: 40_000 };
 
 /**
@@ -27,11 +27,11 @@ export const PACKET_BUDGET = { share: 0.1, min: 6000, max: 40_000 };
  * more headlines and fewer observations rather than an overflow.
  */
 export function packetBudget(kind: string, window?: number | null): number {
-  const w = window && window > 0 ? window : DEFAULT_CONTEXT_WINDOW[kind] ?? 0;
+  const w = window && window > 0 ? window : providerRegistry.get(kind)?.continuity.defaultContextWindow ?? 0;
   return Math.max(PACKET_BUDGET.min, Math.min(PACKET_BUDGET.max, Math.floor(w * PACKET_BUDGET.share)));
 }
 
-export async function observeWorkspace(dir: string): Promise<{ workspace: WorkspaceRef; instructions: string }> {
+export async function observeWorkspace(dir: string, kind?: string): Promise<{ workspace: WorkspaceRef; instructions: string }> {
   const checkout = fs.realpathSync(dir);
   let head: string | null = null, dirty: boolean | null = null, state = "unknown";
   try {
@@ -48,43 +48,11 @@ export async function observeWorkspace(dir: string): Promise<{ workspace: Worksp
     if (failure.code !== "ENOENT" && !/not a git repository/i.test(failure.stderr ?? ""))
       throw new ContinuityError("stale", "Git workspace observation failed; inspect repository state before dispatch");
   }
-  // Conservative union of the harnesses' ancestor and user instruction files.
-  // Imports may legitimately resolve outside a subproject or checkout.
-  const files = new Map<string, string>(), visited = new Map<string, { text: string; depth: number }>();
-  let instructionBytes = 0;
-  const readInstruction = (file: string, depth = 0): void => {
-    file = path.resolve(file);
-    if (!fs.existsSync(file)) { files.set(file, "missing"); return; }
-    const actual = fs.realpathSync(file);
-    let entry = visited.get(actual);
-    if (!entry) {
-      const stat = fs.statSync(actual);
-      instructionBytes += stat.size;
-      if (!stat.isFile() || stat.size > 1_000_000 || instructionBytes > 4_000_000 || visited.size >= 1000)
-        throw new ContinuityError("invalid", `instruction files exceed observation limits: ${file}`);
-      entry = { text: fs.readFileSync(actual, "utf8"), depth: 5 };
-      visited.set(actual, entry);
-    }
-    files.set(file, digest(JSON.stringify([actual, entry.text])));
-    if (entry.depth <= depth) return;
-    entry.depth = depth;
-    const text = entry.text;
-    if (depth >= 4) return;
-    // Over-observing a literal @path is harmless; missing imports are hashed too,
-    // so creating a file after preparation also invalidates the snapshot.
-    for (const match of text.matchAll(/(?:^|\s)@((?:\\ |[^\s`"'<>])+)/g)) {
-      const imported = match[1]!.replace(/\\ /g, " ");
-      readInstruction(imported.startsWith("~/") ? path.join(os.homedir(), imported.slice(2)) : path.resolve(path.dirname(file), imported), depth + 1);
-    }
-  };
-  for (let parent = checkout; ; parent = path.dirname(parent)) {
-    for (const name of ["AGENTS.override.md", "AGENTS.md", "CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md", ".codex/AGENTS.md"])
-      readInstruction(path.join(parent, name));
-    if (parent === path.dirname(parent)) break;
-  }
-  const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex");
-  for (const file of [path.join(codexHome, "AGENTS.override.md"), path.join(codexHome, "AGENTS.md"),
-    path.join(process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude"), "CLAUDE.md")]) readInstruction(file);
+  const driver = kind ? providerRegistry.get(kind) : providerRegistry.list()[0];
+  if (!driver) throw new ContinuityError("unsupported", `no instruction observer for ${kind}`);
+  let instructions: string;
+  try { instructions = (await driver.continuity.instructionDependencies(checkout)).fingerprint; }
+  catch (error) { throw new ContinuityError("invalid", error instanceof Error ? error.message : String(error)); }
   // Hash dirty tracked contents, not just porcelain labels: two edits to the
   // same dirty file must invalidate a prepared snapshot.
   const dirtyContent: Array<[string, string]> = [];
@@ -107,7 +75,7 @@ export async function observeWorkspace(dir: string): Promise<{ workspace: Worksp
     } catch { throw new ContinuityError("stale", "dirty workspace exceeds observation limits or changed during observation; narrow it before dispatch"); }
   }
   return { workspace: { id: digest(checkout), checkout, head, dirty,
-    revision: digest(JSON.stringify([head, state, dirtyContent])) }, instructions: digest(JSON.stringify([...files].sort(([a], [b]) => a.localeCompare(b)))) };
+    revision: digest(JSON.stringify([head, state, dirtyContent])) }, instructions };
 }
 
 type Message = ContextPacket["messages"][number];
@@ -205,13 +173,12 @@ export class ContinuityEngine {
    * covered as exact, summarized, referenced or omitted.
    */
   async prepare(request: ContinuityRequest, kind: string, dir: string, options: Record<string, unknown>, supplement = ""): Promise<{ packet: ContextPacket; rendered: RenderedBriefing; receipt: Receipt }> {
-    if (kind !== "codex" && kind !== "claude-code")
+    const driver = providerRegistry.get(kind);
+    if (!driver?.continuity.supported)
       throw new ContinuityError("unsupported", `${kind} has no verified native continuity protocol; use the legacy workflow`);
-    const observed = await observeWorkspace(dir);
+    const observed = await observeWorkspace(dir, kind);
     this.store.assertWorkspaceIdle(observed.workspace.id);
-    // Both CLIs switch models on resume, so a model change keeps the native session.
-    const { model: _model, ...stable } = options;
-    const fingerprint = digest(JSON.stringify([kind, stable, observed.workspace.id, "turn-input-v2"]));
+    const fingerprint = driver.continuity.compatibilityKey({ kind, options, workspaceId: observed.workspace.id });
     const slot = digest(JSON.stringify([request.conversationId, request.agentInstanceId, observed.workspace.id, fingerprint]));
     let binding = this.store.binding(slot, () => ({ id: randomUUID(), conversationId: request.conversationId,
       agentInstanceId: request.agentInstanceId, harnessKind: kind, workspaceId: observed.workspace.id,
@@ -298,7 +265,7 @@ export class ContinuityEngine {
         sources: [...archive.values()].sort((a, b) => a.source.eventId - b.source.eventId) }));
       // Artifact finalization is an app write. Freeze the workspace after it so
       // projects tracking .loom do not invalidate their own prepared packet.
-      const finalized = await observeWorkspace(dir);
+      const finalized = await observeWorkspace(dir, kind);
       packet.snapshot.workspace = finalized.workspace;
       packet.snapshot.instructionFilesFingerprint = finalized.instructions;
     }
@@ -411,7 +378,7 @@ export class ContinuityEngine {
       throw new ContinuityError("invalid", "submission must match the immutable prepared packet and receipt");
     if (packet.budget.overflow === "mandatory") throw new ContinuityError("overflow", `protected context needs approximately ${packet.budget.estimatedAddedTokens} added tokens; review packet ${packet.id} and increase the target or create reviewed checkpoints`);
     this.validate(packet, rendered);
-    const current = await observeWorkspace(packet.snapshot.workspace.checkout);
+    const current = await observeWorkspace(packet.snapshot.workspace.checkout, packet.target.harnessKind);
     if (packet.retrieval) {
       if (packet.retrieval.relativePath !== `.loom/brain/artifacts/${packet.retrieval.hash}.json` ||
         Buffer.byteLength(new ContextArtifacts(packet.snapshot.workspace.checkout).read(packet.retrieval.hash)) !== packet.retrieval.bytes)

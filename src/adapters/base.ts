@@ -15,7 +15,7 @@ import type {
 } from "../types.js";
 import { writeMemoryFile } from "../core/registry.js";
 
-import { NativeQuiescenceUnknown } from "../core/continuity/contracts.js";
+import { NativeQuiescenceUnknown } from "../providers/settlement.js";
 import { AgentStateStore } from "../core/agent-state.js";
 
 type EventCb = (e: AdapterEvent) => void;

@@ -209,7 +209,8 @@ regression test.
   question everywhere (routes, status, reloaded cards); multi-select questions;
   Codex file-read approvals; sparse Claude and Codex limit reports; per-window
   limit state.
-- [x] Tests: 1798 passing (plus 132 DOM). Known unrelated: `daemon.test.ts`
+- [x] Tests: 1835 passing (plus 132 DOM). `process.test.ts` #16 failed once
+  under full-suite load ("cannot inspect"); under investigation. Known unrelated: `daemon.test.ts`
   "real models" depends on the live Codex catalog; `app-queue-dom` is
   occasionally flaky. `codex.test.ts` "interrupts the running turn" failed once
   under full-suite load and couldn't be reproduced (6 runs alone, 2 full runs).
@@ -243,10 +244,16 @@ regression test.
   imported files; journal-less restore pins are cleaned up; the legacy
   checkpoint migration runs once; a provider change under the same agent id
   starts a fresh session instead of reusing the old cursor.
-- [ ] Provider registry (decided 2026-10-02, before Phase 6): one driver record
-  per provider (identity, config, adapter factory, health, continuity facts,
-  capabilities) read by Brain, the runtime, health, usage tracking and persisted
-  state; a shared adapter conformance suite. Brain's engine stays as is.
+- [x] Provider registry (decided and built 2026-10-02, before Phase 6): static
+  drivers in `src/providers/builtInDrivers.ts` (Codex, Claude Code under
+  `src/providers/drivers/`), a registry that validates config and owns
+  instances, and per-driver continuity facts, capabilities, health, account and
+  continuation identity, instruction discovery and writer fencing (opaque, not
+  tied to process groups). Brain, the runtime, health and usage read from it;
+  no provider names remain in Brain or the runtime. Persisted data loads as
+  before; unknown drivers are preserved. Shared adapter conformance suite in
+  `test/providers/conformance.test.ts`. Adding a provider: adapter + driver +
+  an entry in `builtInDrivers` + conformance fixtures.
 - [ ] UI for the recovery states (pending rewind, pending compaction, a turn
   held after an unsettled writer) — Phase 7.
   Today the way out is the CLI or the API.

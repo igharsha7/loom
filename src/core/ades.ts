@@ -15,8 +15,7 @@ import { listProviders } from "./providers.js";
 import type { AgentConfig } from "../types.js";
 import { agyBin } from "../adapters/antigravity-cli.js";
 import { cliAvailable } from "../adapters/base.js";
-import { claudeBin } from "../providers/claude/adapter.js";
-import { codexBin } from "../providers/codex/adapter.js";
+import { providerRegistry } from "../providers/registry.js";
 import { grokBin } from "../adapters/grok.js";
 
 interface AdeCommon {
@@ -66,26 +65,8 @@ export type AdeSpec = AdeAdapterSpec | AdeBridgeSpec;
  * than absent when the right answer is one HTTP call away.
  */
 export const ADES: AdeSpec[] = [
-  {
-    kind: "claude-code",
-    label: "Claude Code",
-    tier: "adapter",
-    probe: async () => {
-      const bin = claudeBin();
-      return bin ? cliAvailable(bin) : false;
-    },
-  },
-  {
-    kind: "codex",
-    label: "Codex",
-    tier: "adapter",
-    // The CLI ships inside Codex.app as well as on PATH; a Mac with the app and
-    // an empty PATH is the common case.
-    probe: async () => {
-      const bin = codexBin();
-      return bin ? cliAvailable(bin) : false;
-    },
-  },
+  ...providerRegistry.list().map(driver => ({ kind: driver.kind, label: driver.metadata.displayName,
+    tier: "adapter" as const, probe: () => driver.available(providerRegistry.decode(driver.kind, {})) })),
   {
     kind: "opencode",
     label: "OpenCode",

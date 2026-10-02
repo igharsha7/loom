@@ -7,7 +7,6 @@
  */
 import { esc,tokens } from './format.js';
 
-var PROVIDER = { codex: "codex", "claude-code": "claude" };
 var CLAUDE_WINDOWS = { five_hour: "5-hour", seven_day: "weekly", seven_day_opus: "weekly Opus",
   seven_day_sonnet: "weekly Sonnet", seven_day_overage_included: "weekly (overage)", overage: "overage" };
 
@@ -16,7 +15,7 @@ function observeUsage(project, e){
   if (!project || !e || !e.agentId) return false;
   var agent = null;
   project.agents.forEach(function(a){ if (a.id === e.agentId) agent = a; });
-  if (!agent || !PROVIDER[agent.kind]) return false;
+  if (!agent) return false;
   var p = e.payload || {}, ctx = agent.context || null;
   if (e.kind === "run_complete" || e.kind === "error" || (e.kind === "status" && p.state === "interrupted")) {
     if (!ctx || !ctx.compacting) return false;
@@ -39,10 +38,12 @@ function observeUsage(project, e){
     return true;
   }
   if (p.state === "usage_limits" && Array.isArray(p.windows)) {
-    // Limits belong to the account: every agent on this provider shares them.
-    var provider = PROVIDER[agent.kind];
+    // Limits belong to an account. The registry supplies each roster entry's identity.
+    var provider = p.provider, account = p.accountKey || (agent.provider && agent.provider.accountKey) || provider;
+    if (!provider) return false;
     project.agents.forEach(function(a){
-      if (PROVIDER[a.kind] !== provider) return;
+      var owner = a.provider && a.provider.accountKey;
+      if (owner ? owner !== account : a.id !== agent.id) return;
       var byId = {}, order = [];
       ((a.limits && a.limits.windows) || []).concat(p.windows).forEach(function(w){
         if (!w || !w.id) return; if (!(w.id in byId)) order.push(w.id); byId[w.id] = w;

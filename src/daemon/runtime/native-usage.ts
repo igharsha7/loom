@@ -12,8 +12,8 @@
 
 import type { AgentContextUsage, LoomEvent, ProviderLimits } from "../../types.js";
 
-const PROVIDER: Record<string, string> = { codex: "codex", "claude-code": "claude" };
-export const providerOf = (kind: string): string | undefined => PROVIDER[kind];
+import { providerRegistry } from "../../providers/registry.js";
+export const providerOf = (kind: string): string | undefined => providerRegistry.accountKey(kind);
 
 export class NativeUsage {
   private readonly contexts = new Map<string, AgentContextUsage>();
@@ -50,17 +50,18 @@ export class NativeUsage {
       case "usage_limits": {
         if (typeof p.provider !== "string" || !Array.isArray(p.windows)) return;
         // A report can carry one window (Claude sends one per event): merge by id.
-        const previous = this.limits.get(p.provider);
+        const account = typeof p.accountKey === "string" ? p.accountKey : p.provider;
+        const previous = this.limits.get(account);
         const windows = new Map((previous?.windows ?? []).map(w => [w.id, w]));
         for (const w of p.windows as ProviderLimits["windows"]) if (w && typeof w.id === "string") windows.set(w.id, w);
-        const blocked = this.blocked.get(p.provider) ?? new Set<string>();
-        // Codex reached values are account reasons, not primary/secondary IDs.
-        // Its account snapshot without a reached reason supersedes the previous one.
-        if (p.provider === "codex") blocked.clear();
+        const blocked = this.blocked.get(account) ?? new Set<string>();
+        // Account snapshots supersede all reached reasons; window reports
+        // only clear the windows they update. The driver declares that scope.
+        if ((p.reachedScope ?? providerRegistry.list().find(d => d.limits.provider === p.provider)?.limits.reachedScope) === "account") blocked.clear();
         else for (const w of p.windows as ProviderLimits["windows"]) if (w.id !== p.reached) blocked.delete(w.id);
         if (typeof p.reached === "string") blocked.add(p.reached);
-        this.blocked.set(p.provider, blocked);
-        this.limits.set(p.provider, { provider: p.provider, windows: [...windows.values()],
+        this.blocked.set(account, blocked);
+        this.limits.set(account, { provider: p.provider, windows: [...windows.values()],
           reached: blocked.values().next().value ?? null, at });
         return;
       }
@@ -70,8 +71,8 @@ export class NativeUsage {
   }
 
   context(agentId: string): AgentContextUsage | null { return this.contexts.get(agentId) ?? null; }
-  limitsFor(kind: string): ProviderLimits | null {
-    const provider = providerOf(kind);
+  limitsFor(kind: string, accountKey?: string): ProviderLimits | null {
+    const provider = accountKey ?? providerOf(kind);
     return provider ? this.limits.get(provider) ?? null : null;
   }
 }

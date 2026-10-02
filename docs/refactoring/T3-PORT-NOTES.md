@@ -310,3 +310,33 @@ test fix (#212). These are the changes that touch the port:
   belongs to is carried beside the event (a WeakMap), not in its persisted
   payload.
 
+
+## Decisions (provider registry)
+
+- `src/providers/builtInDrivers.ts` is the sole concrete driver collection.
+  Drivers own config decoding/defaults, factories, health/model discovery,
+  permissions, account keys, continuation identities, continuity policy and
+  compaction/settlement/fencing capabilities. `ProviderAgent` is transport-neutral.
+- Like t3code, static drivers, materialized instances and continuation identity
+  are separate. Loom uses plain injected environment closures and its existing
+  project agent/service lifetime instead of Effect services and scopes. Config
+  is decoded before materialization; disposal must retain failed fencing handles.
+- Brain still owns evidence, packets, receipts and review. Built-in compatibility
+  keys and instruction fingerprints retain their previous formats, including
+  in-session model switching and round-11 instruction discovery. A new driver
+  supplies its own policy; Brain has no provider-specific construction branch.
+- Driver ids are open persisted strings. An unavailable driver does not discard
+  saved cursors/bindings. Session files accept an optional `continuationKey`;
+  absent legacy keys keep their original instance ownership. Explicit account or
+  continuation changes start fresh rather than handing a cursor across accounts.
+- New compaction journals store `writer: { driverKind, continuationKey, identity }`.
+  Identities are opaque to the runtime; drivers fence them. Existing PID/identity
+  journals still use the local recovery implementation. A failed fence preserves
+  the hold and the existing Stop/manual-evidence recovery path.
+- Roster status supplies driver/account facts to browser usage folding, so live
+  limit reports no longer merge separate accounts based on a provider name.
+- Turn allocation, native acceptance and writer quiescence are distinct contracts.
+  Shared fake-backed conformance tests run acceptance, correlation, command/child
+  settlement, cancellation, Stop retry, restart/resume, rollback and compaction
+  scenarios against every built-in. Phase 6 management UI and real remote drivers
+  remain out of scope.

@@ -16,13 +16,15 @@
  *    send a delta to an empty session.
  */
 
-import { NativeQuiescenceUnknown } from "../core/continuity/contracts.js";
+import { providerRegistry } from "./registry.js";
+import type { ProviderInstance } from "./driver.js";
+import { NativeQuiescenceUnknown } from "./settlement.js";
 import { EventHub, type ProviderAdapter } from "./adapter.js";
 import type {
   AdapterCapabilities, ApprovalDecision, InstanceId, ProviderKind, ProviderRuntimeEvent, ProviderSession, RequestId,
   RuntimeMode, SendTurnInput, ThreadId, TurnId, TurnStartResult, UserInputAnswers,
 } from "./contracts.js";
-import type { SessionDirectory, TurnLedger } from "./directory.js";
+import type { ProviderBinding, SessionDirectory, TurnLedger } from "./directory.js";
 import { ProviderError, isProviderError } from "./errors.js";
 
 export interface EnsureSessionInput {
@@ -69,7 +71,7 @@ export interface RollbackStep {
 const sessionKey = (threadId: string, instanceId: string) => `${threadId}\u0000${instanceId}`;
 
 export class ProviderService {
-  private readonly adapters = new Map<InstanceId, { adapter: ProviderAdapter; unsubscribe: () => void }>();
+  private readonly adapters = new Map<InstanceId, { adapter: ProviderAdapter; instance?: ProviderInstance; unsubscribe: () => void }>();
   private readonly hub: EventHub<ProviderRuntimeEvent>;
   private readonly starting = new Map<string, Promise<EnsuredSession>>();
   private readonly submittingLedgers = new Map<string, TurnLedger | null | undefined>();
@@ -89,10 +91,10 @@ export class ProviderService {
 
   // ---- registry ------------------------------------------------------------
 
-  register(adapter: ProviderAdapter): void {
+  register(adapter: ProviderAdapter, instance?: ProviderInstance): void {
     if (this.adapters.has(adapter.instanceId)) throw new ProviderError("validation", "register", `an adapter for "${adapter.instanceId}" is already registered`);
     const unsubscribe = adapter.onEvent(event => this.observe(event));
-    this.adapters.set(adapter.instanceId, { adapter, unsubscribe });
+    this.adapters.set(adapter.instanceId, { adapter, instance, unsubscribe });
   }
 
   /** Stop the instance's sessions and forget it. Bindings (and their cursors) stay. */
@@ -102,7 +104,8 @@ export class ProviderService {
     this.stoppingInstances.add(instanceId);
     try {
       await Promise.allSettled([...this.starting].filter(([k]) => k.endsWith(`\0${instanceId}`)).map(([, p]) => p));
-      await entry.adapter.stopAll();
+      if (entry.instance) await entry.instance.dispose();
+      else await entry.adapter.stopAll();
       this.adapters.delete(instanceId);
       entry.unsubscribe();
     }
@@ -138,27 +141,40 @@ export class ProviderService {
     const k = sessionKey(input.threadId, input.instanceId);
     if (this.stoppingAll || this.stoppingInstances.has(input.instanceId) || this.stoppingSessions.has(k))
       throw new ProviderError("validation", "ensureSession", "the native session is stopping", { mayHaveStarted: false });
-    if (adapter.hasSession(input.threadId)) {
-      const session = adapter.listSessions().find(s => s.threadId === input.threadId);
-      if (session) return { session, via: "live", replacedLostSession: false };
-    }
     const pending = this.starting.get(k);
     if (pending) return pending;
-    const start = this.start(adapter, input).finally(() => this.starting.delete(k));
+    let restart = false;
+    if (adapter.hasSession(input.threadId)) {
+      const session = adapter.listSessions().find(s => s.threadId === input.threadId);
+      if (session) {
+        const changed = input.model !== undefined && (input.model ?? undefined) !== session.model;
+        if (changed && adapter.capabilities.sessionModelSwitch === "unsupported")
+          throw new ProviderError("unsupported", "ensureSession", "this driver cannot switch models", { mayHaveStarted: false });
+        if (changed && adapter.capabilities.sessionModelSwitch === "restart") restart = true;
+        else return { session, via: "live", replacedLostSession: false };
+      }
+    }
+    const start = (async () => {
+      if (restart) await adapter.stopSession(input.threadId);
+      return this.start(adapter, input);
+    })().finally(() => this.starting.delete(k));
     this.starting.set(k, start);
     return start;
   }
 
   private async start(adapter: ProviderAdapter, input: EnsureSessionInput): Promise<EnsuredSession> {
     const stored = this.directory.get(input.threadId, input.instanceId);
-    const binding = stored?.provider === adapter.provider ? stored : undefined;
-    const cursor = binding?.resumeCursor ?? undefined;
+    const identity = this.adapters.get(input.instanceId)?.instance?.continuationIdentity;
+    const expectedKey = identity?.continuationKey ?? `${adapter.provider}:instance:${input.instanceId}`;
+    const binding = stored && this.ownsBinding(adapter, stored) ? stored : undefined;
+    const restart = adapter.capabilities.sessionModelSwitch === "restart" && input.model !== undefined && input.model !== binding?.runtimePayload?.model;
+    const cursor = restart ? undefined : binding?.resumeCursor ?? undefined;
     const cwd = binding?.runtimePayload?.cwd ?? input.cwd;
     const model = input.model === null ? undefined : input.model ?? binding?.runtimePayload?.model;
     const launch = async (resumeCursor: unknown) => {
       // A new native session: every turn it will ever have gets recorded.
       this.directory.upsert({ threadId: input.threadId, instanceId: input.instanceId, provider: adapter.provider,
-        status: "starting", resumeCursor: resumeCursor ?? null, runtimePayload: { cwd, ...(model ? { model } : {}) },
+        continuationKey: expectedKey, status: "starting", resumeCursor: resumeCursor ?? null, runtimePayload: { cwd, ...(model ? { model } : {}) },
         runtimeMode: input.runtimeMode, ...(resumeCursor === undefined ? { turnLedger: { since: Date.now(), fromStart: true, turns: [] } } : {}) });
       try {
         return await adapter.startSession({ threadId: input.threadId, instanceId: input.instanceId, cwd,
@@ -166,7 +182,7 @@ export class ProviderService {
           ...(resumeCursor !== undefined ? { resumeCursor } : {}) });
       } catch (error) {
         this.directory.upsert({ threadId: input.threadId, instanceId: input.instanceId, provider: adapter.provider,
-          status: "error", resumeCursor: resumeCursor ?? null, runtimePayload: { cwd, ...(model ? { model } : {}) }, runtimeMode: input.runtimeMode });
+          continuationKey: expectedKey, status: "error", resumeCursor: resumeCursor ?? null, runtimePayload: { cwd, ...(model ? { model } : {}) }, runtimeMode: input.runtimeMode });
         // Starting a session never submits a turn, whatever went wrong.
         if (isProviderError(error) || error instanceof NativeQuiescenceUnknown) throw error;
         throw new ProviderError("transport", "ensureSession", error instanceof Error ? error.message : String(error),
@@ -193,15 +209,25 @@ export class ProviderService {
     return { session, via, replacedLostSession };
   }
 
+  private ownsBinding(adapter: ProviderAdapter, binding: ProviderBinding): boolean {
+    const legacy = `${adapter.provider}:instance:${adapter.instanceId}`;
+    const key = this.adapters.get(adapter.instanceId)?.instance?.continuationIdentity.continuationKey ?? legacy;
+    return binding.provider === adapter.provider &&
+      (binding.continuationKey === key || binding.continuationKey === undefined && key === legacy);
+  }
+
   /** Persist what resumes this session. */
   private record(session: ProviderSession, status: "running" | "stopped" | "error" = "running"): void {
     this.directory.upsert({ threadId: session.threadId, instanceId: session.instanceId, provider: session.provider, status,
+      continuationKey: this.directory.get(session.threadId, session.instanceId)?.continuationKey,
       resumeCursor: session.resumeCursor ?? this.directory.get(session.threadId, session.instanceId)?.resumeCursor ?? null,
       runtimePayload: { cwd: session.cwd, ...(session.model ? { model: session.model } : {}) }, runtimeMode: session.runtimeMode });
   }
 
   /** Start a turn on a live session (starting or resuming one first). */
   async sendTurn(input: SendTurnInput & Omit<EnsureSessionInput, "threadId" | "instanceId"> & { cancelled?: () => boolean; beforeSubmit?: (session: ProviderSession) => void }): Promise<TurnStartResult & { session: EnsuredSession }> {
+    if (input.interactionMode === "plan" && this.adapter(input.instanceId).capabilities.planMode === "unsupported")
+      throw new ProviderError("unsupported", "sendTurn", "this driver has no native plan mode", { mayHaveStarted: false });
     if (!input.input.trim()) throw new ProviderError("validation", "sendTurn", "a turn needs input");
     const ensured = await this.ensureSession(input);
     if (input.cancelled?.()) throw new ProviderError("validation", "sendTurn", "interrupted before the turn started", { mayHaveStarted: false });
@@ -279,6 +305,8 @@ export class ProviderService {
     const binding = this.directory.get(threadId, instanceId);
     if (!binding || binding.resumeCursor === null || binding.resumeCursor === undefined) return null;
     const adapter = this.adapter(instanceId, "rollback");
+    if (!this.ownsBinding(adapter, binding)) throw new ProviderError("unsupported", "rollback",
+      "this saved conversation belongs to a different driver or account; restore its owner or rewind files alone");
     const ledger = binding.turnLedger;
     if (!ledger || (!ledger.fromStart && ledger.since > cutoff)) {
       // Nothing has touched the binding since the cutoff, so no turn ran.
@@ -299,8 +327,11 @@ export class ProviderService {
   }
 
   async validateRollback(step: RollbackStep): Promise<void> {
-    if (step.beforeTurnId === null) return;
     const adapter = this.adapter(step.instanceId, "rollback");
+    const binding = this.directory.get(step.threadId, step.instanceId);
+    if (step.provider !== adapter.provider || binding && !this.ownsBinding(adapter, binding))
+      throw new ProviderError("unsupported", "rollback", "restore this conversation's driver and account before retrying, or rewind files alone");
+    if (step.beforeTurnId === null) return;
     try {
       await this.ensureSession({ threadId: step.threadId, instanceId: step.instanceId, cwd: step.cwd, runtimeMode: step.runtimeMode, ...(step.model ? { model: step.model } : {}) });
     } catch (error) { if (isProviderError(error, "session_missing")) return; throw error; }
@@ -317,6 +348,8 @@ export class ProviderService {
   async rollbackConversation(step: RollbackStep): Promise<void> {
     const adapter = this.adapter(step.instanceId, "rollback");
     const saved = this.directory.get(step.threadId, step.instanceId);
+    if (step.provider !== adapter.provider || saved && !this.ownsBinding(adapter, saved))
+      throw new ProviderError("unsupported", "rollback", "restore this conversation's driver and account before retrying, or rewind files alone");
     // A completed rollback durably removed this boundary. Retrying its intent
     // must not apply a second native cut (including Codex's count fallback).
     if (saved?.resumeCursor == null || (step.beforeTurnId !== null && saved.turnLedger &&

@@ -18,6 +18,7 @@
  * codex-cli 0.153.4).
  */
 
+import { codexCapabilities } from "../drivers/capabilities.js";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { guardNativeOutput } from "../../adapters/base.js";
@@ -164,7 +165,7 @@ interface Session {
 
 export class CodexProviderAdapter implements ProviderAdapter {
   readonly provider = "codex" as const;
-  readonly capabilities: AdapterCapabilities = { sessionModelSwitch: "in-session", supportsConversationRollback: true, manualCompaction: true };
+  readonly capabilities: AdapterCapabilities = codexCapabilities;
   private readonly sessions = new Map<ThreadId, Session>();
   private readonly hub = new EventHub<ProviderRuntimeEvent>();
 

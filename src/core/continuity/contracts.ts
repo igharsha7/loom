@@ -20,7 +20,7 @@ export const ContextItemV1 = z.strictObject({ id: Id, revision: Counter,
 export const CoverageV1 = z.strictObject({ source: SourceRefV1,
   disposition: z.enum(["exact", "summarized", "referenced", "omitted"]), reason: z.string().min(1).max(1000) });
 export const BindingV1 = z.strictObject({ id: Id, conversationId: Id,
-  agentInstanceId: Id, harnessKind: z.enum(["codex", "claude-code"]),
+  agentInstanceId: Id, harnessKind: Id,
   workspaceId: Hash, compatibilityFingerprint: Hash, nativeSessionId: Id.nullable(),
   // "compacted": the harness reported native compaction; the next packet rebuilds state.
   sessionEpoch: Counter, retention: z.enum(["unknown", "observed", "compacted"]) });
@@ -73,21 +73,7 @@ export class ContinuityError extends Error {
   }
 }
 
-/** Only adapters with evidence that no process was launched may use this. */
-export class NativeDispatchRejected extends Error {
-  constructor(message: string) { super(message); this.name = "NativeDispatchRejected"; }
-}
-
-/** The bound native session could not be resumed and no turn was started.
- * Safe to rebuild: the binding moves to a new epoch and reconstructs. */
-export class NativeSessionMissing extends NativeDispatchRejected {
-  constructor(message: string) { super(message); this.name = "NativeSessionMissing"; }
-}
-
-/** The native parent may have exited while a tool descendant still owns files. */
-export class NativeQuiescenceUnknown extends Error {
-  constructor(message: string) { super(message); this.name = "NativeQuiescenceUnknown"; }
-}
+export { NativeDispatchRejected, NativeSessionMissing, NativeQuiescenceUnknown } from "../../providers/settlement.js";
 
 export function parseBounded<T>(schema: z.ZodType<T>, value: unknown): T {
   // Reject oversize/deep/unserializable inputs before handing them to Zod.

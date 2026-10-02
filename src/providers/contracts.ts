@@ -12,11 +12,8 @@
  * a session by (thread, instance), because a chat can switch provider.
  */
 
-export type ProviderKind = "codex" | "claude-code";
-export const PROVIDER_KINDS: readonly ProviderKind[] = ["codex", "claude-code"];
-export const isProviderKind = (value: string): value is ProviderKind =>
-  (PROVIDER_KINDS as readonly string[]).includes(value);
-
+/** Driver ids are open strings. Registration, not persistence, determines availability. */
+export type ProviderKind = string;
 /** A Loom chat id. */
 export type ThreadId = string;
 /** A Loom agent id: one configured instance of a provider. */
@@ -49,6 +46,8 @@ export interface ProviderSession {
   resumeCursor?: unknown;
   /** POSIX process group owned by this warm session. */
   processGroupId?: number;
+  /** Opaque recoverable fencing identity; remote adapters need no PID. */
+  writerIdentity?: { type: string; value: unknown };
   activeTurnId?: TurnId;
   createdAt: number;
   updatedAt: number;
@@ -91,6 +90,11 @@ export interface AdapterCapabilities {
   supportsConversationRollback: boolean;
   /** Whether the adapter can start a compaction on request. */
   manualCompaction: boolean;
+  planMode: "native" | "unsupported";
+  compaction: { type: "request" } | { type: "slash-command"; command: string } | { type: "unsupported" };
+  /** tracked: terminal turn plus completed command/child items. adapter: terminal proves all writers idle. */
+  writerSettlement: "tracked" | "adapter";
+  fencing: "process-group" | "opaque" | "none";
 }
 
 export interface ThreadSnapshot {
@@ -221,7 +225,7 @@ export interface RuntimeEventPayloads {
    */
   "user-input.requested": { questions: UserInputQuestion[]; responseMode?: "tool" | "message" };
   "user-input.resolved": { answers: UserInputAnswers };
-  "account.rate-limits.updated": { windows: RateLimitWindow[]; reached?: string | null };
+  "account.rate-limits.updated": { windows: RateLimitWindow[]; reached?: string | null; reachedScope?: "account" | "window" };
   "model.rerouted": { fromModel: string; toModel: string; reason?: string };
   "config.warning": { summary: string; details?: string };
   "runtime.warning": { message: string; detail?: unknown; retrying?: boolean };

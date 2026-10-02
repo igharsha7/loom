@@ -15,6 +15,7 @@
 import type {
   CommandItemData, FileChangeItemData, InstanceId, ProviderKind, ProviderRuntimeEvent, ThreadId, ToolItemData,
 } from "./contracts.js";
+import { providerRegistry } from "./registry.js";
 import { ContextArtifacts } from "../core/continuity/artifacts.js";
 
 /** A Loom log event, before the log assigns id and time. */
@@ -57,11 +58,13 @@ export interface IngestionOptions {
   live?: (delta: LiveDelta) => void;
   /** Tool progress for live display; not persisted. */
   liveItem?: (item: LiveItem) => void;
+  /** Instance account identity; default legacy labels are supplied by the driver. */
+  accountKey?: () => string;
   /** Where large command output is written, per agent (continuity turns only). */
   artifactDir?: (instanceId: InstanceId) => string | undefined;
 }
 
-const PROVIDER_ACCOUNT: Record<ProviderKind, string> = { codex: "codex", "claude-code": "claude" };
+
 /** Items that are the agent doing something (as opposed to saying something). */
 const TOOL_ITEMS = new Set(["command_execution", "file_change", "mcp_tool_call", "dynamic_tool_call", "collab_agent_tool_call", "web_search", "image_view"]);
 const ARTIFACT_THRESHOLD = 100_000;
@@ -182,10 +185,15 @@ export class RuntimeIngestion {
           autoCompacts: u.compactsAutomatically ?? true });
         return;
       }
-      case "account.rate-limits.updated":
-        status("usage_limits", { provider: PROVIDER_ACCOUNT[event.provider], windows: event.payload.windows,
+      case "account.rate-limits.updated": {
+        const provider = providerRegistry.get(event.provider)?.limits.provider ?? event.provider;
+        const accountKey = this.options.accountKey?.();
+        status("usage_limits", { provider, windows: event.payload.windows,
+          ...(accountKey && accountKey !== provider ? { accountKey } : {}),
+          ...(event.payload.reachedScope ? { reachedScope: event.payload.reachedScope } : {}),
           ...(event.payload.reached ? { reached: event.payload.reached } : {}) });
         return;
+      }
       case "user-input.requested": {
         s.asked = true;
         const question = event.payload.questions.map(q => q.question).join("\n");

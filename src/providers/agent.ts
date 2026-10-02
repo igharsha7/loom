@@ -21,16 +21,15 @@
  */
 
 import path from "node:path";
-import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
-import { AdapterBase, ADAPTER_CAPABILITIES, cliAvailable, cliOutput, firstLine, frameBriefing, withNativeChat, type AgentCheck } from "../adapters/base.js";
+import { AdapterBase, ADAPTER_CAPABILITIES, frameBriefing, withNativeChat, type AgentCheck } from "../adapters/base.js";
 import { hasApprovalBroker } from "../core/approvals.js";
-import { NativeDispatchRejected, NativeQuiescenceUnknown, NativeSessionMissing } from "../core/continuity/contracts.js";
+import { NativeDispatchRejected, NativeQuiescenceUnknown, NativeSessionMissing } from "./settlement.js";
 import { permissionFor } from "../core/permissions.js";
 import { MAIN_CHAT, type AgentCapabilities, type McpServerEntry, type SendInput } from "../types.js";
 import type { ProviderAdapter } from "./adapter.js";
 import { ApprovalBridge } from "./approvals.js";
-import { ClaudeProviderAdapter, claudeBin, type ClaudeHistory } from "./claude/adapter.js";
-import { CodexProviderAdapter, codexBin } from "./codex/adapter.js";
+import { providerRegistry } from "./registry.js";
+import type { ProviderHealth, ProviderInstance, WriterRecovery } from "./driver.js";
 import type { ProviderKind, ProviderRuntimeEvent, ThreadId, TurnId, ProviderSession } from "./contracts.js";
 import { runtimeModeFor } from "./contracts.js";
 import { FileSessionDirectory } from "./directory.js";
@@ -38,7 +37,6 @@ import { isProviderError } from "./errors.js";
 import { RuntimeIngestion, type LiveDelta, type LiveItem } from "./ingestion.js";
 import { SessionReaper } from "./reaper.js";
 import { ProviderService, type RollbackStep } from "./service.js";
-import type { Json } from "./codex/rpc.js";
 
 // ---------------------------------------------------------------------------
 // One provider service per working directory
@@ -93,15 +91,9 @@ interface AgentOptions {
   model?: string;
   /** Reasoning effort ("low" | "medium" | "high" | …, the provider's own words). */
   effort?: string;
-  bin?: string;
-  extraArgs?: string[];
-  sandbox?: "read-only" | "workspace-write" | "danger-full-access";
-  permissionMode?: string;
   loomProject?: string;
   /** How long a finished turn waits for its running commands (tests). */
   commandSettleMs?: number;
-  /** Claude session history in place of the SDK's (tests). */
-  claudeHistory?: ClaudeHistory;
   [key: string]: unknown;
 }
 
@@ -119,25 +111,13 @@ interface CurrentTurn {
   wake?: () => void;
 }
 
-/** A project MCP server as a Codex `mcp_servers.<key>` config value. */
-function codexMcpServer(entry: McpServerEntry): Json {
-  if (entry.type === "stdio") return { command: entry.command, ...(entry.args ? { args: entry.args } : {}), ...(entry.env ? { env: entry.env } : {}) };
-  // Codex's key for per-server HTTP headers is unverified; a guessed key is
-  // either ignored or rejected, so headers are deliberately not sent.
-  return { url: entry.url };
-}
-
-function claudeMcpServer(entry: McpServerEntry): McpServerConfig {
-  if (entry.type === "stdio") return { type: "stdio", command: entry.command, ...(entry.args ? { args: entry.args } : {}), ...(entry.env ? { env: entry.env } : {}) };
-  return { type: entry.type, url: entry.url, ...(entry.headers ? { headers: entry.headers } : {}) };
-}
-
 export class ProviderAgent extends AdapterBase {
   /** MCP servers are applied when a session starts; a change restarts (and resumes) it. */
   override readonly capabilities: AgentCapabilities = { ...ADAPTER_CAPABILITIES, mcp: true };
   private readonly options: AgentOptions;
   private providers: ProjectProviders | null = null;
   private adapter: ProviderAdapter | null = null;
+  private instance: ProviderInstance | null = null;
   private unsubscribe: (() => void) | null = null;
   private readonly ingestion: RuntimeIngestion;
   private current: CurrentTurn | null = null;
@@ -153,12 +133,16 @@ export class ProviderAgent extends AdapterBase {
 
   constructor(id: string, readonly provider: ProviderKind, projectDir: string, options: Record<string, unknown> = {}) {
     super(id, provider, projectDir);
+    providerRegistry.require(provider);
+    // Decode when materializing: bad config still rejects send before launch and
+    // releases its reservation, just as the pre-registry adapters did.
     this.options = options as AgentOptions;
     this.ingestion = new RuntimeIngestion({
       append: event => this.emit(withNativeChat({ kind: event.kind, payload: event.payload }, event.chat)),
       live: delta => { for (const cb of this.liveListeners) { try { cb(delta); } catch { /* a viewer's problem */ } } },
       liveItem: item => { for (const cb of this.itemListeners) { try { cb(item); } catch { /* a viewer's problem */ } } },
       artifactDir: () => this.projectDir,
+      accountKey: () => this.instance?.accountKey ?? providerRegistry.require(this.provider).accountKey(this.options),
     });
   }
 
@@ -187,9 +171,11 @@ export class ProviderAgent extends AdapterBase {
    * `compaction: { type: "slash-command" }`).
    */
   async compact(chat: ThreadId = MAIN_CHAT, beforeSubmit?: (session: ProviderSession) => void): Promise<void> {
-    if (this.provider === "claude-code") {
+    const strategy = providerRegistry.require(this.provider).capabilities.compaction;
+    if (strategy.type === "unsupported") throw new Error(`${this.provider} does not support manual compaction`);
+    if (strategy.type === "slash-command") {
       this.beforeCompact = beforeSubmit;
-      try { await this.send({ text: "/compact", chat }); } finally { this.beforeCompact = undefined; }
+      try { await this.send({ text: strategy.command, chat }); } finally { this.beforeCompact = undefined; }
       return;
     }
     if (this._busy) throw new Error(`${this.provider} agent "${this.id}" is busy`);
@@ -216,34 +202,22 @@ export class ProviderAgent extends AdapterBase {
 
   get workspaceDir(): string { return this.projectDir; }
 
-  private get bin(): string | null {
-    return this.provider === "codex" ? codexBin(this.options.bin) : claudeBin(this.options.bin);
-  }
-
   async available(): Promise<boolean> {
-    const bin = this.bin;
-    return bin ? cliAvailable(bin) : false;
+    try { return await providerRegistry.require(this.provider).available(providerRegistry.decode(this.provider, this.options)); }
+    catch { return false; }
   }
-  /** Installed, and (Codex) signed in — asked of the CLI itself, no turn spent. */
+  async health(): Promise<ProviderHealth> {
+    if (this.instance) return this.instance.health();
+    return providerRegistry.require(this.provider).health(providerRegistry.decode(this.provider, this.options));
+  }
   async selfCheck(): Promise<AgentCheck[]> {
-    const bin = this.bin;
-    const name = this.provider === "codex" ? "codex" : "claude";
-    if (!bin) return [{ name: "installed", ok: false, detail: `${name} CLI not found — install it${this.provider === "codex" ? " or open Codex.app once" : ""}` }];
-    const v = await cliOutput(bin, ["--version"]);
-    const checks: AgentCheck[] = [
-      { name: "installed", ok: v?.code === 0, detail: v?.code === 0 ? firstLine(v.out) || bin : `${name} didn't answer --version` },
-    ];
-    if (this.provider === "codex") {
-      const s = await cliOutput(bin, ["login", "status"]);
-      checks.push({
-        name: "signed in",
-        ok: s?.code === 0,
-        detail: s ? firstLine(s.out) || (s.code === 0 ? "signed in" : "not signed in — run: codex login") : "couldn't ask codex",
-      });
-    }
-    return checks;
+    try { return await providerRegistry.require(this.provider).selfCheck(providerRegistry.decode(this.provider, this.options)); }
+    catch (error) { return [{ name: "configuration", ok: false, detail: error instanceof Error ? error.message : String(error) }]; }
   }
-
+  recoveryIdentity(session: ProviderSession): WriterRecovery | undefined {
+    if (!this.instance) throw new Error("provider instance is not attached");
+    return this.instance.recoveryIdentity(session);
+  }
 
   async start(): Promise<void> {
     this.emit({ kind: "status", payload: { state: "ready" } });
@@ -265,17 +239,14 @@ export class ProviderAgent extends AdapterBase {
     // A concurrent attach may have finished while the previous owner stopped.
     const attached = this.providers as ProjectProviders | null;
     if (attached) { releaseProviders(this.projectDir, providers); return { providers: attached, service: attached.service }; }
-    const mcpServers = () => this.mcp?.servers ?? [];
-    const adapter: ProviderAdapter = this.provider === "codex"
-      ? new CodexProviderAdapter(this.id, { ...(this.options.bin ? { bin: this.options.bin } : {}),
-        ...(this.options.extraArgs ? { extraArgs: this.options.extraArgs } : {}), ...(this.options.sandbox ? { sandbox: this.options.sandbox } : {}),
-        mcpConfig: () => Object.fromEntries(mcpServers().map(s => [`mcp_servers.${s.key}`, codexMcpServer(s.entry)])) })
-      : new ClaudeProviderAdapter(this.id, { ...(this.options.bin ? { bin: this.options.bin } : {}),
-        ...(this.options.extraArgs ? { extraArgs: this.options.extraArgs } : {}),
-        ...(this.options.permissionMode ? { permissionMode: this.options.permissionMode } : {}),
-        ...(this.options.claudeHistory ? { history: this.options.claudeHistory } : {}),
-        mcpServers: () => Object.fromEntries(mcpServers().map(s => [s.key, claudeMcpServer(s.entry)])), canAsk: hasApprovalBroker });
-    providers.service.register(adapter);
+    let instance: ProviderInstance;
+    try { instance = await providerRegistry.create(this.provider, this.id, this.options, {
+      cwd: this.projectDir, mcpServers: () => this.mcp?.servers ?? [], canAsk: hasApprovalBroker,
+    }); } catch (error) { releaseProviders(this.projectDir, providers); throw error; }
+    const adapter = instance.adapter;
+    try { providers.service.register(adapter, instance); }
+    catch (error) { await instance.dispose(); releaseProviders(this.projectDir, providers); throw error; }
+    this.instance = instance;
     providers.owners.set(this.id, this);
     providers.busy.set(this.id, () => this.current?.chat ?? this.compactingChat);
     this.unsubscribe = providers.service.onEvent(event => { if (event.instanceId === this.id) this.observe(event); });
@@ -343,7 +314,7 @@ export class ProviderAgent extends AdapterBase {
    * running at the deadline.
    */
   private async commandsSettled(chat: ThreadId, timeoutMs = 60_000): Promise<boolean> {
-    if (!this.running.get(chat)?.size) return true;
+    if (this.adapter?.capabilities.writerSettlement === "adapter" || !this.running.get(chat)?.size) return true;
     return new Promise(resolve => {
       const timer = setTimeout(() => { this.commandsIdle.delete(chat); resolve(false); }, timeoutMs);
       timer.unref();
@@ -354,9 +325,6 @@ export class ProviderAgent extends AdapterBase {
   async send(input: SendInput): Promise<void> {
     if (this._busy) throw new Error(`${this.provider} agent "${this.id}" is busy${this.current?.quiescenceUnknown
       ? " — native writer quiescence is unknown; use Stop or loom interrupt before sending another turn" : ""}`);
-    const bin = this.bin;
-    if (!bin) throw new NativeDispatchRejected(this.provider === "codex" ? "codex CLI not found — install it or open Codex.app once"
-      : "claude CLI not found — install Claude Code or set its path");
     this._busy = true;
     this.beginContinuity(input);
     const chat = input.chat ?? MAIN_CHAT;
@@ -562,7 +530,7 @@ export class ProviderAgent extends AdapterBase {
       }
       return;
     }
-    // The harness did not stop the turn: end its session (and process group).
+    // The provider did not stop the turn: fence its session writers.
     if (service) await service.stopSession(cur.chat, this.id);
     if (!(await within(10_000))) throw new NativeQuiescenceUnknown(`${this.provider} did not stop after interruption; quiescence unknown`);
   }
@@ -574,6 +542,7 @@ export class ProviderAgent extends AdapterBase {
     await providers.service.unregister(this.id);
     this.providers = null;
     this.adapter = null;
+    this.instance = null;
     this.unsubscribe?.();
     this.unsubscribe = null;
     if (providers.owners.get(this.id) === this) { providers.owners.delete(this.id); providers.busy.delete(this.id); }

@@ -36,6 +36,8 @@ export interface ProviderBinding {
   threadId: ThreadId;
   instanceId: InstanceId;
   provider: ProviderKind;
+  /** Absent on pre-registry bindings; those retain their original cursor ownership. */
+  continuationKey?: string;
   status: BindingStatus;
   /** The native thread/session id. */
   resumeCursor: unknown | null;
@@ -118,7 +120,8 @@ export class MemorySessionDirectory implements SessionDirectory {
 const BindingFile = z.object({
   version: z.literal(1),
   bindings: z.array(z.object({
-    threadId: z.string().min(1), instanceId: z.string().min(1), provider: z.enum(["codex", "claude-code"]),
+    threadId: z.string().min(1), instanceId: z.string().min(1), provider: z.string().min(1).max(256),
+    continuationKey: z.string().min(1).max(1024).optional(),
     status: z.enum(["starting", "running", "stopped", "error"]), resumeCursor: z.unknown().nullable(),
     runtimePayload: z.object({ cwd: z.string().optional(), model: z.string().optional() }).nullable(),
     runtimeMode: z.enum(["approval-required", "auto-accept-edits", "full-access"]), lastSeenAt: z.number(),
