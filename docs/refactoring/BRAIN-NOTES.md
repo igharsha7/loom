@@ -340,3 +340,51 @@ Standards: eight initial/follow-up correctness findings addressed; the original
 worst issue was Stop racing with launch. Spec: ten initial/follow-up findings
 addressed in the supported path; full descendant/platform containment remains
 partial. Neither verdict is release certification for every matrix row.
+
+## OpenCode (2026-09-29)
+
+Enabled as a native harness after its protocol and acceptance fixtures passed.
+
+Protocol, recorded from a live `opencode serve` 1.18.31 (`/doc` OpenAPI plus a captured `/event` stream):
+
+- A bound session that no longer exists answers `GET /api/session/{id}` with 404
+  `SessionNotFoundError`. The adapter raises NativeSessionMissing before sending
+  anything, so the engine moves the binding to a new epoch.
+- `POST /api/session/{id}/prompt` returns 200 at once with an admission
+  (`admittedSeq`, message id, `delivery: "steer"`). That admission is the
+  acceptance evidence (`native_turn_accepted`). Any other status before admission
+  is NativeDispatchRejected; a network failure mid-request stays "outcome unknown".
+- `/api/session/{id}/wait` still answers 503 ("not available yet"), so it can't
+  prove a turn is over. `GET /api/session/active` lists the session as
+  `{type: "running"}` for the whole turn and drops it when the turn ends, so the
+  turn is over, and quiescent, when the session leaves that list. A session still
+  listed at the timeout is NativeQuiescenceUnknown.
+- `POST /api/session/{id}/model` switches the model of an existing session, so a
+  model change keeps the native session, as with Codex and Claude.
+- Streamed events are `session.next.*`: text/reasoning deltas, `tool.called` /
+  `tool.success` / `tool.failed` (reported as tool calls), and
+  `compaction.started` / `compaction.ended` plus `session.compacted` (reported once
+  as `native_compacted`, which marks the binding compacted).
+
+Verification:
+
+- `test/opencode-continuity.test.ts` (11 cases) runs the real adapter and engine
+  against a fake server with those shapes. The cases: acceptance and correlation,
+  delta resume on the same session, in-place model switch, a lost session then
+  rebuild, a refused prompt with no lease left behind, a stuck session with
+  unknown quiescence, a failed turn, tool and compaction events, the baseUrl
+  health probe, and a runtime-level turn. A mutation that drops the lost-session
+  check fails it.
+- Live (opencode 1.18.31, free `opencode/big-pickle`), through a daemon with
+  continuity on:
+  1. The first turn is a reconstruction, which creates the session.
+  2. The second is a delta on the same session and recalls a planted fact.
+  3. After restarting the daemon and its OpenCode server, the third is a delta on
+     the same session and still recalls the fact.
+  All three receipts are `accepted/complete`. An ordinary (non-continuity)
+  OpenCode turn still works.
+
+Limits: prompts carry no client message id yet (the API accepts `id: msg_…`, which
+could make a lost acknowledgement retry-safe). There is no context-window meter
+for OpenCode. Attachments and `extraArgs` stay refused, as for the other harnesses.
+

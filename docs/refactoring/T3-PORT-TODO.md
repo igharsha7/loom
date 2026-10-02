@@ -321,6 +321,17 @@ Decided with the user 2026-10-02.
   models), `provider_status` frames, and the model picker re-rendering live.
   Live check: Codex 8 models in ~1 s, Claude 12 in ~2 s, both with sign-in,
   no turn taken and nothing left running. Tests set `LOOM_PROVIDER_PROBES=0`.
+- [ ] OpenCode as a registry driver. Upstream main (#213, merged 2026-10-03)
+  added native continuity for OpenCode inside the legacy
+  `src/adapters/opencode.ts`, with a hard-coded native-kind list. On this
+  branch a native kind is a registry driver with a `ProviderAdapter`, so the
+  merge kept the registry checks and the feature waits for this item: an
+  OpenCode driver and adapter ported from t3code's
+  `provider/Layers/OpenCodeAdapter.ts`, reusing upstream's verified opencode
+  1.18 protocol (session per binding, admission as acceptance,
+  `/api/session/active` for quiescence, `session.next.*` events, `baseUrl`
+  health) and its fake server (`test/opencode-fake.ts`). Done when
+  `test/opencode-continuity.test.ts` runs unskipped.
 - [ ] Instances: several accounts per driver (the registry's continuation and
   account identity), auth status, install/update detection, native session
   history import.

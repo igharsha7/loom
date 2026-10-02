@@ -25,6 +25,7 @@ Do not infer user approval from elapsed time or an unchecked question.
 - [x] Define asynchronous internal commands for potential worker isolation; preserve legacy synchronous semantics in their owner.
 - [x] Record supported Node/harness versions and compatibility profiles.
 - [ ] Verify Claude dynamic context on resume, Codex explicit resume and OpenCode API shape; E09–E16.
+  OpenCode API shape verified against opencode 1.18.31 (2026-09-29): see BRAIN-NOTES "OpenCode".
 - [x] Establish native acceptance evidence and idempotency limits; E25–E30.
 - [x] Define process/run quiescence and project/workspace ownership; E19–E24, E31–E32.
 - [x] Choose a read-only retrieval route for each supported harness; E45.
@@ -100,7 +101,8 @@ usable when helpers are disabled or unavailable. Embeddings are outside scope.
 
 ## P5 — Integrate and cut over
 
-- [ ] Enable OpenCode only after its protocol/acceptance fixtures pass.
+- [x] Enable OpenCode only after its protocol/acceptance fixtures pass. `test/opencode-continuity.test.ts`
+  (fake `opencode serve` recorded from 1.18.31) plus a live three-turn run with a daemon restart; 2026-09-29.
 - [ ] Integrate queue, pinned chats, routes and worktree/orchestra ownership.
 - [ ] Apply explicit team/private/bridge context rules; E24, E57–E60.
 - [ ] Remove redundant legacy injection/extraction paths after parity; prevent double briefings.
@@ -133,7 +135,7 @@ coding, Electron redesign and local embeddings require separate future scope.
   remain pending when no final result is exposed); bounded large-output behavior.
 - [ ] Automatic artifact GC/deletion/retention and complete downgrade/export tooling.
 - [ ] Genuine OS disk-full/network-filesystem and process-orphan fault injection.
-- [ ] Isolated cheap helpers/account model discovery, OpenCode protocol parity.
+- [ ] Isolated cheap helpers/account model discovery. (OpenCode protocol parity: done 2026-09-29.)
 - [ ] Native continuation quality and Git/worktree-heavy performance corpora.
 
 Unsupported profiles/features return explicit errors rather than silently using

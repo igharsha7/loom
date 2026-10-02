@@ -11,7 +11,7 @@ Enable **Native context continuity** in Settings → Preferences, or set
 `brain.continuity: true` in `.loom/config.json`. Finish/reconcile active turns and clear queued prompts before
 changing modes. The default remains the legacy workflow.
 
-Select Codex or Claude Code in an ordinary chat. The next request captures its
+Select Codex, Claude Code or OpenCode in an ordinary chat. The next request captures its
 target/model. Requests sent during another foreground turn queue until it finishes;
 later picker changes do not retarget them. Explicit handoff/Stop interrupts, waits
 for process close, and refuses unproven quiescence. Preparing turns can also be stopped.
@@ -22,12 +22,13 @@ for process close, and refuses unproven quiescence. Preparing turns can also be 
 | Claude Code | Any installed version, driven through the Claude Agent SDK; explicit resume by session; context in the ordinary user message (stdin). Acceptance is the `requesting` status or the first output. |
 | Lost native session | A resume that finds no session fails before any turn starts. The adapter reports `NativeSessionMissing`; the receipt fails and the binding moves to a new epoch, so the next packet reconstructs into a fresh session. |
 | Harness health | Each native CLI is probed with `--version` every 20 s and before dispatch. An unreachable CLI refuses the turn before the request is recorded. Status reports `available` and `cliVersion`; transitions are logged. Protocol drift appears as missing acceptance evidence, never as success. |
-| Per-chat model | Supported. Changing the model keeps the same native session (both CLIs accept a model on resume); other configuration changes select a new binding. |
-| OpenCode/bridges | Native continuity unsupported until protocol/acceptance fixtures pass; legacy workflow available. |
+| Per-chat model | Supported. Changing the model keeps the same native session (Codex and Claude accept a model on resume; OpenCode switches the session's model in place); other configuration changes select a new binding. |
+| OpenCode | Not yet on the provider registry: native continuity for OpenCode waits for its registry driver (T3-PORT-TODO, Phase 6), and until then it is refused like a bridge. The protocol, verified upstream: driven over `opencode serve`'s HTTP API (verified on 1.18.31); explicit resume by session; context in the ordinary prompt. Acceptance is the prompt's admission; the turn is over, and quiescent, when `/api/session/active` no longer lists the session. A session the server no longer has fails before anything is sent, and the next packet rebuilds in a new one. An agent pointed at a running server (`baseUrl`) is probed by that server's health. |
+| Bridges | Native continuity unsupported; legacy workflow available. |
 | Parallel subagents/orchestra | Unsupported in this sequential mode. |
 | Embeddings/inference/cheap helpers | Not loaded or launched by this mode; helpers disabled. |
 | Attachments | Existing `[image]`/`[file]` upload protocol rejected; ordinary workspace references usable. |
-| Native compaction | Both harnesses report it: Claude as `status: compacting` then `compact_boundary`, Codex as a `contextCompaction` item. The binding is marked compacted, and the next packet rebuilds reviewed state and recent history into the same resumed session. The UI shows compaction while it runs, and the context in use against the model's window. No private transcript modifications. |
+| Native compaction | Every harness reports it: Claude as `status: compacting` then `compact_boundary`, Codex as a `contextCompaction` item, OpenCode as `session.next.compaction.started`/`.ended`. The binding is marked compacted, and the next packet rebuilds reviewed state and recent history into the same resumed session. The UI shows compaction while it runs, and the context in use against the model's window. No private transcript modifications. |
 
 Checked fixtures are not live account validation on every listed version or
 cross-platform packaging certification.

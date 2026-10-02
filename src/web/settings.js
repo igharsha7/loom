@@ -252,7 +252,7 @@ import { durfmt } from './transcript.js';
         var pname = state.project && state.project.name ? state.project.name : "this project";
         var hh = '<div class="sgrouph">Brain \u00b7 ' + esc(pname) + "</div>";
         hh += '<div class="prow"><div class="pl"><div class="pt">Native context continuity</div>' +
-          '<div class="pd">Sequential Codex and Claude switching with per-chat sessions, protected user context and delivery diagnostics. Uses SQLite search; helpers and local inference are disabled. OpenCode and parallel execution are not supported in this mode.</div></div>' +
+          '<div class="pd">Sequential Codex and Claude Code switching with per-chat sessions, protected user context and delivery diagnostics. Uses SQLite search; helpers and local inference are disabled. OpenCode (until its provider driver lands), bridges and parallel execution are not supported in this mode.</div></div>' +
           '<div class="pc">' + seg("continuity", [{ v: "on", l: "On" }, { v: "off", l: "Off" }], cfg.brain.continuity ? "on" : "off") + "</div></div>";
         if (!cfg.brain.continuity) {
           hh += '<div class="prow"><div class="pl"><div class="pt">Memory extractor</div>' +

@@ -9,6 +9,15 @@
  *   live events    : GET  /event   (SSE)
  *
  * Surface verified against opencode 1.17.20 — see docs/integration-notes.md.
+ *
+ * Native continuity (see core/continuity): a continuity turn runs on the
+ * session its binding names, or a new one it reports as `turn_started`; a
+ * bound session the server no longer has is NativeSessionMissing, before
+ * anything is sent. The prompt's admission is the acceptance evidence
+ * (`native_turn_accepted`), and the turn is over — and quiescent — when
+ * `/api/session/active` no longer lists the session. Verified against
+ * opencode 1.18.31 (`/api/session/{id}/model` switches the model in place,
+ * `session.next.compaction.*` reports compaction).
  */
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
@@ -16,6 +25,7 @@ import type { SendInput } from "../types.js";
 import { readProjectState, writeProjectState } from "../core/registry.js";
 import { AdapterBase, agentEnv, cliAvailable, cliOutput, fetchJson, firstLine, frameBriefing, freePort, waitFor, type AgentCheck } from "./base.js";
 import { permissionFor } from "../core/permissions.js";
+import { NativeDispatchRejected, NativeQuiescenceUnknown, NativeSessionMissing } from "../core/continuity/contracts.js";
 
 interface OpenCodeOptions {
   /** Reuse an already-running server instead of spawning one. */
@@ -85,6 +95,14 @@ export class OpenCodeAdapter extends AdapterBase {
   private roles = new Map<string, string>();
   /** assistant messages whose text already went to the log (SSE path) */
   private emittedText = new Set<string>();
+  /** The session a continuity turn is running on; the agent's own otherwise. */
+  private activeSid: string | undefined;
+  /** interrupt() was asked for during this turn. */
+  private interrupted = false;
+  /** Tools opencode started this turn, by call id (1.18 reports name and result separately). */
+  private toolCalls = new Map<string, { tool: string; title: string }>();
+  /** A compaction was already reported as done (both the step event and the session event can say so). */
+  private compactionReported = false;
 
   constructor(id: string, projectDir: string, options: Record<string, unknown> = {}) {
     super(id, "opencode", projectDir);
@@ -183,7 +201,9 @@ export class OpenCodeAdapter extends AdapterBase {
       return true;
     });
     await this.assertModelAvailable();
-    await this.ensureSession();
+    // No session yet: an ordinary turn makes (or reuses) the agent's own when it
+    // sends, and a continuity turn runs on its binding's. Creating one here left
+    // an empty session behind every time a continuity project started.
     this.startSse();
     this.started = true;
     this.emit({
@@ -299,7 +319,12 @@ export class OpenCodeAdapter extends AdapterBase {
     const type = String(evt.type ?? "");
     // Payload wrapping varies across opencode builds: {properties} or {data}.
     const props = (evt.properties ?? evt.data ?? evt) as Json;
-    const mySession = this.sessionId;
+    const mySession = this.activeSid ?? this.sessionId;
+    if (type.startsWith("session.next.tool.") || type.startsWith("session.next.compaction.") || type === "session.compacted") {
+      if (props.sessionID && props.sessionID !== mySession) return;
+      this.handleSessionNext(type, props);
+      return;
+    }
 
     // opencode 1.18+ streams the reply as session.next.{text,reasoning}.delta,
     // one fragment each; the finished message still arrives the usual way.
@@ -384,6 +409,36 @@ export class OpenCodeAdapter extends AdapterBase {
     }
   }
 
+  /** opencode 1.18's tool and compaction events, for a session already known to be ours. */
+  private handleSessionNext(type: string, props: Json): void {
+    const callId = String(props.callID ?? "");
+    if (type === "session.next.tool.called") {
+      const input = (props.input ?? {}) as Json;
+      const title = String(input.description ?? input.command ?? input.filePath ?? input.path ?? input.pattern ?? props.tool ?? "tool");
+      this.toolCalls.set(callId, { tool: String(props.tool ?? "tool"), title: title.slice(0, 200) });
+      return;
+    }
+    if (type === "session.next.tool.success" || type === "session.next.tool.failed") {
+      const call = this.toolCalls.get(callId) ?? { tool: "tool", title: "tool" };
+      this.toolCalls.delete(callId);
+      const err = (props.error ?? {}) as Json;
+      this.emit({
+        kind: "tool_call",
+        payload: { tool: call.tool, summary: call.title, ...(type.endsWith("failed") ? { error: String(err.message ?? "failed").slice(0, 300) } : {}) },
+      });
+      return;
+    }
+    if (type === "session.next.compaction.started") {
+      this.compactionReported = false;
+      this.emit({ kind: "status", payload: { state: "compacting", reason: String(props.reason ?? "auto") } });
+      return;
+    }
+    if ((type === "session.next.compaction.ended" || type === "session.compacted") && !this.compactionReported) {
+      this.compactionReported = true;
+      this.emit({ kind: "status", payload: { state: "native_compacted", session: String(props.sessionID ?? this.activeSid ?? "") } });
+    }
+  }
+
   /** All messages in the session, oldest first (info objects). */
   private async listMessages(sid: string): Promise<Json[]> {
     const res = await fetchJson<Json>(`${this.baseUrl}/api/session/${sid}/message`);
@@ -446,6 +501,7 @@ export class OpenCodeAdapter extends AdapterBase {
   }
 
   async send(input: SendInput): Promise<void> {
+    if (input.continuity) return this.sendContinuity(input);
     if (!this.started) await this.start();
     if (this._busy) throw new Error(`opencode agent "${this.id}" is busy`);
     this._busy = true;
@@ -527,8 +583,214 @@ export class OpenCodeAdapter extends AdapterBase {
     }
   }
 
+  /**
+   * A continuity turn (see the header): the binding's session, the admission as
+   * acceptance, and the session leaving `/api/session/active` as the end.
+   * Failures before the prompt is admitted are NativeDispatchRejected — nothing
+   * reached opencode — and a lost acknowledgement is never retried.
+   */
+  private async sendContinuity(input: SendInput): Promise<void> {
+    const c = input.continuity!;
+    if (this._busy) throw new NativeDispatchRejected(`opencode agent "${this.id}" is busy`);
+    this._busy = true;
+    this.interrupted = false;
+    this.beginContinuity(input);
+    const started = Date.now();
+    let admitted = false;
+    try {
+      if (!this.started) {
+        try {
+          await this.start();
+        } catch (err) {
+          throw new NativeDispatchRejected(`opencode didn't start: ${(err as Error).message}`);
+        }
+      }
+      const sid = await this.continuitySession(c.nativeSessionId, input.model);
+      this.activeSid = sid;
+      this.emit({ kind: "status", payload: { state: "turn_started", session: sid } });
+      if (this.interrupted) throw new NativeDispatchRejected("interrupted before the turn started");
+      const baseline = new Set((await this.listMessages(sid).catch(() => [] as Json[])).map((m) => String(m.id)));
+      const text = [c.context, input.briefing, input.text].filter(Boolean).join("\n\n");
+      let res: Response;
+      try {
+        res = await fetch(`${this.baseUrl}/api/session/${encodeURIComponent(sid)}/prompt`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ prompt: { text } }),
+          signal: AbortSignal.timeout(30_000),
+        });
+      } catch (err) {
+        // The request may or may not have reached the server: unknown, not rejected.
+        throw new Error(`opencode prompt request failed: ${(err as Error).message}; native outcome is unknown`);
+      }
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new NativeDispatchRejected(`opencode refused the prompt (${res.status}): ${body.slice(0, 300)}`);
+      }
+      const ack = ((await res.json().catch(() => ({}))) as Json).data as Json | undefined;
+      admitted = true;
+      this.emit({ kind: "status", payload: { state: "native_turn_accepted", session: sid, ...(ack?.id ? { messageId: String(ack.id) } : {}) } });
+
+      const idle = await this.waitIdle(sid, baseline, this.turnTimeoutMs());
+      if (!idle) {
+        this.emit({ kind: "error", payload: { message: "opencode was still working when the turn timed out" } });
+        throw new NativeQuiescenceUnknown("opencode still lists the session as active; quiescence unknown");
+      }
+      if (this.interrupted) {
+        this.emit({ kind: "status", payload: { state: "interrupted" } });
+        return;
+      }
+      const messages = await this.listMessages(sid).catch(() => [] as Json[]);
+      const turn = [...messages].reverse().find((m) => (m.type ?? m.role) === "assistant" && !baseline.has(String(m.id)));
+      if (!turn) {
+        const message = "opencode finished without a reply";
+        this.emit({ kind: "error", payload: { message } });
+        throw new Error(message);
+      }
+      const failed = await this.reportTurn(sid, turn);
+      if (failed) throw new Error(`opencode reported a failed turn: ${failed}`);
+      this.emit({
+        kind: "run_complete",
+        payload: {
+          durationMs: Date.now() - started,
+          session: sid,
+          ...(this.lastModel ? { model: this.lastModel } : {}),
+          ...(this.lastUsage ? { inputTokens: this.lastUsage.input, outputTokens: this.lastUsage.output } : {}),
+        },
+      });
+    } catch (err) {
+      if (!admitted && !(err instanceof NativeSessionMissing) && !(err instanceof NativeDispatchRejected) && !/native outcome is unknown/.test(String((err as Error).message))) {
+        throw new NativeDispatchRejected((err as Error).message);
+      }
+      throw err;
+    } finally {
+      this.lastUsage = null;
+      this.lastModel = null;
+      this.activeSid = undefined;
+      this._busy = false;
+      this.endContinuity();
+    }
+  }
+
+  private turnTimeoutMs(): number {
+    const t = (this.options as { turnTimeoutMs?: unknown }).turnTimeoutMs;
+    return typeof t === "number" && t > 0 ? t : 60 * 60 * 1000;
+  }
+
+  /** The session a continuity turn runs on: its binding's, or a new one. Nothing is sent yet. */
+  private async continuitySession(bound: string | null, turnModel?: string): Promise<string> {
+    const want = turnModel ?? this.options.model;
+    const ref = want ? parseModelRef(want) : null;
+    if (bound) {
+      let res: Response;
+      try {
+        res = await fetch(`${this.baseUrl}/api/session/${encodeURIComponent(bound)}`, { signal: AbortSignal.timeout(15_000) });
+      } catch (err) {
+        throw new NativeDispatchRejected(`opencode server unreachable: ${(err as Error).message}`);
+      }
+      if (res.status === 404) throw new NativeSessionMissing(`opencode no longer has session ${bound}`);
+      if (!res.ok) throw new NativeDispatchRejected(`opencode answered ${res.status} for session ${bound}`);
+      const info = (((await res.json().catch(() => ({}))) as Json).data ?? {}) as Json;
+      const cur = (info.model ?? {}) as Json;
+      // A model change keeps the session, as it does for the other harnesses.
+      if (ref && (cur.providerID !== ref.providerID || cur.id !== ref.id)) {
+        try {
+          await fetchJson(`${this.baseUrl}/api/session/${encodeURIComponent(bound)}/model`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ model: ref }),
+          });
+        } catch (err) {
+          throw new NativeDispatchRejected(`opencode couldn't switch the session to ${want}: ${(err as Error).message}`);
+        }
+      }
+      return bound;
+    }
+    const body: Json = {};
+    if (ref) body.model = ref;
+    if (this.options.agent) body.agent = this.options.agent;
+    try {
+      const created = await fetchJson<Json>(`${this.baseUrl}/api/session`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const id = String(((created.data ?? created) as Json).id ?? "");
+      if (!id) throw new Error("no session id in the reply");
+      return id;
+    } catch (err) {
+      throw new NativeDispatchRejected(`opencode couldn't create a session: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * Wait until opencode no longer lists the session as active. Before it has
+   * been seen running, an idle session only counts as done once a new
+   * completed assistant message exists — the prompt may not have started yet.
+   */
+  private async waitIdle(sid: string, baseline: Set<string>, timeoutMs: number): Promise<boolean> {
+    const pollMs = typeof (this.options as { pollMs?: unknown }).pollMs === "number" ? (this.options as { pollMs: number }).pollMs : 500;
+    const deadline = Date.now() + timeoutMs;
+    let sawRunning = false;
+    while (Date.now() < deadline) {
+      const res = await fetchJson<Json>(`${this.baseUrl}/api/session/active`).catch(() => null);
+      const active = res ? ((res.data ?? res) as Json) : null;
+      if (active && Object.prototype.hasOwnProperty.call(active, sid)) sawRunning = true;
+      else if (active) {
+        if (sawRunning || this.interrupted) return true;
+        const messages = await this.listMessages(sid).catch(() => [] as Json[]);
+        if (messages.some((m) => (m.type ?? m.role) === "assistant" && !baseline.has(String(m.id)) && (m.time as Json | undefined)?.completed)) return true;
+      }
+      await new Promise((r) => setTimeout(r, pollMs));
+    }
+    return false;
+  }
+
+  /**
+   * Emit a finished assistant message's text (unless the stream already did),
+   * its cost, and stash its usage and model for run_complete. Returns the
+   * error message when opencode says the turn failed.
+   */
+  private async reportTurn(sid: string, turn: Json): Promise<string | null> {
+    const turnId = String(turn.id);
+    const detail = await fetchJson<Json>(`${this.baseUrl}/api/session/${sid}/message/${turnId}`).catch(() => null);
+    const info = ((detail?.data ?? detail ?? turn) as Json) ?? turn;
+    if (info.finish === "error" || info.error) {
+      const err = (info.error ?? {}) as Json;
+      const message = String(err.message ?? "opencode turn failed").slice(0, 500);
+      this.emit({ kind: "error", payload: { message } });
+      return message;
+    }
+    if (!this.emittedText.has(turnId)) {
+      const content = Array.isArray(info.content) ? (info.content as Json[]) : [];
+      const text = content
+        .filter((p) => p.type === "text" && typeof p.text === "string")
+        .map((p) => String(p.text))
+        .join("")
+        .trim();
+      if (text) {
+        this.emit({ kind: "message", payload: { text } });
+        this.emittedText.add(turnId);
+      }
+    }
+    const cost = Number(info.cost ?? 0);
+    if (cost > 0) this.emit({ kind: "status", payload: { state: "turn_cost", costUsd: cost } });
+    const tk = (info.tokens ?? {}) as Record<string, number>;
+    const cache = (tk.cache ?? {}) as unknown as Record<string, number>;
+    this.lastUsage = {
+      input: (tk.input ?? 0) + (cache.read ?? 0) + (cache.write ?? 0),
+      output: (tk.output ?? 0) + (tk.reasoning ?? 0),
+    };
+    const mid = info.modelID, pid = info.providerID;
+    const model = (info.model ?? {}) as Json;
+    if (typeof mid === "string" && mid) this.lastModel = typeof pid === "string" && pid ? `${pid}/${mid}` : mid;
+    else if (typeof model.id === "string") this.lastModel = typeof model.providerID === "string" ? `${model.providerID}/${model.id}` : model.id;
+    return null;
+  }
+
   async interrupt(): Promise<void> {
-    const sid = this.sessionId;
+    this.interrupted = true;
+    const sid = this.activeSid ?? this.sessionId;
     if (!sid || !this.baseUrl) return;
     try {
       await fetchJson(`${this.baseUrl}/api/session/${sid}/interrupt`, {
